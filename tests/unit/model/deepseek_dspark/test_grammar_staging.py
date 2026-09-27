@@ -43,6 +43,8 @@ def test_repacked_bits_preserve_model_vocabulary() -> None:
     np.testing.assert_array_equal(
         physical[:, :DSPARK_GRAMMAR_SEGMENT_TOKENS].reshape(-1), original
     )
+    assert int(destination[0, -1]) == 0
+    physical[0, -16:] = 1  # Reserved row-mode header, outside vocabulary bits.
     assert np.all(physical[:, DSPARK_GRAMMAR_SEGMENT_TOKENS:] == 1)
 
 
@@ -80,8 +82,59 @@ def test_k7_mask_rows_and_draft_caps_are_isolated() -> None:
     assert int(masks[5, 40, 0, 0]) == -1
 
     runner._stage_decode_grammar(SimpleNamespace(constraint_states={}), inputs)
+    # Ordinary batches select immutable defaults and do not rewrite the dirty slot.
+    assert int(masks[6, 40, 0, 0]) == -2
+    assert counts[4:8, 5].tolist() == [2, 2, 2, 2]
+    next_inputs = SimpleNamespace(
+        buffer_slot=0, request_ids=("r",), groups=(1,), group_ordinals=(5,), sampled_slots=((6, 48),)
+    )
+    runner._stage_decode_grammar(SimpleNamespace(constraint_states={"r": State()}), next_inputs)
     assert int(masks[6, 40, 0, 0]) == -1
-    assert counts[4:8, 5].tolist() == [DSPARK_DRAFTER_QUERY_WIDTH] * 4
+    assert int(masks[6, 40, 0, -1]) == -1
+    assert int(masks[6, 48, 0, -1]) == 0
+
+
+def test_ordinary_dispatch_reuses_immutable_device_defaults() -> None:
+    from pypto_serving.model.common.runner.buffer_set import StaticDeviceTensor, resolve_l3_arg
+
+    runner = DSparkModelRunner.__new__(DSparkModelRunner)
+    runner._default_grammar_args = {}
+    runner._compiled = SimpleNamespace(layout=SimpleNamespace(ranks=1))
+    runner._ensure_shared_host_allocation_before_worker = lambda _name: None
+    runner._prepare_default_grammar_args()
+    defaults = runner._default_grammar_args
+    runner._prepare_default_grammar_args()
+    assert runner._default_grammar_args is defaults
+
+    names = ("logits", "grammar_mask", "valid_draft_counts", "sampled_ids")
+    args = tuple(object() for _ in names)
+    ordinary = runner._grammar_dispatch_args(args, names, constrained=False)
+    assert ordinary[0] is args[0] and ordinary[3] is args[3]
+    assert isinstance(ordinary[1], StaticDeviceTensor)
+    assert ordinary[1].tensor.is_shared()
+    assert torch.all(ordinary[1].tensor == -1)
+    assert torch.all(ordinary[2].tensor == DSPARK_DRAFTER_QUERY_WIDTH)
+    assert runner._grammar_dispatch_args(args, names, constrained=True) is args
+    assert runner._grammar_dispatch_args(args, names, constrained=False)[1] is ordinary[1]
+
+    uploads = []
+    worker = SimpleNamespace(alloc_stacked_tensor=lambda tensor: uploads.append(tensor) or object())
+    cache = {}
+    first = resolve_l3_arg(worker, ordinary[1], cache)
+    second = resolve_l3_arg(worker, ordinary[1], cache)
+    assert first is second and len(uploads) == 1
+
+
+def test_prefill_uses_the_same_default_mask_without_decode_count_argument() -> None:
+    from pypto_serving.model.common.runner.buffer_set import StaticDeviceTensor
+
+    runner = DSparkModelRunner.__new__(DSparkModelRunner)
+    marker = StaticDeviceTensor(torch.full((1,), -1, dtype=torch.int16))
+    runner._default_grammar_args = {"grammar_mask": marker, "valid_draft_counts": object()}
+    output = object()
+    assert runner._grammar_dispatch_args(
+        (object(), output), ("grammar_mask", "sampled_ids"), constrained=False
+    ) == (marker, output)
 
 
 def test_failed_decode_mask_staging_cannot_poison_reused_slot() -> None:

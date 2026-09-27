@@ -6,6 +6,7 @@ This guide deploys structural tool-call constraints for DeepSeek V4 Flash DSpark
 
 - Use a DeepSeek V4 Flash DSpark W8A8 checkpoint and the 16-device `--dp 4 --ep 16 --tp 4` topology described in [DSpark serving](../developer-guide/deepseek-v4-dspark.md).
 - Deploy PyPTO Serving and PyPTO-Lib as a matched pair. Their prefill and decode positional ABI now includes `grammar_mask`; fused K7 decode also includes `valid_draft_counts`. Updating only one repository will not work. The mask shape and argument order are fixed regardless of whether a request has constraints.
+- The mask also carries a row-mode header in segment 0's last padding word: `-1` selects ordinary argmax and `0` enables masking. Serving packs this header; it is not part of the provider's vocabulary bitset. Deploy the matching packer and sampler together even when their tensor shapes have not changed.
 - Install `xgrammar==0.2.7` into the Python environment that runs Serving. This is the version validated with the DeepSeek V4 structural-tag grammar and the checkpoint tokenizer. XGrammar is a host-side dependency; PyPTO-Lib does not import it. See the [XGrammar package](https://pypi.org/project/xgrammar/0.2.7/).
 - DSpark currently supports greedy sampling only. Use `temperature: 0`; non-greedy requests are rejected rather than silently changing sampling behavior.
 
@@ -74,6 +75,8 @@ curl --noproxy '*' http://127.0.0.1:8000/v1/chat/completions \
 Expect a completed `message.tool_calls` entry named `shell`, with `function.arguments` as a JSON string containing `command`, and `finish_reason: "tool_calls"`. A length-truncated call is not a successful invocation. For a baseline, repeat the request with `tool_choice: "auto"` and `strict` omitted: it follows the unconstrained path and may answer directly or produce a tool call. `/v1/completions` uses the same fixed kernel ABI with an all-allowed mask.
 
 `auto` enters structural constraints only when at least one declared tool has `strict: true`; `required` and a named tool choice also enter the constrained path. A schema needs `required` to require a field and `additionalProperties: false` to exclude unknown fields. Ordinary non-strict `auto` does not guarantee schema-valid parameters. `parallel_tool_calls` is passed to the grammar only for constrained requests.
+
+Ordinary batches reuse immutable device-resident all-allowed masks and default draft counts. The sampler skips bitset decoding for ordinary rows; constrained rows apply the mask before the same running-maximum reduction. These paths share the fused K7 interface and do not require a separate forward/sampling dispatch.
 
 Missing XGrammar, an unsupported schema, or an unsupported model path yields an HTTP 400 before streaming headers are sent. There is no fallback to unconstrained generation for a request that asked for constraints. Request completion and cancellation release request-local grammar state. Recompute preemption of a constrained request is not yet supported; under cache pressure it may wait for resources rather than preempt another constrained request.
 

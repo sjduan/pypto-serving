@@ -57,7 +57,12 @@ from pypto_serving.config.types import (
     RuntimeModel,
     SamplingParams,
 )
-from pypto_serving.model.common.runner.buffer_set import copy_shared
+from pypto_serving.model.common.runner.buffer_set import (
+    StaticDeviceTensor,
+    copy_shared,
+    resolve_l3_arg,
+    shared_empty,
+)
 from pypto_serving.model.common.runner.l3_dispatch import L3DispatchMixin, PendingL3Dispatch
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek_dspark.weight_loader import (
@@ -1139,6 +1144,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._device_scratch: dict[tuple[str, str], StackedDeviceTensor] = {}
         self._prefill_task_args: TaskArgs | None = None
         self._decode_task_args: list[TaskArgs] = []
+        self._default_grammar_args: dict[str, StaticDeviceTensor] = {}
         self._prefill_grammar_rows: set[tuple[int, int]] = set()
         self._decode_grammar_rows: list[set[tuple[int, int]]] = [set(), set()]
         # Speculative drafter state (milestone 2): per-request leases, the
@@ -1542,6 +1548,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 if self._compiled.decode_full_fused:
                     task_args.tensors["valid_draft_counts"].fill_(DSPARK_DRAFTER_QUERY_WIDTH)
                 self._decode_task_args.append(task_args)
+        self._prepare_default_grammar_args()
         if self.speculative:
             from pypto_serving.model.common.runner.buffer_set import (  # noqa: PLC0415
                 shared_empty,
@@ -1999,6 +2006,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         for task_args in (self._prefill_task_args, *self._decode_task_args):
             if task_args is not None:
                 task_args.allocate_device(worker, None)
+        for marker in self._default_grammar_args.values():
+            resolve_l3_arg(worker, marker, self._l3_static_tensors)
         worker.release_inherited_host_tensor_refs()
 
     @staticmethod
@@ -2336,6 +2345,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             self._prefill_task_args.clear_outputs()
             args = self._prefill_dispatch_args(
                 inputs.physical_tokens, inputs.query_start_loc.shape[1] - 1
+            )
+            args = self._grammar_dispatch_args(
+                args, self._prefill_task_args.names, constrained=bool(batch.constraint_states)
             )
             self._trace_prefill_chunk(inputs, status="started")
             try:
@@ -2825,10 +2837,47 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         aligned[:, :DSPARK_GRAMMAR_SEGMENT_TOKENS] = bit_rows
         packed = np.packbits(aligned, axis=1, bitorder="little").view(np.int16)
         destination.copy_(torch.from_numpy(packed))
+        # Reserve one unused padding word as the device sampler's row-mode header.
+        destination[0, DSPARK_GRAMMAR_SEGMENT_WORDS - 1] = 0
+
+    def _prepare_default_grammar_args(self) -> None:
+        """Allocate immutable defaults before the chip workers inherit Host storage."""
+        if self._default_grammar_args:
+            return
+        self._ensure_shared_host_allocation_before_worker("default grammar buffers")
+        ranks = self._compiled.layout.ranks
+        mask = shared_empty(
+            (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
+            torch.int16,
+            name="dspark_default_grammar_mask",
+        )
+        mask.fill_(-1)
+        counts = shared_empty((ranks, DSPARK_DECODE_BATCH), torch.int32, name="dspark_default_draft_counts")
+        counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
+        self._default_grammar_args = {
+            "grammar_mask": StaticDeviceTensor(mask),
+            "valid_draft_counts": StaticDeviceTensor(counts),
+        }
+
+    def _grammar_dispatch_args(
+        self, args: tuple[Any, ...], names: tuple[str, ...], *, constrained: bool
+    ) -> tuple[Any, ...]:
+        """Keep ordinary batches off the mutable per-step mask upload path."""
+        if constrained:
+            return args
+        if not self._default_grammar_args:
+            raise RuntimeError("DSpark default grammar buffers were not allocated before worker startup")
+        resolved = list(args)
+        for name, marker in self._default_grammar_args.items():
+            if name in names:
+                resolved[names.index(name)] = marker
+        return tuple(resolved)
 
     def _stage_prefill_grammar(
         self, batch: PrefillBatch, inputs: DSparkPreparedPrefillInputs
     ) -> None:
+        if not batch.constraint_states:
+            return
         task_args = self._prefill_task_args
         if task_args is None:
             raise RuntimeError("DSpark prefill TaskArgs are not staged")
@@ -2853,6 +2902,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     def _stage_decode_grammar(
         self, batch: DecodeBatch, inputs: DSparkPreparedDecodeInputs
     ) -> None:
+        if not batch.constraint_states:
+            return
         slot = inputs.buffer_slot
         task_args = self._decode_task_args[slot]
         masks = task_args.tensors["grammar_mask"]
@@ -3025,6 +3076,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             ):
                 self._prepare_target_inputs_on_device(inputs.buffer_slot, task_args)
             args = task_args.build()
+            args = self._grammar_dispatch_args(args, task_args.names, constrained=False)
             if fused_device_state:
                 args = (*args, *self._fused_decode_device_state_args(inputs.buffer_slot))
             try:
@@ -3113,6 +3165,11 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             # Direct synchronous callers may bypass ``prepare_decode``; keep
             # that compatibility path outside the steady serving pipeline.
             args = self._bind_fused_decode_args(inputs)
+        names = tuple(
+            name for name in self._decode_task_args[inputs.buffer_slot].names
+            if name not in _DSPARK_FUSED_INTERNAL_PREPARE_NAMES
+        )
+        args = self._grammar_dispatch_args(args, names, constrained=bool(batch.constraint_states))
         try:
             with profile_span(
                 "DSparkModelRunner.decode.l3_dispatch",
@@ -5757,6 +5814,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             for task_args in self._decode_task_args:
                 task_args.close()
             self._decode_task_args = []
+            self._default_grammar_args.clear()
             # Speculative resources: the executor retains its runners, so
             # every drafter-era reference must drop here or staging buffers,
             # weights, and per-request states outlive the model.

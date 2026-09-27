@@ -71,6 +71,7 @@ def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkMode
     runner._prefill_task_args.allocate_host_shared(None)
     runner._decode_task_args = [task_args_module.decode_task_args(runner)]
     runner._decode_task_args[0].allocate_host_shared(None)
+    runner._prepare_default_grammar_args()
     if speculative:
         runner._drafter_task_args = task_args_module.drafter_task_args(runner)
         runner._drafter_task_args.allocate_host_shared(None)
@@ -381,7 +382,9 @@ def test_packed_prefill_reads_each_requests_sampled_slot(monkeypatch):
     batch = _packed_prefill_batch()
     batch.allow_device_greedy_sampling = True
     monkeypatch.setattr(runner, "_ensure_l3_shared_buffers", lambda model: None)
-    monkeypatch.setattr(runner, "_prefill_dispatch_args", lambda *args: ())
+    monkeypatch.setattr(
+        runner, "_prefill_dispatch_args", lambda *args: (None,) * len(runner._prefill_task_args.names)
+    )
 
     def dispatch(*args):
         sampled = runner._prefill_task_args.tensors["sampled_ids"]
