@@ -2820,25 +2820,28 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
 
     @staticmethod
     def _copy_grammar_mask_row(destination: torch.Tensor, mask: np.ndarray) -> None:
+        DSparkModelRunner._copy_grammar_mask_rows(destination.unsqueeze(0), np.asarray(mask)[None, :])
+
+    @staticmethod
+    def _copy_grammar_mask_rows(destination: torch.Tensor, masks: np.ndarray) -> None:
         if sys.byteorder != "little":
             raise RuntimeError("DSpark packed grammar mask requires a little-endian host")
-        words = np.asarray(mask, dtype=np.int32)
-        if words.shape != (DSPARK_VOCAB_SIZE // 32,):
+        words = np.asarray(masks, dtype=np.int32)
+        if words.ndim != 2 or words.shape != (destination.shape[0], DSPARK_VOCAB_SIZE // 32):
             raise ValueError(f"invalid grammar mask shape {words.shape}")
-        if not np.any(words):
+        if not np.all(np.any(words, axis=1)):
             raise ValueError("grammar has no allowed token for an active sample row")
-        bit_rows = np.unpackbits(
-            np.ascontiguousarray(words).view(np.uint8), bitorder="little"
-        ).reshape(DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_TOKENS)
-        aligned = np.ones(
-            (DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS * 16),
-            dtype=np.uint8,
+        # Every 808-bit segment is exactly 101 bytes. Copy packed bytes directly
+        # into the shared destination; no vocabulary-sized bit expansion or
+        # temporary repacking tensor is needed, including at odd byte boundaries.
+        segment_bytes = DSPARK_GRAMMAR_SEGMENT_TOKENS // 8
+        packed = destination.numpy().view(np.uint8)
+        packed[:, :, :segment_bytes] = np.ascontiguousarray(words).view(np.uint8).reshape(
+            len(words), DSPARK_GRAMMAR_SEGMENTS, segment_bytes
         )
-        aligned[:, :DSPARK_GRAMMAR_SEGMENT_TOKENS] = bit_rows
-        packed = np.packbits(aligned, axis=1, bitorder="little").view(np.int16)
-        destination.copy_(torch.from_numpy(packed))
+        packed[:, :, segment_bytes:] = 255
         # Reserve one unused padding word as the device sampler's row-mode header.
-        destination[0, DSPARK_GRAMMAR_SEGMENT_WORDS - 1] = 0
+        packed[:, 0, -2:] = 0
 
     def _prepare_default_grammar_args(self) -> None:
         """Allocate immutable defaults before the chip workers inherit Host storage."""
@@ -2882,8 +2885,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if task_args is None:
             raise RuntimeError("DSpark prefill TaskArgs are not staged")
         masks = task_args.tensors["grammar_mask"]
-        for rank, row in self._prefill_grammar_rows:
-            masks[rank, row].fill_(-1)
+        previous = self._prefill_grammar_rows
         self._prefill_grammar_rows = set()
         active: set[tuple[int, int]] = set()
         try:
@@ -2892,11 +2894,16 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 if state is None:
                     continue
                 active.add((rank, row))
-                self._copy_grammar_mask_row(masks[rank, row], state.masks_for_rows(())[0])
+                valid, rows = state.plan_draft_rows(())
+                if valid != 0 or rows.shape != (1, DSPARK_VOCAB_SIZE // 32):
+                    raise ValueError("constraint provider returned invalid prefill row masks")
+                self._copy_grammar_mask_row(masks[rank, row], rows[0])
         except Exception:
-            for rank, row in active:
+            for rank, row in previous | active:
                 masks[rank, row].fill_(-1)
             raise
+        for rank, row in previous - active:
+            masks[rank, row].fill_(-1)
         self._prefill_grammar_rows = active
 
     def _stage_decode_grammar(
@@ -2908,8 +2915,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         task_args = self._decode_task_args[slot]
         masks = task_args.tensors["grammar_mask"]
         counts = task_args.tensors["valid_draft_counts"]
-        for rank, row in self._decode_grammar_rows[slot]:
-            masks[rank, row].fill_(-1)
+        previous = self._decode_grammar_rows[slot]
         self._decode_grammar_rows[slot] = set()
         counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
         active: set[tuple[int, int]] = set()
@@ -2923,21 +2929,22 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 if constraint is None:
                     continue
                 drafts = self._drafter_state(request_id).pending_draft_tokens
-                valid = constraint.validate_draft_prefix(drafts)
+                valid, rows = constraint.plan_draft_rows(drafts)
                 if not 0 <= valid <= min(len(drafts), DSPARK_DRAFTER_QUERY_WIDTH):
                     raise ValueError("constraint provider returned an invalid draft prefix length")
-                rows = constraint.masks_for_rows(drafts[:valid])
                 if rows.shape != (valid + 1, DSPARK_VOCAB_SIZE // 32):
                     raise ValueError(f"constraint provider returned invalid row masks {rows.shape}")
                 counts[group * layout.tp_size : (group + 1) * layout.tp_size, ordinal] = valid
-                for offset, mask in enumerate(rows):
-                    active.add((rank, row + offset))
-                    self._copy_grammar_mask_row(masks[rank, row + offset], mask)
+                active.update((rank, row + offset) for offset in range(valid + 1))
+                self._copy_grammar_mask_rows(masks[rank, row:row + valid + 1], rows)
         except Exception:
-            for rank, row in active:
+            for rank, row in previous | active:
                 masks[rank, row].fill_(-1)
             counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
             raise
+        # Rows overwritten by the new plan need no intermediate all-allowed fill.
+        for rank, row in previous - active:
+            masks[rank, row].fill_(-1)
         self._decode_grammar_rows[slot] = active
 
     # ------------------------------------------------------------------

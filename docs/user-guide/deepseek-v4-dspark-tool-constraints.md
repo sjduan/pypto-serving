@@ -78,6 +78,8 @@ Expect a completed `message.tool_calls` entry named `shell`, with `function.argu
 
 Ordinary batches reuse immutable device-resident all-allowed masks and default draft counts. The sampler skips bitset decoding for ordinary rows; constrained rows apply the mask before the same running-maximum reduction. These paths share the fused K7 interface and do not require a separate forward/sampling dispatch.
 
+Constrained requests reuse request-local Host bitmask storage. Draft validation and mask generation share one speculative traversal, then roll back; only committed output advances the grammar. Serving packs the valid prefix and bonus row directly into shared buffers without unpacking vocabulary bits. With asynchronous scheduling enabled, acceptance-independent metadata can prepare early, but mask planning still waits for that request's previous output to be committed. Mutable slot ownership lasts through output reclaim. Constrained masks still use the existing full-tensor runtime upload path; Host row reuse is not partial H2D transfer.
+
 Missing XGrammar, an unsupported schema, or an unsupported model path yields an HTTP 400 before streaming headers are sent. There is no fallback to unconstrained generation for a request that asked for constraints. Request completion and cancellation release request-local grammar state. Recompute preemption of a constrained request is not yet supported; under cache pressure it may wait for resources rather than preempt another constrained request.
 
 ## Upgrade and rollback

@@ -48,17 +48,62 @@ def test_repacked_bits_preserve_model_vocabulary() -> None:
     assert np.all(physical[:, DSPARK_GRAMMAR_SEGMENT_TOKENS:] == 1)
 
 
+@pytest.mark.parametrize("strided", [False, True])
+def test_direct_byte_packing_matches_bitwise_reference_and_clears_old_padding(strided):
+    rng = np.random.default_rng(9)
+    words = rng.integers(-(2**31), 2**31, DSPARK_VOCAB_SIZE // 32, dtype=np.int32)
+    if strided:
+        storage = np.zeros((len(words), 2), dtype=np.int32)
+        storage[:, 0] = words
+        words = storage[:, 0]
+        assert not words.flags.c_contiguous
+    expected_bits = np.ones((DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS * 16), np.uint8)
+    expected_bits[:, :DSPARK_GRAMMAR_SEGMENT_TOKENS] = np.unpackbits(
+        np.ascontiguousarray(words).view(np.uint8), bitorder="little"
+    ).reshape(DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_TOKENS)
+    expected = np.packbits(expected_bits, axis=1, bitorder="little").view(np.int16)
+    expected[0, -1] = 0
+    # A row view with a nonzero storage offset, initially containing stale bytes.
+    storage = torch.zeros((2, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS), dtype=torch.int16)
+    DSparkModelRunner._copy_grammar_mask_row(storage[1], words)
+    np.testing.assert_array_equal(storage[1].numpy(), expected)
+    assert torch.count_nonzero(storage[0]) == 0
+
+
+def test_bad_mask_is_rejected_before_destination_is_modified():
+    destination = torch.full((DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS), 123, dtype=torch.int16)
+    for words in (np.ones(1, dtype=np.int32), np.zeros(DSPARK_VOCAB_SIZE // 32, dtype=np.int32)):
+        with pytest.raises(ValueError):
+            DSparkModelRunner._copy_grammar_mask_row(destination, words)
+        assert torch.all(destination == 123)
+
+
+@pytest.mark.parametrize("length", range(1, 9))
+def test_bulk_mask_pack_matches_each_reference_row(length):
+    rng = np.random.default_rng(71)
+    masks = rng.integers(-(2**31), 2**31, (length, DSPARK_VOCAB_SIZE // 32), dtype=np.int32)
+    destination = torch.empty((length, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS), dtype=torch.int16)
+    DSparkModelRunner._copy_grammar_mask_rows(destination, masks)
+    physical = np.unpackbits(destination.numpy().view(np.uint8), axis=-1, bitorder="little")
+    np.testing.assert_array_equal(
+        physical[:, :, :DSPARK_GRAMMAR_SEGMENT_TOKENS].reshape(length, -1),
+        np.unpackbits(masks.view(np.uint8), axis=-1, bitorder="little"),
+    )
+    assert torch.all(destination[:, 0, -1] == 0)
+    masks[-1].fill(0)
+    destination.fill_(123)
+    with pytest.raises(ValueError, match="no allowed token"):
+        DSparkModelRunner._copy_grammar_mask_rows(destination, masks)
+    assert torch.all(destination == 123)
+
+
 def test_k7_mask_rows_and_draft_caps_are_isolated() -> None:
     class State:
-        def validate_draft_prefix(self, token_ids):
+        def plan_draft_rows(self, token_ids):
             assert token_ids == [11, 12, 13]
-            return 2
-
-        def masks_for_rows(self, token_ids):
-            assert token_ids == [11, 12]
             masks = np.full((3, DSPARK_VOCAB_SIZE // 32), -1, dtype=np.int32)
             masks[:, 0] = -2
-            return masks
+            return 2, masks
 
     runner = DSparkModelRunner.__new__(DSparkModelRunner)
     masks = torch.full(
@@ -137,16 +182,52 @@ def test_prefill_uses_the_same_default_mask_without_decode_count_argument() -> N
     ) == (marker, output)
 
 
+def test_decode_double_buffers_shrink_and_failure_clear_old_rows():
+    class State:
+        valid = 7
+        fail = False
+
+        def plan_draft_rows(self, drafts):
+            rows = np.full((self.valid + 1, DSPARK_VOCAB_SIZE // 32), -2, dtype=np.int32)
+            if self.fail:
+                rows[-1].fill(0)
+            return self.valid, rows
+
+    state = State()
+    runner = DSparkModelRunner.__new__(DSparkModelRunner)
+    runner._compiled = SimpleNamespace(layout=SimpleNamespace(tp_size=1))
+    runner._decode_task_args = [SimpleNamespace(tensors={
+        "grammar_mask": torch.full((1, 16, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS), -1, dtype=torch.int16),
+        "valid_draft_counts": torch.full((1, 2), 7, dtype=torch.int32),
+    }) for _ in range(2)]
+    runner._decode_grammar_rows = [set(), set()]
+    runner._drafter_state = lambda _: SimpleNamespace(pending_draft_tokens=list(range(7)))
+    inputs = SimpleNamespace(buffer_slot=0, request_ids=("r",), groups=(0,), group_ordinals=(0,), sampled_slots=((0, 0),))
+    batch = SimpleNamespace(constraint_states={"r": state})
+    runner._stage_decode_grammar(batch, inputs)
+    state.valid = 1
+    inputs.buffer_slot = 1
+    runner._stage_decode_grammar(batch, inputs)
+    assert runner._decode_grammar_rows == [{(0, i) for i in range(8)}, {(0, 0), (0, 1)}]
+    inputs.buffer_slot = 0
+    runner._stage_decode_grammar(batch, inputs)
+    assert torch.all(runner._decode_task_args[0].tensors["grammar_mask"][0, 2:] == -1)
+    state.fail = True
+    inputs.sampled_slots = ((0, 8),)
+    with pytest.raises(ValueError, match="no allowed token"):
+        runner._stage_decode_grammar(batch, inputs)
+    assert torch.all(runner._decode_task_args[0].tensors["grammar_mask"] == -1)
+    assert runner._decode_grammar_rows[0] == set()
+    assert runner._decode_grammar_rows[1] == {(0, 0), (0, 1)}
+
+
 def test_failed_decode_mask_staging_cannot_poison_reused_slot() -> None:
     class State:
-        def validate_draft_prefix(self, token_ids):
-            return 1
-
-        def masks_for_rows(self, token_ids):
+        def plan_draft_rows(self, token_ids):
             rows = np.full((2, DSPARK_VOCAB_SIZE // 32), -1, dtype=np.int32)
             rows[0, 0] = -2
             rows[1].fill(0)
-            return rows
+            return 1, rows
 
     runner = DSparkModelRunner.__new__(DSparkModelRunner)
     masks = torch.full(
@@ -177,11 +258,11 @@ def test_failed_prefill_mask_staging_cannot_poison_next_request() -> None:
         def __init__(self, allowed):
             self.allowed = allowed
 
-        def masks_for_rows(self, token_ids):
+        def plan_draft_rows(self, token_ids):
             row = np.full((1, DSPARK_VOCAB_SIZE // 32), -1 if self.allowed else 0, dtype=np.int32)
             if self.allowed:
                 row[0, 0] = -2
-            return row
+            return 0, row
 
     runner = DSparkModelRunner.__new__(DSparkModelRunner)
     masks = torch.full(

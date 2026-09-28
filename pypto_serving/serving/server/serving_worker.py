@@ -557,21 +557,36 @@ class WorkerProcess:
         prepared: _PreparedDecodeWork,
         scheduled: tuple[DecodeRequest, ...],
     ) -> DecodeBatch:
-        """Patch a prior token only when the active executor requests it.
+        """Bind live constraints and patch a token only when the executor needs it.
 
         DeepSeek fused MTP finalizes persistent state during prefill, so both
         cold and steady descriptors return the early-prepared batch unchanged.
         """
         assert prepared.batch is not None
+        batch = prepared.batch
+        constrained_ids = [
+            request.request_id for request in scheduled
+            if self._req_cache[request.request_id].constraint_spec is not None
+        ]
+        if constrained_ids:
+            # Early prepare may precede registration on the command lane. Never
+            # reuse an empty/stale snapshot as an unconstrained dispatch.
+            states = {}
+            for request_id in constrained_ids:
+                state = self._constraint_states.get(request_id)
+                if state is None:
+                    raise RuntimeError(f"constraint state is not registered for {request_id!r}")
+                states[request_id] = state
+            batch = replace(batch, constraint_states=states)
         if not self.executor.prepared_decode_requires_token(prepared.prepared):
-            return prepared.batch
+            return batch
         tokens = [self._resolve_decode_token(request) for request in scheduled]
         token_ids = torch.tensor(
             tokens,
             dtype=torch.long,
             device=self.model_record.runtime_model.runtime.device,
         ).unsqueeze(1)
-        return replace(prepared.batch, token_ids=token_ids)
+        return replace(batch, token_ids=token_ids)
 
     def _handle_profile_command(self, cmd: ProfileCommand) -> None:
         """Apply a profile command and acknowledge it after the file is flushed."""
@@ -900,14 +915,9 @@ class WorkerProcess:
             # Placeholder tokens cannot be embedded correctly until the prior
             # device result is available. Keep this executor on the serial path.
             return None
-        if any(
-            (cached := self._req_cache.get(request.request_id)) is not None
-            and cached.constraint_spec is not None
-            for request in cmd.decode_requests
-        ):
-            # Its next mask depends on the previous reclaim, so bind it on
-            # the device lane after that request's output is committed.
-            return None
+        # Constraints do not prevent acceptance-independent metadata preparation.
+        # The device lane still waits for these requests' prior output reclaim
+        # before touching matchers or drafts and staging the next mask.
         runtime_model = self.model_record.runtime_model
         if buffer_slot is None:
             buffer_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS

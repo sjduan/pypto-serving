@@ -14,6 +14,7 @@ from queue import Queue
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
@@ -323,7 +324,8 @@ def test_worker_close_releases_executor_once():
     assert worker.executor is None
 
 
-def test_worker_prepares_next_decode_while_prior_device_step_runs():
+@pytest.mark.parametrize("constrained", [False, True])
+def test_worker_prepares_next_decode_while_prior_device_step_runs(constrained):
     """MRV2 cadence: prepare and reclaim overlap the FIFO device lane."""
     model = _model(max_batch_size=1, eos_token_id=0)
     first_running = threading.Event()
@@ -335,6 +337,7 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     allow_first_reclaim = threading.Event()
     calls: list[tuple[str, int]] = []
     released: list[str] = []
+    committed = []
 
     class Executor:
         supports_async_decode_prepare = True
@@ -363,6 +366,10 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
         @classmethod
         def dispatch_prepared_decode(cls, _model, _batch, prepared):
             calls.append(("execute", prepared.slot))
+            if constrained:
+                # Planning the next mask can only see actually committed output.
+                assert committed == list(range(11, cls.device_token + 1))
+                assert "req" in _batch.constraint_states
             if len([call for call in calls if call[0] == "execute"]) == 1:
                 first_running.set()
                 assert allow_first_finish.wait(timeout=5)
@@ -402,6 +409,9 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
         "old": NewRequestData("old", [2], 0.0, 1.0, None),
     }
     worker._last_tokens = {"req": [10]}
+    if constrained:
+        worker._req_cache["req"].constraint_spec = {"provider_id": "xgrammar"}
+        worker._constraint_states = {"req": SimpleNamespace(accept=committed.extend)}
 
     first = StepCommand(
         new_requests=[],
@@ -440,7 +450,10 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     # N+1 is fully bound by prepare, so its device dispatch is not held behind
     # N's host-side output processing.
     assert first_reclaim_running.wait(timeout=5)
-    assert second_dispatched.wait(timeout=5)
+    if constrained:
+        assert not second_dispatched.wait(timeout=0.1)
+    else:
+        assert second_dispatched.wait(timeout=5)
     input_queue.put(encode_command(third))
     # Step N+2 maps back to N's slot and must not prepare until reclaim has
     # finished reading that slot's captured outputs.
@@ -448,6 +461,7 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     assert output_queue.empty()
     allow_first_reclaim.set()
     assert third_prepared.wait(timeout=5)
+    assert second_dispatched.wait(timeout=5)
 
     first_result = decode_result(output_queue.get(timeout=5))
     second_result = decode_result(output_queue.get(timeout=5))
@@ -462,6 +476,8 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     assert second_result.new_tokens == {"req": [12]}
     assert third_result.new_tokens == {"req": [13]}
     assert released == ["old"]
+    if constrained:
+        assert committed == [11, 12, 13]
     assert calls.index(("prepare", 0)) < calls.index(("execute", 0))
     assert calls.index(("execute", 0)) < calls.index(("reclaim", 0))
 
@@ -477,6 +493,28 @@ def test_worker_does_not_prepare_prefill_asynchronously():
     )
 
     assert worker._prepare_step_command(command) is None
+
+
+def test_constrained_dispatch_binds_live_state_after_early_prepare():
+    from pypto_serving.config.types import DecodeBatch
+
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = SimpleNamespace(prepared_decode_requires_token=lambda _: False)
+    worker._req_cache = {"req": NewRequestData("req", [1], 0.0, 1.0, None, constraint_spec={"active": True})}
+    live_state = object()
+    worker._constraint_states = {"req": live_state}
+    batch = DecodeBatch(
+        request_ids=["req"], token_ids=torch.tensor([[0]]), hidden_states=None,
+        seq_lens=torch.tensor([2]), constraint_states={},
+    )
+    prepared = SimpleNamespace(batch=batch, prepared=object())
+    scheduled = (DecodeRequest("req", -1, 2, []),)
+    bound = worker._late_bind_prepared_decode_batch(prepared, scheduled)
+    assert bound.constraint_states == {"req": live_state}
+    assert batch.constraint_states == {}
+    worker._constraint_states.clear()
+    with pytest.raises(RuntimeError, match="not registered"):
+        worker._late_bind_prepared_decode_batch(prepared, scheduled)
 
 
 def test_worker_does_not_prepare_host_embedding_decode_asynchronously():

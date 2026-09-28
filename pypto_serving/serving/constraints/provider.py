@@ -22,9 +22,13 @@ from .spec import ConstraintSpec
 class ConstraintState(Protocol):
     """A request's committed grammar position and speculative row planner."""
 
-    def validate_draft_prefix(self, token_ids: Sequence[int]) -> int: ...
+    def plan_draft_rows(self, token_ids: Sequence[int]) -> tuple[int, np.ndarray]:
+        """Return valid prefix length and its masks, including the bonus row.
 
-    def masks_for_rows(self, valid_draft_ids: Sequence[int]) -> np.ndarray: ...
+        Masks are borrowed until the next plan or close on this state. The
+        caller must consume them before then; a state has one sequential owner.
+        """
+        ...
 
     def accept(self, token_ids: Sequence[int]) -> None: ...
 
@@ -80,42 +84,24 @@ class XGrammarState:
         self._matcher = matcher
         self._xgr = xgr
         self.vocab_size = vocab_size
+        self._max_draft_tokens = 7
+        self._bitmask = xgr.allocate_token_bitmask(self._max_draft_tokens + 1, vocab_size)
+        self._mask_array = self._bitmask.numpy()
 
-    def validate_draft_prefix(self, token_ids: Sequence[int]) -> int:
-        advanced = 0
-        accepted = 0
-        try:
-            for token_id in token_ids:
-                if self._matcher.is_terminated():
-                    accepted += 1
-                    continue
-                if not self._matcher.accept_token(int(token_id)):
-                    break
-                advanced += 1
-                accepted += 1
-            return accepted
-        finally:
-            if advanced:
-                self._matcher.rollback(advanced)
-
-    def masks_for_rows(self, valid_draft_ids: Sequence[int]) -> np.ndarray:
-        rows = len(valid_draft_ids) + 1
-        bitmask = self._xgr.allocate_token_bitmask(rows, self.vocab_size)
+    def plan_draft_rows(self, token_ids: Sequence[int]) -> tuple[int, np.ndarray]:
+        """Fill masks and validate drafts in one rollback-safe matcher traversal."""
+        if len(token_ids) > self._max_draft_tokens:
+            raise ValueError("draft prefix exceeds the grammar rollback capacity")
         advanced = 0
         try:
-            for row, token_id in enumerate(valid_draft_ids):
+            for row in range(len(token_ids) + 1):
                 if self._matcher.is_terminated():
-                    bitmask[row].fill_(-1)
-                    continue
-                self._matcher.fill_next_token_bitmask(bitmask, row)
-                if not self._matcher.accept_token(int(token_id)):
-                    raise ValueError("a speculative token violates its grammar mask")
+                    self._mask_array[row:len(token_ids) + 1].fill(-1)
+                    return len(token_ids), self._mask_array[:len(token_ids) + 1]
+                self._matcher.fill_next_token_bitmask(self._bitmask, row)
+                if row == len(token_ids) or not self._matcher.accept_token(int(token_ids[row])):
+                    return row, self._mask_array[:row + 1]
                 advanced += 1
-            if self._matcher.is_terminated():
-                bitmask[-1].fill_(-1)
-            else:
-                self._matcher.fill_next_token_bitmask(bitmask, rows - 1)
-            return bitmask.numpy().copy()
         finally:
             if advanced:
                 self._matcher.rollback(advanced)
@@ -129,3 +115,5 @@ class XGrammarState:
 
     def close(self) -> None:
         self._matcher = None
+        self._bitmask = None
+        self._mask_array = None
