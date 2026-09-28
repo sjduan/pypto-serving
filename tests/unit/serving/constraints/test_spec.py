@@ -38,7 +38,7 @@ def _server(monkeypatch):
     monkeypatch.setattr("importlib.util.find_spec", lambda name: object() if name == "xgrammar" else None)
     engine = SimpleNamespace(
         tokenizer=SimpleNamespace(output_parser_id="deepseek_v4"),
-        config=SimpleNamespace(executor_cls="PyptoDeepSeekV4DSparkExecutor"),
+        config=SimpleNamespace(executor_cls="PyptoDeepSeekV4DSparkExecutor", model_dir="/unused"),
     )
     return ServingServer(engine, "model", GenerateConfig())
 
@@ -100,14 +100,15 @@ def test_preflight_rejects_invalid_schema_before_worker_registration(monkeypatch
     calls = []
 
     class Provider:
-        def __init__(self, tokenizer):
-            calls.append(tokenizer)
+        def __init__(self, tokenizer, model_vocab_size):
+            calls.append((tokenizer, model_vocab_size))
 
         def compile(self, candidate):
             assert candidate is spec
             raise RuntimeError("unsupported schema")
 
     monkeypatch.setattr("pypto_serving.serving.server.server.XGrammarProvider", Provider)
+    monkeypatch.setattr("pypto_serving.serving.server.server.read_model_config", lambda _: {"vocab_size": 129280})
     with pytest.raises(ValueError, match="invalid tool constraint: unsupported schema"):
         asyncio.run(server._preflight_constraint(spec))
-    assert calls == [server.engine.tokenizer]
+    assert calls == [(server.engine.tokenizer, 129280)]

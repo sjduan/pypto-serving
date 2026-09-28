@@ -201,8 +201,8 @@ def test_constrained_worker_error_releases_matcher_and_next_request_is_healthy(m
             self.closed = True
 
     class Provider:
-        def __init__(self, tokenizer):
-            pass
+        def __init__(self, tokenizer, model_vocab_size):
+            assert model_vocab_size == 129280
 
         def compile(self, spec):
             state = State()
@@ -213,7 +213,7 @@ def test_constrained_worker_error_releases_matcher_and_next_request_is_healthy(m
     worker = WorkerProcess.__new__(WorkerProcess)
     worker.executor = SimpleNamespace(release_finished_requests=released.extend)
     worker.sampler = SimpleNamespace(release_requests=lambda ids: None)
-    worker.model_record = SimpleNamespace(tokenizer=object())
+    worker.model_record = SimpleNamespace(tokenizer=object(), config=SimpleNamespace(vocab_size=129280))
     worker._req_cache = {}
     worker._last_tokens = {}
     worker._constraint_states = {}

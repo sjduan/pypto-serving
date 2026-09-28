@@ -38,7 +38,7 @@ class ConstraintState(Protocol):
 class XGrammarProvider:
     """Compile model structural tags against the checkpoint's actual tokenizer."""
 
-    def __init__(self, tokenizer) -> None:
+    def __init__(self, tokenizer, model_vocab_size: int) -> None:
         try:
             import xgrammar as xgr
         except ImportError as exc:
@@ -48,9 +48,12 @@ class XGrammarProvider:
         if backend_tokenizer is None:
             raise ValueError("xgrammar requires a Hugging Face tokenizer backend")
         vocabulary = tokenizer.get_vocab()
-        self.vocab_size = max(vocabulary.values()) + 1
-        if self.vocab_size != len(vocabulary):
+        tokenizer_vocab_size = max(vocabulary.values()) + 1
+        if tokenizer_vocab_size != len(vocabulary):
             raise ValueError("xgrammar requires a contiguous tokenizer vocabulary")
+        if model_vocab_size < tokenizer_vocab_size:
+            raise ValueError("model vocabulary is smaller than the tokenizer vocabulary")
+        self.vocab_size = model_vocab_size
         self._xgr = xgr
         tokenizer_info = xgr.TokenizerInfo.from_huggingface(
             backend_tokenizer, vocab_size=self.vocab_size

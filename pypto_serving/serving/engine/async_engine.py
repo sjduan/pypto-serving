@@ -585,7 +585,9 @@ class ReplicaEngineCore:
         in-flight), False if the scheduler produced nothing.
         """
         with profile_span("scheduler.schedule", cat="scheduler"):
-            scheduler_output = self.scheduler.schedule()
+            scheduler_output = self.scheduler.schedule(
+                allow_reject_stalled=not self._batch_queue
+            )
         for request_id, reason in scheduler_output.rejected_requests.items():
             logger.warning("request %s rejected during scheduling: %s", request_id, reason)
             ctx = self._request_contexts.get(request_id)

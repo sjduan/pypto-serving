@@ -928,7 +928,7 @@ def test_constrained_request_is_not_recomputed_without_grammar_replay():
     assert protected.status is RequestStatus.RUNNING
 
 
-def test_constrained_request_waits_under_cache_pressure_then_admits_after_release():
+def test_constrained_request_waits_for_inflight_work_then_rejects_if_no_progress():
     manager = KvCacheManager(num_blocks=1, block_size=1, enable_prefix_cache=False)
     scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
     protected = Request(
@@ -945,14 +945,24 @@ def test_constrained_request_waits_under_cache_pressure_then_admits_after_releas
     waiter = Request("waiter", [2], max_new_tokens=1)
     scheduler.add_request(waiter)
 
+    protected.num_output_placeholders = 1
     blocked = scheduler.schedule()
     assert blocked.is_empty
     assert not blocked.preempted_requests
+    assert not blocked.rejected_requests
     assert protected.status is RequestStatus.RUNNING
     assert [request.request_id for request in scheduler.waiting] == ["waiter"]
 
-    scheduler.abort_request("protected")
+    protected.num_output_placeholders = 0
+    in_flight = scheduler.schedule(allow_reject_stalled=False)
+    assert in_flight.is_empty
+    assert not in_flight.rejected_requests
+    assert protected.status is RequestStatus.RUNNING
+
     admitted = scheduler.schedule()
+    assert "cannot allocate KV blocks" in admitted.rejected_requests["protected"]
+    assert protected.status is RequestStatus.FINISHED_ABORTED
+    assert "protected" not in scheduler.requests
     assert [item.request.request_id for item in admitted.scheduled_requests] == ["waiter"]
 
 

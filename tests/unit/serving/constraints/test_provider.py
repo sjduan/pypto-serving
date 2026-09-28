@@ -8,13 +8,32 @@
 # -----------------------------------------------------------------------------------------------------------
 """Speculative mask planning is single-pass, borrowed, and rollback-safe."""
 
+import sys
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-from pypto_serving.serving.constraints.provider import XGrammarState
+from pypto_serving.serving.constraints.provider import XGrammarProvider, XGrammarState
+
+
+def test_provider_uses_model_vocab_width_without_weakening_tokenizer_validation(monkeypatch):
+    seen = []
+    fake_xgrammar = SimpleNamespace(
+        TokenizerInfo=SimpleNamespace(from_huggingface=lambda _, vocab_size: seen.append(vocab_size)),
+        GrammarCompiler=lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setitem(sys.modules, "xgrammar", fake_xgrammar)
+    tokenizer = SimpleNamespace(tokenizer=object(), get_vocab=lambda: {"a": 0, "b": 1})
+    provider = XGrammarProvider(tokenizer, 64)
+    assert provider.vocab_size == 64
+    assert seen == [64]
+    with pytest.raises(ValueError, match="smaller than the tokenizer"):
+        XGrammarProvider(tokenizer, 1)
+    tokenizer.get_vocab = lambda: {"a": 0, "b": 2}
+    with pytest.raises(ValueError, match="contiguous"):
+        XGrammarProvider(tokenizer, 64)
 
 
 class Matcher:

@@ -20,6 +20,7 @@ import uuid
 from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
+from pypto_serving.model.model_family import read_model_config
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import XGrammarProvider
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
@@ -701,7 +702,10 @@ class ServingServer:
 
     def _compile_constraint_for_preflight(self, spec: ConstraintSpec) -> None:
         if self._constraint_preflight_provider is None:
-            self._constraint_preflight_provider = XGrammarProvider(self.engine.tokenizer)
+            model_vocab_size = int(read_model_config(self.engine.config.model_dir)["vocab_size"])
+            self._constraint_preflight_provider = XGrammarProvider(
+                self.engine.tokenizer, model_vocab_size
+            )
         with profile_span("ServingServer.constraint_preflight", cat="constraints"):
             state = self._constraint_preflight_provider.compile(spec)
         state.close()

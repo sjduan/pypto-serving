@@ -295,7 +295,7 @@ class Scheduler:
     def has_work(self) -> bool:
         return len(self.running) > 0 or len(self.waiting) > 0
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, *, allow_reject_stalled: bool = True) -> SchedulerOutput:
         output = SchedulerOutput()
         token_budget = self.config.max_num_scheduled_tokens
         grouped_phase = self._grouped_cache_phase()
@@ -304,6 +304,7 @@ class Scheduler:
         scheduled_req_ids: set[str] = set()
         num_scheduled_tokens: dict[str, int] = {}
         running_to_keep: list[Request] = []
+        stalled_constrained: list[Request] = []
         for request in self.running:
             # A request later in this snapshot may have been preempted while
             # scheduling an earlier request. Do not schedule it again from the
@@ -348,6 +349,8 @@ class Scheduler:
                     request, scheduled_req_ids, num_scheduled_tokens, output
                 )
                 if preempted is None:
+                    if request.constraint_spec is not None:
+                        stalled_constrained.append(request)
                     running_to_keep.append(request)
                     continue
                 token_budget += preempted.get("returned_tokens", 0)
@@ -388,6 +391,24 @@ class Scheduler:
             for request in running_to_keep
             if request.status is not RequestStatus.PREEMPTED
         ]
+        if (
+            allow_reject_stalled
+            and stalled_constrained
+            and not output.scheduled_requests
+            and not any(
+                request.num_output_placeholders or request.terminal_prefill_in_flight
+                for request in self.running
+            )
+        ):
+            # No running request can free a block or produce an in-flight result.
+            # Recompute preemption cannot reconstruct a constrained matcher, so
+            # fail one stalled request explicitly instead of spinning forever.
+            victim = stalled_constrained[-1]
+            self.abort_request(victim.request_id)
+            output.rejected_requests[victim.request_id] = (
+                f"Request {victim.request_id} cannot allocate KV blocks; "
+                "constrained recompute preemption is not supported"
+            )
 
         # Keep grouped-cache commands single-phase. Prefill may run in the next
         # scheduler step, after the round-robin selector rotates away from decode.

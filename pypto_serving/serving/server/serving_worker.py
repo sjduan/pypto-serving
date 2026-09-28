@@ -652,7 +652,9 @@ class WorkerProcess:
                 if spec.provider_id != "xgrammar":
                     raise ValueError(f"unsupported constraint provider {spec.provider_id!r}")
                 if self._xgrammar_provider is None:
-                    self._xgrammar_provider = XGrammarProvider(self.model_record.tokenizer)
+                    self._xgrammar_provider = XGrammarProvider(
+                        self.model_record.tokenizer, self.model_record.config.vocab_size
+                    )
                 with profile_span("WorkerProcess.constraint_compile", cat="constraints"):
                     self._constraint_states[new_request.request_id] = self._xgrammar_provider.compile(spec)
             self._req_cache[new_request.request_id] = new_request
