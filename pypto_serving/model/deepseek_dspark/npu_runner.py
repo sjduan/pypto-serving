@@ -40,8 +40,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from pypto_serving.model.common.runner.task_args import TaskArgs
 
-import torch
 import numpy as np
+import torch
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
 
 from pypto_serving.config.types import (
