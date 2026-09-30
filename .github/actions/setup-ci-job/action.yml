@@ -90,11 +90,6 @@ inputs:
       The runner name in the path covers concurrency (an instance runs one job at
       a time, so each tree has a single writer); this input covers the rest.
     required: true
-  pypto-commit:
-    description: >-
-      Full PyPTO commit to build. Its pinned runtime submodule and toolchain
-      versions determine the matching Simpler, PTO-ISA, and PTOAS revisions.
-    required: true
   needs-device:
     description: >-
       When 'true' the job talks to an NPU: verify a card is visible (npu-smi) and
@@ -270,8 +265,6 @@ runs:
       # revision. pypto owns ptoas (toolchain/versions.env) and pins pto-isa via
       # its runtime submodule (runtime/pto_isa.pin); read both.
       shell: bash
-      env:
-        PYPTO_COMMIT: ${{ inputs.pypto-commit }}
       run: |
         # $PYPTO_SRC is the per-job build tree exported by the loader step.
         # github.com clones/fetches over this runner's link drop mid-transfer
@@ -293,36 +286,23 @@ runs:
             sleep $((attempt * 10))
           done
         }
-        if [[ ! "$PYPTO_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-          echo "::error::pypto-commit must be a full 40-character commit SHA"
-          exit 1
-        fi
-        # Build the pinned revision, independent of later PyPTO main changes.
+        # Follow the latest commit on pypto's default branch on every CI run.
         if [ -d "$PYPTO_SRC/.git" ]; then
-          echo "Cache hit — selecting pinned pypto"
-          if ! git -C "$PYPTO_SRC" cat-file -e "$PYPTO_COMMIT^{commit}" 2>/dev/null; then
-            retry git -C "$PYPTO_SRC" fetch --depth=1 origin "$PYPTO_COMMIT" || exit 1
-          fi
-          git -C "$PYPTO_SRC" checkout --detach --force "$PYPTO_COMMIT"
+          echo "Cache hit — updating pypto"
+          retry git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD || exit 1
+          git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
           git -C "$PYPTO_SRC" clean -ffdx
           git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
         else
-          echo "Cache miss — cloning pinned pypto"
+          echo "Cache miss — cloning pypto"
           mkdir -p "$(dirname "$PYPTO_SRC")"
           # rm before each attempt so a retried clone never hits a partial dir.
-          clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 --no-checkout https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
+          clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
           retry clone_pypto || exit 1
-          retry git -C "$PYPTO_SRC" fetch --depth=1 origin "$PYPTO_COMMIT" || exit 1
-          git -C "$PYPTO_SRC" checkout --detach "$PYPTO_COMMIT"
         fi
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
-        actual_pypto_commit=$(git -C "$PYPTO_SRC" rev-parse HEAD)
-        if [ "$actual_pypto_commit" != "$PYPTO_COMMIT" ]; then
-          echo "::error::expected pypto $PYPTO_COMMIT, got $actual_pypto_commit"
-          exit 1
-        fi
-        echo "pypto under test: $actual_pypto_commit"
+        echo "pypto under test: $(git -C "$PYPTO_SRC" rev-parse HEAD)"
         # PTOAS ships one wheel per arch, with a matching PTOAS_SHA256_<ARCH> in
         # versions.env — so the arch is detected here rather than pinned, and only
         # the version has to be managed (upstream, in pypto's versions.env). An

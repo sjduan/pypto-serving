@@ -96,9 +96,6 @@ jobs:
           # never land on one dir.
           build-namespace: pypto-serving
           pip-cache-name: pip-pypto-serving
-          # Keep CI on the PyPTO revision validated with this Serving/Lib pair.
-          # Its runtime submodule also pins the matching Simpler and PTO-ISA.
-          pypto-commit: ee49fceaa3290cf90257a22eab867c04245b499d
 
       - name: Run Qwen3 accuracy guard
         env:
