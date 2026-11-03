@@ -386,7 +386,13 @@ class ReplicaEngineCore:
 
             logger.info("Waiting for worker to initialize model...")
             try:
-                await wait_worker_ready(process, ready_event, cache_capacity, self._init_timeout)
+                await wait_worker_ready(process, ready_event, cache_capacity, self._init_timeout,
+                                        stop_requested=lambda: self._stop_task is not None)
+                # This check and publication below have no intervening await:
+                # stop's single-owner gate and startup publication are ordered
+                # on the engine event loop, even if readiness is already set.
+                if self._stop_task is not None:
+                    raise RuntimeError("Worker startup interrupted by stop")
                 # Include metadata initialization in the same cleanup scope.
                 reported_num_blocks = cache_capacity[0]
                 group_sizes = {group.name: cache_capacity[index]
@@ -398,10 +404,16 @@ class ReplicaEngineCore:
                 )
             except BaseException as exc:
                 self.startup_error = f"{type(exc).__name__}: {exc}"
-                try:
-                    await finish_cleanup(self._ensure_stop_task(timeout=5))
-                except BaseException:
-                    logger.exception("Startup cleanup failed; original startup error preserved")
+                self.shutdown_report["startup_error"] = self.startup_error
+                if self._stop_task is None:
+                    try:
+                        await finish_cleanup(self._ensure_stop_task(timeout=5))
+                    except BaseException:
+                        logger.exception("Startup cleanup failed; original startup error preserved")
+                # An external stop already owns/drains cleanup. Report startup
+                # interruption promptly rather than await that owner from a
+                # pending start it may itself need to observe. Its callers and
+                # repeated stop still join the same tracked cleanup task.
                 raise
             logger.info("Worker ready")
 
@@ -508,6 +520,7 @@ class ReplicaEngineCore:
             raise
         self.shutdown_report.update({
             "worker_reaped": reaped,
+            "startup_error": getattr(self, "startup_error", None),
             "native_ddr_obligations": len(native_ddr.jobs) + len(native_ddr.steps) if native_ddr else 0,
         })
         logger.info("Worker reap result (not native/driver release proof): %s", self.shutdown_report)

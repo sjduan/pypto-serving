@@ -31,7 +31,7 @@ import pytest
 
 class _DeviceImportGuard(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in {"torch_npu", "pypto", "acl", "runtime"}:
+        if fullname.split('.')[0] in {"torch_npu", "pypto", "acl", "runtime", "_task_interface"}:
             raise ImportError(f"device module forbidden in host test: {fullname}")
         return None
 
@@ -305,6 +305,149 @@ def test_stopped_core_cannot_spawn_again_using_an_old_completed_stop_owner():
             await core.start()
         assert not process.alive and process.joins == 1
     asyncio.run(check())
+
+
+async def _wait_for_host(predicate):
+    async def poll():
+        while not predicate():
+            await asyncio.sleep(0.001)
+    await asyncio.wait_for(poll(), 1)
+
+
+@pytest.mark.parametrize("outcome", ["ready", "never-ready", "init-error", "caller-cancel"])
+@pytest.mark.parametrize("cancel_stop", [False, True])
+def test_stop_during_real_start_cannot_publish_loop_during_reap(tmp_path, outcome, cancel_stop):
+    class GatedProcess(_Process):
+        def __init__(self):
+            super().__init__()
+            self.join_entered = threading.Event()
+            self.release_join = threading.Event()
+
+        def join(self, timeout=None):
+            self.join_entered.set()
+            assert self.release_join.wait(timeout=2), "host fixture must release fake join"
+            super().join(timeout)
+
+    async def check():
+        event, process = _Event(), GatedProcess()
+        messages = queue.Queue()
+        factory = lambda config: (process, messages, queue.Queue(), queue.Queue(), event, [8])
+        # Use the REAL engine loop implementation, not the _Core test subclass.
+        core = ReplicaEngineCore(EngineConfig(), SimpleNamespace(), worker_factory=factory)
+        core._init_timeout = 1
+        start = asyncio.create_task(core.start())
+        await _wait_for_host(lambda: event.checks > 0)
+        stop = asyncio.create_task(core.stop())
+        await _wait_for_host(process.join_entered.is_set)
+        owner = core._stop_task
+        assert owner is not None and not owner.done()
+        if outcome == "ready":
+            process.startup_status[0] = 1
+            event.ready = True
+        elif outcome == "init-error":
+            error = b"original-host-init-error-during-stop"
+            process.startup_status[1:1 + len(error)] = error
+            process.startup_status[0] = 2
+            event.ready = True
+        elif outcome == "caller-cancel":
+            start.cancel("original startup caller cancellation")
+        if cancel_stop:
+            stop.cancel()
+            await asyncio.sleep(0)
+            stop.cancel()  # cleanup owner must survive both caller cancels
+        try:
+            if outcome == "caller-cancel":
+                with pytest.raises(asyncio.CancelledError, match="original startup caller cancellation"):
+                    await asyncio.wait_for(start, 0.5)
+            else:
+                expected = "original-host-init-error" if outcome == "init-error" else "interrupted by stop"
+                with pytest.raises(RuntimeError, match=expected):
+                    await asyncio.wait_for(start, 0.5)
+            assert not core._running and core._loop_task is None
+            assert core.kv_cache_manager.num_blocks == 0
+        finally:
+            process.release_join.set()
+        if cancel_stop:
+            with pytest.raises(asyncio.CancelledError):
+                await stop
+        else:
+            assert await stop
+        assert await core.stop()
+        assert core._stop_task is owner and process.joins == 1
+        assert not process.alive
+        assert isinstance(decode_command(messages.get_nowait()), ShutdownCommand)
+        assert messages.empty()
+        assert core.shutdown_report["startup_error"] == core.startup_error
+        assert core.shutdown_report["native_children_stopped"] == "unknown"
+        _assert_owned_tasks_done(core)
+        result = dict(host_only=True, business_passed=False, startup_error=core.startup_error,
+                      shutdown_report=core.shutdown_report, loop_created=core._loop_task is not None)
+        (tmp_path / "stop-during-start.json").write_text(json.dumps(result), encoding="utf-8")
+    before = set(threading.enumerate())
+    asyncio.run(check())
+    assert set(threading.enumerate()) == before
+
+
+@pytest.mark.parametrize("start_first", [False, True])
+def test_already_ready_and_stop_same_tick_have_one_publication_order(start_first):
+    async def check():
+        event, process = _Event(True), _Process()
+        process.startup_status[0] = 1
+        factory = lambda config: (process, queue.Queue(), queue.Queue(), queue.Queue(), event, [8])
+        core = ReplicaEngineCore(EngineConfig(), SimpleNamespace(), worker_factory=factory)
+        if start_first:
+            start = asyncio.create_task(core.start())
+            stop = asyncio.create_task(core.stop())
+        else:
+            stop = asyncio.create_task(core.stop())
+            start = asyncio.create_task(core.start())
+        if start_first:
+            await start
+        else:
+            with pytest.raises(RuntimeError, match="fresh core"):
+                await start
+        assert await stop and await core.stop()
+        assert not core._running
+        assert process.joins == (1 if start_first else 0)
+        _assert_owned_tasks_done(core)
+    before = set(threading.enumerate())
+    asyncio.run(check())
+    assert set(threading.enumerate()) == before
+
+
+@pytest.mark.parametrize("cleanup", ["false", "error"])
+def test_pending_start_external_stop_preserves_sticky_cleanup_failure(cleanup):
+    class FailingCore(ReplicaEngineCore):
+        def _shutdown_worker(self, *, timeout):
+            raise RuntimeError("original-external-stop-cleanup-error")
+
+    async def check():
+        event, process = _Event(), _Process(reaps=False)
+        factory = lambda config: (process, queue.Queue(), queue.Queue(), queue.Queue(), event, [8])
+        cls = FailingCore if cleanup == "error" else ReplicaEngineCore
+        core = cls(EngineConfig(), SimpleNamespace(), worker_factory=factory)
+        core._init_timeout = 1
+        start = asyncio.create_task(core.start())
+        await _wait_for_host(lambda: event.checks > 0)
+        stop = asyncio.create_task(core.stop())
+        with pytest.raises(RuntimeError, match="interrupted by stop"):
+            await start
+        if cleanup == "error":
+            with pytest.raises(RuntimeError, match="original-external-stop-cleanup-error"):
+                await stop
+            with pytest.raises(RuntimeError, match="original-external-stop-cleanup-error"):
+                await core.stop()
+            assert "original-external-stop-cleanup-error" in core.shutdown_report["cleanup_error"]
+        else:
+            assert not await stop and not await core.stop()
+            assert process.joins == 3 and process.signals == ["terminate", "kill"]
+        assert core.shutdown_report["worker_reaped"] is False
+        assert core.shutdown_report["native_children_stopped"] == "unknown"
+        assert "interrupted by stop" in core.startup_error
+        _assert_owned_tasks_done(core)
+    before = set(threading.enumerate())
+    asyncio.run(check())
+    assert set(threading.enumerate()) == before
 
 
 if __name__ == "__main__":

@@ -649,6 +649,23 @@ class Scheduler:
                     continue
 
             allocated = self._try_allocate_request_blocks(request, num_new)
+            if not allocated and native_ddr is not None:
+                # Reserve-time minimum headroom is not a guarantee for this
+                # actual suffix chunk. Do not let other completed loader pins
+                # permanently block the FCFS head; native-owned pins stay put.
+                if native_ddr.release_completed_restores():
+                    allocated = self._try_allocate_request_blocks(request, num_new)
+                if not allocated and cached_blocks:
+                    # Capacity may have changed while LOAD was pending, or a
+                    # long suffix chunk may need more pages than cold prefill.
+                    # Drop only this lookup's request refs and retry the normal
+                    # cold allocation once, without repeating prefix lookup.
+                    self._release_waiting_prefix_blocks(request)
+                    cold_num_new = self._limit_scheduled_tokens(request, token_budget)
+                    if cold_num_new > 0:
+                        allocated = self._try_allocate_request_blocks(request, cold_num_new)
+                        if allocated:
+                            num_new = cold_num_new
             if not allocated and grouped_prefix_hit:
                 # A grouped hit is rank-local. If its partition cannot hold the
                 # uncached suffix, release the hit and retry cold so an idle

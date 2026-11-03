@@ -111,8 +111,9 @@ class DdrPrefixCoordinator:
     def reserve_restore(self, request, keys, local_blocks) -> RestoreDecision:
         req_key = self._request_key(request)
         fresh = [key for key in keys if (self.worker_epoch, key) not in self.loads_by_key]
-        # Leave room for the next complete minimal suffix step, not merely the
-        # transferred pages. This does not reserve a second private free queue.
+        # This is only the minimum one-token suffix headroom. The scheduler
+        # checks the actual chunk allocation and can relinquish completed
+        # restore pins before retrying; no private suffix/free-page pool exists.
         if self.manager.num_free_blocks < len(fresh) + 1 or len(self.jobs) + len(fresh) > self.max_entries:
             return RestoreDecision(RestoreKind.MISS)
         blocks = self.manager.allocate_blocks(len(fresh))
@@ -137,6 +138,9 @@ class DdrPrefixCoordinator:
         # Transfer ownership of the initial lookup refs only on WAIT.
         self.waiters[req_key] = _Waiter(request, job_ids, tuple(b.block_id for b in local_blocks))
         request.scheduling_held = True
+        # All canonical targets may already be committed behind a prefix gap.
+        # Such a late waiter must not need another event to become runnable.
+        self._wake_waiters()
         return RestoreDecision(RestoreKind.WAIT, tuple(sorted(job_ids)))
 
     def next_transfer(self) -> DdrTransferRequest | None:
@@ -248,8 +252,9 @@ class DdrPrefixCoordinator:
                 job.state = LoadState.DISCARD_PENDING
                 if not success and self.ready.get(key) == req.entry_refs[0]:
                     self.ready.pop(key, None)
-            # The loader pin is held across ordinary lookup by ALL waiters.
-            self.loads_by_key.pop((req.worker_epoch, key), None)
+                self.loads_by_key.pop((req.worker_epoch, key), None)
+            # A committed target stays canonical across gaps in ordinary HBM
+            # lookup until its LAST waiter has acquired a ref or left waiting.
         if self.active_job == req.job_id:
             self.active_job = None
         if req.operation == Operation.STORE:
@@ -293,8 +298,26 @@ class DdrPrefixCoordinator:
 
     def _finish_load(self, job_id):
         job = self.jobs.pop(job_id)
+        index_key = (job.request.worker_epoch, job.request.entry_keys[0])
+        if self.loads_by_key.get(index_key) == job_id:
+            del self.loads_by_key[index_key]
         self._release(job.lease)
         job.state = LoadState.RELEASED
+
+    def release_completed_restores(self):
+        """Relinquish unconsumed restore refs on actual suffix admission failure.
+
+        Only fully settled waiters can be abandoned. Their valid pages remain
+        ordinary evictable cache entries; queued/loading/quarantined targets,
+        shared pins still needed by held waiters, step and STORE refs survive.
+        Requests stay WAITING and may use normal lookup/cold prefill later.
+        """
+        before = self.manager.num_free_blocks
+        for req_key, waiter in tuple(self.waiters.items()):
+            if all(self.jobs[j].state in (LoadState.COMMITTED, LoadState.DISCARD_PENDING)
+                   for j in waiter.jobs):
+                self.cancel_request(*req_key)
+        return self.manager.num_free_blocks > before
 
     def cancel_request(self, request_id, request_epoch):
         req_key = (request_id, request_epoch)

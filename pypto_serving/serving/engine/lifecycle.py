@@ -10,15 +10,19 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Callable
 
 
-async def wait_worker_ready(process, ready_event, cache_capacity, timeout: float) -> None:
+async def wait_worker_ready(process, ready_event, cache_capacity, timeout: float,
+                            *, stop_requested: Callable[[], bool] | None = None) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         status = getattr(process, "startup_status", None)
         if status is not None and status[0] == 2:
             error = bytes(status[1:]).split(b"\x00", 1)[0].decode("utf-8", errors="replace")
             raise RuntimeError(f"Worker initialization failed: {error}")
+        if stop_requested is not None and stop_requested():
+            raise RuntimeError("Worker startup interrupted by stop")
         if not process.is_alive():
             raise RuntimeError(f"Worker exited during initialization (exitcode={process.exitcode})")
         if ready_event.is_set():

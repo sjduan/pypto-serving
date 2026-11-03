@@ -646,3 +646,190 @@ def test_quarantined_engine_rejects_before_scheduler_or_model_admission():
     # No scheduler/worker exists: rejection must precede touching either.
     with pytest.raises(RuntimeError, match="quarantined"):
         core._try_dispatch_step()
+
+
+def _seed_full_prefix(coord, manager, req, count):
+    keys = [PrefixKey(coord.namespace, block_hash)
+            for block_hash in manager.compute_block_hashes(req.prompt_token_ids)[:count]]
+    for index, key in enumerate(keys):
+        coord.ready[key] = DdrEntryRef(coord.worker_epoch, f"{req.request_id}:{index}", len(coord.ready) + 1)
+    return keys
+
+
+@pytest.mark.parametrize("chunk", [1, 128, 129, 256, 512])
+@pytest.mark.parametrize("requests,pages", [(2, 5), (3, 7)])
+def test_completed_multi_block_restores_allow_actual_suffix_admission(chunk, requests, pages):
+    coord, manager = coordinator(num_blocks=pages)
+    sched = Scheduler(SchedulerConfig(max_num_scheduled_tokens=512,
+                                      max_prefill_tokens_per_request=chunk), manager)
+    sched._native_ddr = coord
+    for index in range(requests):
+        req = request(str(index), 385)
+        req.prompt_token_ids = [token + index * 10000 for token in req.prompt_token_ids]
+        _seed_full_prefix(coord, manager, req, 2)
+        sched.add_request(req)
+    assert not sched.schedule().scheduled_requests
+    assert len(coord.jobs) == requests * 2
+    transfers = []
+    while (job := coord.next_transfer()) is not None:
+        transfers.append(job)
+        coord.on_transfer_event(event_for(job))
+    assert len(transfers) == requests * 2
+    assert coord.active_job is None
+    # No pending native/model result could unstick this state: schedule itself
+    # must drop reclaimable loader pins and make progress, without user abort.
+    output = sched.schedule()
+    assert output.scheduled_requests
+    first = output.scheduled_requests[0]
+    assert first.request.request_id == "0"
+    assert first.num_computed_tokens == 256
+    assert first.num_new_tokens == min(chunk, 129)
+    assert len(first.block_ids) == 2 + (first.num_new_tokens + 127) // 128
+    for req in list(sched.requests.values()):
+        sched.abort_request(req.request_id)
+    coord.close()
+    assert not coord.loads_by_key and not coord.waiters and not coord.jobs
+    assert manager.num_free_blocks == pages
+    assert all(page.ref_cnt == 0 for page in manager.blocks)
+
+
+@pytest.mark.parametrize("chunk", [129, 256])
+def test_restore_capacity_change_can_fall_back_to_cold_without_losing_other_pins(chunk):
+    coord, manager = coordinator(num_blocks=4)
+    sched = Scheduler(SchedulerConfig(max_num_scheduled_tokens=512,
+                                      max_prefill_tokens_per_request=chunk), manager)
+    sched._native_ddr = coord
+    req = request(length=385)
+    _seed_full_prefix(coord, manager, req, 2)
+    sched.add_request(req)
+    assert not sched.schedule().scheduled_requests
+    # Another normal owner consumes capacity AFTER reserve. A restored suffix
+    # now needs four pages, while a cold chunk needs only two and can progress.
+    other_blocks = manager.allocate_blocks(1)
+    assert other_blocks is not None
+    other_page = other_blocks[0]
+    while (job := coord.next_transfer()) is not None:
+        coord.on_transfer_event(event_for(job))
+    output = sched.schedule()
+    assert len(output.scheduled_requests) == 1
+    scheduled = output.scheduled_requests[0]
+    assert scheduled.num_computed_tokens == 0
+    assert scheduled.num_new_tokens == chunk
+    assert len(scheduled.block_ids) == 2
+    assert other_page.block_id not in scheduled.block_ids and other_page.ref_cnt == 1
+    assert not coord.jobs and not coord.loads_by_key and not coord.waiters
+    sched.abort_request(req.request_id)
+    manager.release_blocks_by_ids([other_page.block_id])
+    coord.close()
+    assert manager.num_free_blocks == 4
+
+
+def _next_load_for_key(coord, key):
+    # CPU fault-injection ordering, independent of production queue preference.
+    job_id = coord.loads_by_key[(coord.worker_epoch, key)]
+    coord.outbound.remove(job_id)
+    coord.outbound.appendleft(job_id)
+    job = coord.next_transfer()
+    assert job.entry_keys == (key,)
+    return job
+
+
+@pytest.mark.parametrize("completed_index", [0, 1])
+@pytest.mark.parametrize("cancel", ["none", "first", "second", "all"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_partial_multi_block_completion_late_join_and_cancel_balance_refs(completed_index, cancel, failed):
+    coord, manager = coordinator()
+    first, second = request("first", 257), request("second", 257)
+    keys = _seed_full_prefix(coord, manager, first, 2)
+    assert coord.lookup_after_hbm(first, [], 256).kind == RestoreKind.WAIT
+    original_jobs = set(coord.jobs)
+    original_pages = {job.lease.block_ids for job in coord.jobs.values()}
+    done = _next_load_for_key(coord, keys[completed_index])
+    coord.on_transfer_event(event_for(done))
+    coord.on_transfer_event(event_for(done))
+    assert first.scheduling_held  # the other block has not completed
+    local = manager.get_computed_blocks(second.prompt_token_ids)
+    assert len(local) == (1 if completed_index == 0 else 0)
+    assert coord.lookup_after_hbm(second, local, 256).kind == RestoreKind.WAIT
+    assert set(coord.jobs) == original_jobs
+    assert {job.lease.block_ids for job in coord.jobs.values()} == original_pages
+    assert len(coord.loads_by_key) == 2
+    pending_index = 1 - completed_index
+    pending = _next_load_for_key(coord, keys[pending_index])
+    assert pending is not None
+    # Actual suffix pressure must not drop a partially settled waiter, including
+    # the committed block shared with its still-native-owned sibling.
+    refs = [page.ref_cnt for page in manager.blocks]
+    assert not coord.release_completed_restores()
+    assert [page.ref_cnt for page in manager.blocks] == refs
+    survivors = []
+    for name, req in (("first", first), ("second", second)):
+        if cancel in (name, "all"):
+            coord.cancel_request(*coord._request_key(req))
+        else:
+            survivors.append(req)
+    assert manager.blocks[pending.page_ids[0]].ref_cnt == 1
+    final = event_for(pending, TransferStatus.FAILED, completed=False, size=0) if failed else event_for(pending)
+    coord.on_transfer_event(final)
+    coord.on_transfer_event(final)
+    assert coord.next_transfer() is None  # exactly two copies; never a third target
+    acquired = []
+    for req in survivors:
+        assert not req.scheduling_held
+        coord.resume_request(req)
+        blocks = manager.get_computed_blocks(req.prompt_token_ids)
+        coord.after_lookup(req)
+        assert len(blocks) == (pending_index if failed else 2)
+        acquired.extend(block.block_id for block in blocks)
+    assert not coord.jobs and not coord.loads_by_key and not coord.waiters
+    assert sum(page.ref_cnt for page in manager.blocks) == len(acquired)
+    manager.release_blocks_by_ids(acquired)
+    coord.on_transfer_event(event_for(done))  # replay after final retirement
+    coord.on_transfer_event(final)
+    coord.close()
+    assert manager.num_free_blocks == 12
+    assert all(page.ref_cnt == 0 for page in manager.blocks)
+
+
+@pytest.mark.parametrize("state", ["reserved", "loading", "quarantined"])
+def test_suffix_pressure_cannot_relinquish_unsettled_native_target(state):
+    coord, manager = coordinator()
+    req = request()
+    seed_ready(coord, manager, req)
+    coord.lookup_after_hbm(req, [], 128)
+    job = None if state == "reserved" else coord.next_transfer()
+    if state == "quarantined":
+        coord.on_transfer_event(event_for(job, stopped=False))
+    assert not coord.release_completed_restores()
+    assert len(coord.jobs) == 1 and len(coord.waiters) == 1
+    assert sum(page.ref_cnt for page in manager.blocks) == 1
+    coord.cancel_request(*coord._request_key(req))
+    if job is not None:
+        assert sum(page.ref_cnt for page in manager.blocks) == 1
+        coord.on_transfer_event(event_for(job))
+    coord.close()
+    assert not coord.jobs and not coord.loads_by_key
+    assert manager.num_free_blocks == 12
+
+
+def test_joining_committed_canonical_target_does_not_wait_for_another_event():
+    coord, manager = coordinator()
+    first, second = request("first"), request("second")
+    key = seed_ready(coord, manager, first)
+    coord.lookup_after_hbm(first, [], 128)
+    job = coord.next_transfer()
+    coord.on_transfer_event(event_for(job))
+    # Explicit reserve API with a previously acquired incomplete lookup: this
+    # joins the committed target and must not install a permanently held waiter.
+    assert coord.reserve_restore(second, [key], []).kind == RestoreKind.WAIT
+    assert not second.scheduling_held
+    assert len(coord.jobs) == 1 and coord.next_transfer() is None
+    for req in (first, second):
+        coord.resume_request(req)
+        blocks = manager.get_computed_blocks(req.prompt_token_ids)
+        coord.after_lookup(req)
+        assert len(blocks) == 1
+        manager.release_cached_blocks(blocks)
+    assert not coord.loads_by_key and not coord.jobs
+    coord.close()
+    assert manager.num_free_blocks == 12
