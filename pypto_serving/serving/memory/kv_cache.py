@@ -341,6 +341,16 @@ class KvCacheManager:
             for block_id in block_ids:
                 self.release(self.blocks[block_id])
 
+    def retain_block_ids(self, block_ids: tuple[int, ...]) -> None:
+        """Pin an exact already-owned single-pool dispatch snapshot atomically."""
+        if self.has_groups or len(set(block_ids)) != len(block_ids):
+            raise ValueError("retain requires unique single-pool block IDs")
+        if any(type(i) is not int or not 0 <= i < len(self.blocks)
+               or self.blocks[i].ref_cnt <= 0 for i in block_ids):
+            raise ValueError("cannot retain an unowned or out-of-range block")
+        for block_id in block_ids:
+            self.blocks[block_id].ref_cnt += 1
+
     def release_cached_blocks(self, blocks: list[KVCacheBlock]) -> None:
         """Release cached block objects returned by ``get_computed_blocks``."""
         for block in blocks:

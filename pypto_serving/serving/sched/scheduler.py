@@ -231,6 +231,7 @@ class Scheduler:
     def __init__(self, config: SchedulerConfig, kv_cache_manager: KvCacheManager) -> None:
         self.config = config
         self.kv_cache_manager = kv_cache_manager
+        self._native_ddr = None
         self.config.validate_cache_groups(self.kv_cache_manager.group_specs)
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
@@ -400,6 +401,8 @@ class Scheduler:
         request = self.requests.get(request_id)
         if request is None:
             return
+        if self._native_ddr is not None:
+            self._native_ddr.cancel_request(*self._native_ddr._request_key(request))
         request.status = RequestStatus.FINISHED_ABORTED
         self._free_request_blocks(request)
         self.running = [r for r in self.running if r.request_id != request_id]
@@ -567,6 +570,12 @@ class Scheduler:
                 continue
 
             # Prefix cache lookup
+            native_ddr = self._native_ddr
+            if native_ddr is not None and request.scheduling_held:
+                remaining_waiting.append(request)
+                continue
+            if native_ddr is not None:
+                native_ddr.resume_request(request)
             if self.config.enable_prefix_cache:
                 if self.kv_cache_manager.has_groups:
                     (
@@ -596,6 +605,13 @@ class Scheduler:
                     cached_blocks = self.kv_cache_manager.get_computed_blocks(
                         request.prompt_token_ids
                     )
+                    if native_ddr is not None:
+                        native_ddr.after_lookup(request)
+                        decision = native_ddr.lookup_after_hbm(
+                            request, cached_blocks, max(0, request.num_prompt_tokens - 1))
+                        if decision.kind == "WAIT":
+                            remaining_waiting.append(request)
+                            continue
                     if cached_blocks:
                         request.cached_block_ids = [b.block_id for b in cached_blocks]
                         request.num_computed_tokens = (

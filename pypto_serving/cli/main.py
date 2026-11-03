@@ -106,6 +106,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type. 'auto' follows --dtype (default: bfloat16).")
 
     # Runtime
+    parser.add_argument("--enable-native-ddr-kv", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable experimental native DDR prefix KV (requires verified M3 backend).")
+    parser.add_argument("--native-ddr-kv-bytes", type=int, default=0,
+                        help="Explicit bounded DDR capacity in bytes; at least one 20971520-byte block.")
     parser.add_argument("--max-model-len", type=int, default=1024, help="Maximum sequence length (prompt + generated; default: 1024).")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
     parser.add_argument(
@@ -283,6 +287,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    if getattr(args, "enable_native_ddr_kv", False):
+        if (model_family != "qwen" or args.backend != "npu" or args.platform != "a2a3"
+                or args.tensor_parallel_size != 1 or args.data_parallel_size != 1
+                or args.expert_parallel_size != 1 or args.pd_role):
+            raise ValueError("native DDR requires a single Qwen TP1 a2a3 NPU instance without PD")
     if model_family == "deepseek_v41":
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
     model_variant = _resolve_model_variant(args)
@@ -508,6 +517,7 @@ def _build_runtime_config(
         )
 
     return RuntimeConfig(
+        native_ddr=_build_native_ddr_config(args),
         page_size=args.block_size,
         max_batch_size=args.max_num_seqs,
         max_seq_len=args.max_model_len,
@@ -527,6 +537,20 @@ def _build_runtime_config(
         ring_task_window=args.ring_task_window,
         ring_heap=args.ring_heap,
     )
+
+
+def _build_native_ddr_config(args):
+    from pypto_serving.serving.native_ddr.types import NativeDdrPrefixConfig
+
+    config = NativeDdrPrefixConfig(
+        enabled=getattr(args, "enable_native_ddr_kv", False),
+        capacity_bytes=getattr(args, "native_ddr_kv_bytes", 0),
+    )
+    dtype = args.dtype if args.kv_cache_dtype == "auto" else args.kv_cache_dtype
+    if config.enabled and (args.block_size != 128 or dtype != "bfloat16"
+                           or args.dtype != "bfloat16" or not args.enable_prefix_caching):
+        raise ValueError("native DDR requires BF16 weights/KV, page128, and prefix caching")
+    return config
 
 
 def _resolve_model_variant(args: argparse.Namespace) -> str:

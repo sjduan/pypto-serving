@@ -15,6 +15,7 @@ from typing import Literal
 import torch
 
 from pypto_serving.model.tokenizer import TokenizerAdapter
+from pypto_serving.serving.native_ddr.types import NativeDdrPrefixConfig
 
 
 PREFILL_CHUNK_SIZE_CHOICES = (1024, 2048, 4096, 8192)
@@ -211,6 +212,7 @@ class RuntimeConfig:
     ring_dep_pool: int | list[int] | None = None
     ring_task_window: int | list[int] | None = None
     ring_heap: int | list[int] | None = None
+    native_ddr: NativeDdrPrefixConfig = field(default_factory=NativeDdrPrefixConfig)
 
 
 @dataclass(frozen=True)

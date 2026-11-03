@@ -24,9 +24,10 @@ call sites.
 
 from __future__ import annotations
 
-from typing import Any, Union
+from typing import Any, Literal, Union
 
 import msgspec
+from pypto_serving.serving.native_ddr.types import DdrEntryRef, DdrTransferEvent, DdrTransferRequest
 
 # Sentinel for a decode input token the worker must resolve from its own cache.
 # Under async (pipelined) scheduling the engine builds step N+1 before step N's
@@ -142,8 +143,17 @@ class ControlCommand(msgspec.Struct, tag="control"):
     payload: bytes = b""
 
 
+class NativeDdrCommand(msgspec.Struct, tag="native_ddr"):
+    """Narrow non-barrier command; replies NEVER enter the StepResult FIFO."""
+
+    operation: Literal["submit", "cancel", "evict", "drain"]
+    request: DdrTransferRequest | None = None
+    job_id: str = ""
+    entry_ref: DdrEntryRef | None = None
+
+
 # Union used for the decoder — tag field ("type") discriminates.
-Command = Union[StepCommand, ShutdownCommand, ProfileCommand, ControlCommand]
+Command = Union[StepCommand, ShutdownCommand, ProfileCommand, ControlCommand, NativeDdrCommand]
 
 
 # ---------------------------------------------------------------------------
@@ -236,3 +246,13 @@ def encode_control_result(result: ControlResult) -> bytes:
 def decode_control_result(data: bytes) -> ControlResult:
     """Decode one worker-local PD control result."""
     return _control_result_decoder.decode(data)
+
+
+def encode_native_ddr_event(event: DdrTransferEvent) -> bytes:
+    return msgspec.msgpack.encode(event)
+
+
+def decode_native_ddr_event(data: bytes) -> DdrTransferEvent:
+    if len(data) > 65536:
+        raise ValueError("native DDR metadata event exceeds bounded payload")
+    return msgspec.msgpack.decode(data, type=DdrTransferEvent)

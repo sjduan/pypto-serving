@@ -47,6 +47,8 @@ from pypto_serving.serving.server.ipc import (
     ShutdownCommand,
     StepCommand,
     StepResult,
+    NativeDdrCommand,
+    encode_native_ddr_event,
     decode_command,
     encode_control_result,
     encode_profile_result,
@@ -57,6 +59,7 @@ from pypto_serving.tools.profile import configure_profiler, get_profiler, profil
 
 if TYPE_CHECKING:
     from pypto_serving.serving.engine.async_engine import EngineConfig
+    from pypto_serving.serving.native_ddr.worker import DdrPrefixWorker
 
 logger = logging.getLogger(__name__)
 
@@ -149,12 +152,15 @@ class WorkerProcess:
         output_queue: mp.Queue,
         profile_output_queue: mp.Queue | None = None,
         services_factory=None,
+        native_ddr_output_queue=None,
     ):
         self.config = config
         self._sampling_capabilities = config.sampling_capabilities()
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.profile_output_queue = profile_output_queue
+        self.native_ddr_output_queue = native_ddr_output_queue
+        self._native_ddr_worker: DdrPrefixWorker | None = None
         self._decode_metrics = DecodeStepRecorder.from_env()
 
         self._services_factory = services_factory
@@ -176,6 +182,13 @@ class WorkerProcess:
         self._xgrammar_provider: XGrammarProvider | None = None
 
     def init_device_and_model(self) -> int:
+        native_config = self.config.resolve_runtime_config().native_ddr
+        if native_config.enabled:
+            # Fail BEFORE executor construction/device initialization. A future
+            # M3-approved same-owner adapter must replace this explicit seam;
+            # host unit tests never install a production mock fallback.
+            from pypto_serving.model.qwen.native_ddr_kv import require_native_ddr_backend
+            require_native_ddr_backend()
         from pypto_serving.config.types import ModelRecord
         from pypto_serving.model.common.executor.sampler import Sampler
         from pypto_serving.model.model_loader import ModelLoader
@@ -296,7 +309,17 @@ class WorkerProcess:
         """Original one-command-at-a-time worker path."""
         while True:
             try:
-                raw: bytes = self.input_queue.get()
+                module = getattr(self, "_native_ddr_worker", None)
+                if module is not None and module.pending is not None:
+                    self._poll_native_ddr()
+                    raw: bytes = (
+                        self.input_queue.get(timeout=0.02) if module.pending is not None
+                        else self.input_queue.get()
+                    )
+                else:
+                    raw: bytes = self.input_queue.get()
+            except queue.Empty:
+                continue
             except Exception:
                 break
 
@@ -317,6 +340,10 @@ class WorkerProcess:
 
             if isinstance(cmd, ControlCommand):
                 self._handle_control_command(cmd)
+                continue
+
+            if isinstance(cmd, NativeDdrCommand):
+                self._handle_native_ddr_command(cmd)
                 continue
 
             self._handle_step_command(cmd)
@@ -426,7 +453,21 @@ class WorkerProcess:
     ) -> None:
         """Dispatch FIFO device work without reclaiming host outputs."""
         while True:
-            cmd, prepared, release_cache_entries = work_queue.get()
+            module = getattr(self, "_native_ddr_worker", None)
+            if module is not None and module.pending is not None:
+                self._poll_native_ddr()
+                try:
+                    cmd, prepared, release_cache_entries = (
+                        work_queue.get(timeout=0.02) if module.pending is not None
+                        else work_queue.get()
+                    )
+                except queue.Empty:
+                    continue
+            else:
+                cmd, prepared, release_cache_entries = work_queue.get()
+            if isinstance(cmd, NativeDdrCommand):
+                self._handle_native_ddr_command(cmd)
+                continue
             if isinstance(cmd, ShutdownCommand):
                 output_work_queue.put(cmd)
                 return
@@ -1379,6 +1420,10 @@ class WorkerProcess:
 
     def close(self) -> None:
         """Release executor-owned runtime and device resources."""
+        if getattr(self, "_native_ddr_worker", None) is not None:
+            events = self._native_ddr_worker.close()
+            for event in events:
+                self.native_ddr_output_queue.put(encode_native_ddr_event(event))
         for constraint_state in getattr(self, "_constraint_states", {}).values():
             constraint_state.close()
         if hasattr(self, "_constraint_states"):
@@ -1386,13 +1431,13 @@ class WorkerProcess:
         if hasattr(self, "_accepted_output_lengths"):
             self._accepted_output_lengths.clear()
         executor = self.executor
-        self.executor = None
         if executor is None:
             return
 
         close = getattr(executor, "close", None)
         if callable(close):
             close()
+        self.executor = None
 
     def _sample_result_row(
         self,
@@ -1424,6 +1469,34 @@ class WorkerProcess:
         if logits is None or logits.numel() == 0:
             raise ValueError("host sampling requires logits when device sampling is unavailable")
         return self.sampler.sample(logits, params, request_id)
+
+    def _poll_native_ddr(self):
+        for event in self._native_ddr_worker.poll_completed():
+            self.native_ddr_output_queue.put(encode_native_ddr_event(event))
+        module = self._native_ddr_worker
+        if module.closed and module.pending is None and not module.poisoned:
+            module.close()
+
+    def _handle_native_ddr_command(self, cmd):
+        module = self._native_ddr_worker
+        if module is None or self.native_ddr_output_queue is None:
+            raise RuntimeError("native DDR command on a disabled/unavailable worker")
+        if cmd.operation == "submit":
+            if cmd.request is None:
+                raise ValueError("native DDR submit requires a request")
+            event = module.submit_transfer(cmd.request)
+            self.native_ddr_output_queue.put(encode_native_ddr_event(event))
+        elif cmd.operation == "cancel":
+            module.cancel(cmd.job_id)
+        elif cmd.operation == "evict":
+            if cmd.entry_ref is None:
+                raise ValueError("native DDR evict requires an entry ref")
+            module.evict(cmd.entry_ref)
+        else:
+            module.closed = True
+            if module.pending is not None:
+                module.cancel(module.pending.request.job_id)
+            self._poll_native_ddr()
 
     def _accept_output_tokens(self, request_id: str, count: int) -> None:
         lengths = getattr(self, "_accepted_output_lengths", {})
@@ -1515,6 +1588,8 @@ def _worker_entry(
     cache_capacity,
     profile_output_queue: mp.Queue | None = None,
     services_factory=None,
+    native_ddr_output_queue=None,
+    startup_status=None,
 ):
     """Entry point for the worker subprocess."""
     import signal
@@ -1533,6 +1608,8 @@ def _worker_entry(
     configure_runtime_logging()
 
     worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue, services_factory)
+    if native_ddr_output_queue is not None:
+        worker.native_ddr_output_queue = native_ddr_output_queue
     try:
         num_pages = worker.init_device_and_model()
         sizes = worker.executor.cache_group_sizes(config.model_id)
@@ -1550,10 +1627,16 @@ def _worker_entry(
         # multi-ms gen2 pauses landing mid-step). Must happen in this process:
         # gc.freeze() does not cross the spawn boundary.
         freeze_gc_heap()
+        if startup_status is not None:
+            startup_status[0] = 1
         ready_event.set()
         worker.busy_loop()
     except Exception as e:
         logger.error(f"Worker process failed: {e}", exc_info=True)
+        if startup_status is not None:
+            error = f"{type(e).__name__}: {e}".encode("utf-8")[:4095]
+            startup_status[1:1 + len(error)] = error
+            startup_status[0] = 2
         ready_event.set()
     finally:
         try:
@@ -1576,7 +1659,10 @@ def spawn_worker(config: EngineConfig, *, services_factory=None):
     output_queue = ctx.Queue()
     profile_output_queue = ctx.Queue()
     ready_event = ctx.Event()
+    startup_status = ctx.Array("B", 4097)
     cache_capacity = ctx.Array("q", 1 + len(config.resolve_runtime_config().kv_cache_groups))
+    native_ddr_output_queue = (ctx.Queue(maxsize=16)
+                               if config.resolve_runtime_config().native_ddr.enabled else None)
 
     process = ctx.Process(
         target=_worker_entry,
@@ -1588,10 +1674,15 @@ def spawn_worker(config: EngineConfig, *, services_factory=None):
             cache_capacity,
             profile_output_queue,
             services_factory,
+            native_ddr_output_queue,
+            startup_status,
         ),
         daemon=False,
     )
     process.start()
+    process.startup_status = startup_status
+    if native_ddr_output_queue is not None:
+        process.native_ddr_output_queue = native_ddr_output_queue
     return (
         process,
         input_queue,

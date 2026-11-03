@@ -1,0 +1,648 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""CPU/fake control-plane tests, NOT native transfer/model/NPU verification."""
+from __future__ import annotations
+
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+
+from pypto_serving.config.types import RuntimeConfig
+from pypto_serving.model.qwen.native_ddr_kv import NativeDdrUnavailable, require_native_ddr_backend
+from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngineCore
+from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.native_ddr.coordinator import DdrPrefixCoordinator, ScheduledPrefix
+from pypto_serving.serving.native_ddr.types import (
+    DdrEntryRef, DdrTransferEvent, DdrTransferRequest, EntryState, LoadState,
+    NativeDdrPrefixConfig, Operation, PrefixKey, QwenKvLayout, RestoreKind, TransferStatus,
+)
+from pypto_serving.serving.native_ddr.worker import (
+    DdrPrefixWorker, NativeCompletion, NativeSubmissionError, NativeStopProof,
+)
+from pypto_serving.serving.server.ipc import (
+    NativeDdrCommand, StepResult, decode_command, decode_native_ddr_event,
+    decode_result, encode_command, encode_native_ddr_event, encode_result,
+)
+from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
+
+
+LAYOUT = QwenKvLayout(40, 16, 128, 8, 128)
+CONFIG = NativeDdrPrefixConfig(True, LAYOUT.block_bytes * 2)
+KEY = PrefixKey(b'n' * 32, b'h' * 32)
+REF = DdrEntryRef("worker1", "entry1", 1)
+
+
+def transfer(operation=Operation.STORE, *, job="job1", page=0, ref=REF, key=KEY):
+    return DdrTransferRequest(job, "worker1", operation, (key,), (ref,), "lease1", (page,), 1)
+
+
+class FakeHandle:
+    """Manual test-only completion, never a production backend or native fence."""
+    def __init__(self):
+        self.ready = False
+        self.outcome = NativeCompletion(LAYOUT.block_bytes, True, True)
+        self.error = None
+
+    def done(self):
+        return self.ready
+
+    def result(self):
+        assert self.ready
+        if self.error:
+            raise self.error
+        return self.outcome
+
+
+class FakeBackend:
+    def __init__(self):
+        self.slots = {}
+        self.submissions = []
+        self.handle = None
+        self.error = None
+        self.release_error = None
+
+    def reserve_slot(self, slot, size):
+        assert size == LAYOUT.block_bytes
+        assert slot not in self.slots
+        backing = object()  # explicit fake, no DDR allocation or data claims
+        self.slots[slot] = backing
+        return backing
+
+    def release_slot(self, backing):
+        if self.release_error:
+            raise self.release_error
+        slot = next(s for s, b in self.slots.items() if b is backing)
+        del self.slots[slot]
+
+    def submit(self, request, backing):
+        assert backing in self.slots.values()
+        self.submissions.append(request)
+        if self.error:
+            raise self.error
+        self.handle = FakeHandle()
+        return self.handle
+
+
+def worker(backend=None):
+    backend = backend or FakeBackend()
+    return DdrPrefixWorker(CONFIG, LAYOUT, "worker1", backend), backend
+
+
+def complete(module, backend):
+    backend.handle.ready = True
+    return module.poll_completed()[0]
+
+
+def test_layout_full_byte_offsets_cpu_oracle():
+    assert LAYOUT.page_side_bytes == 262144
+    assert LAYOUT.block_bytes == 20971520
+    for layer in range(LAYOUT.num_layers):
+        for page in (0, LAYOUT.num_pages - 1):
+            assert LAYOUT.hbm_offset(layer, page) == (layer * 16 + page) * 262144
+        for side in (0, 1):
+            assert LAYOUT.ddr_offset(1, layer, side) == 20971520 + (layer * 2 + side) * 262144
+    # Independent CPU byte oracle for the proposed compact ordering. This does
+    # not invoke, compile, or claim correctness of a PyPTO/native candidate.
+    compact = bytearray(LAYOUT.block_bytes)
+    for layer in range(40):
+        for side in (0, 1):
+            start = LAYOUT.ddr_offset(0, layer, side)
+            compact[start:start + LAYOUT.page_side_bytes] = bytes([layer * 2 + side]) * LAYOUT.page_side_bytes
+    for layer in range(40):
+        for side in (0, 1):
+            start = (layer * 2 + side) * 128 * 8 * 128 * 2
+            assert compact[start:start + 262144] == bytes([layer * 2 + side]) * 262144
+
+
+@pytest.mark.parametrize("method,args", [("hbm_offset", (40, 0)), ("hbm_offset", (0, 16)),
+                                           ("hbm_offset", (0, True)), ("ddr_offset", (-1, 0, 0)),
+                                           ("ddr_offset", (0, 0, 2))])
+def test_offset_rejects_invalid_ranges(method, args):
+    with pytest.raises(ValueError):
+        getattr(LAYOUT, method)(*args)
+
+
+@pytest.mark.parametrize("kwargs", [{"enabled": True}, {"capacity_bytes": -1},
+                                   {"enabled": True, "capacity_bytes": 20971519},
+                                   {"max_inflight_transfers": 2}])
+def test_config_explicit_bounded_capacity(kwargs):
+    with pytest.raises(ValueError):
+        NativeDdrPrefixConfig(**kwargs)
+
+
+def test_default_off_has_no_transfer_owner_and_enabled_rejects_unsupported():
+    assert RuntimeConfig().native_ddr == NativeDdrPrefixConfig()
+    core = ReplicaEngineCore(EngineConfig(), SimpleNamespace())
+    assert core._native_ddr is None
+    assert core._native_ddr_output_queue is None
+    assert core.kv_cache_manager.num_blocks == 0
+    with pytest.raises(ValueError, match="only Qwen"):
+        ReplicaEngineCore(EngineConfig(executor_cls="MockExecutor", runtime_config=RuntimeConfig(native_ddr=CONFIG)),
+                          SimpleNamespace())
+    with pytest.raises(NativeDdrUnavailable, match="no CPU/mock fallback"):
+        require_native_ddr_backend()
+
+
+def test_typed_auxiliary_ipc_roundtrip_does_not_corrupt_step_result():
+    request = transfer()
+    command = NativeDdrCommand(operation="submit", request=request)
+    assert decode_command(encode_command(command)).request == request
+    event = DdrTransferEvent(request.job_id, request.worker_epoch, request.operation,
+                             TransferStatus.ACCEPTED, request.entry_refs, 0, False, False)
+    assert decode_native_ddr_event(encode_native_ddr_event(event)) == event
+    assert decode_result(encode_result(StepResult(step_id=31, new_tokens={}))).step_id == 31
+    with pytest.raises(ValueError, match="bounded"):
+        decode_native_ddr_event(b'x' * 65537)
+
+
+def test_no_backend_is_explicit_rejection_without_claiming_completed():
+    module = DdrPrefixWorker(CONFIG, LAYOUT, "worker1")
+    event = module.submit_transfer(transfer())
+    assert event.status == TransferStatus.REJECTED
+    assert not event.native_completed and event.stopped
+    assert not module.entries and module.pending is None
+
+
+@pytest.mark.parametrize("change", [dict(page_ids=(16,)), dict(page_ids=(True,)),
+                                    dict(page_ids=(0, 0)), dict(entry_keys=()),
+                                    dict(worker_epoch="old"), dict(entry_refs=(replace(REF, slot_generation=0),))])
+def test_invalid_mapping_rejected_before_any_native_submit(change):
+    module, backend = worker()
+    assert module.submit_transfer(replace(transfer(), **change)).status == TransferStatus.REJECTED
+    assert backend.submissions == []
+    assert backend.slots == {}
+
+
+def test_store_load_completion_cancel_and_read_during_evict_keep_backing():
+    module, backend = worker()
+    assert module.submit_transfer(transfer()).status == TransferStatus.ACCEPTED
+    assert module.entries[REF.entry_id].state == EntryState.OFFLOADING
+    assert module.poll_completed() == ()
+    assert module.submit_transfer(transfer(job="busy")).status == TransferStatus.REJECTED
+    assert complete(module, backend).status == TransferStatus.SUCCEEDED
+    load = transfer(Operation.LOAD, job="load", page=7)
+    assert module.submit_transfer(load).status == TransferStatus.ACCEPTED
+    backing = module.entries[REF.entry_id].backing
+    module.evict(REF)
+    assert backing in backend.slots.values()
+    module.cancel(load.job_id)
+    assert complete(module, backend).status == TransferStatus.CANCELLED
+    assert backend.slots == {}
+    assert not module.entries
+    assert module.close() == ()
+    assert module.submit_transfer(transfer(job="closed")).status == TransferStatus.REJECTED
+
+
+def test_slot_reuse_requires_fresh_generation_and_load_key_identity():
+    module, backend = worker()
+    module.submit_transfer(transfer())
+    complete(module, backend)
+    assert module.submit_transfer(transfer(Operation.LOAD, job="wrong-key", key=replace(KEY, block_hash=b'z' * 32))).status == TransferStatus.REJECTED
+    module.evict(REF)
+    assert module.submit_transfer(transfer(job="reused", ref=replace(REF, entry_id="entry2"))).status == TransferStatus.REJECTED
+    fresh = replace(REF, entry_id="entry2", slot_generation=2)
+    assert module.submit_transfer(transfer(job="fresh", ref=fresh)).status == TransferStatus.ACCEPTED
+    module.cancel("fresh")
+    assert complete(module, backend).status == TransferStatus.CANCELLED
+    assert not backend.slots
+
+
+@pytest.mark.parametrize("outcome", ["ordinary-submit", "result", "no-stop", "release"])
+def test_unknown_native_or_cleanup_failure_quarantines_not_reuses(outcome):
+    module, backend = worker()
+    if outcome == "ordinary-submit":
+        backend.error = RuntimeError("submit may have accepted")
+        event = module.submit_transfer(transfer())
+    else:
+        module.submit_transfer(transfer())
+        if outcome == "result":
+            backend.handle.error = RuntimeError("result failed")
+        elif outcome == "no-stop":
+            backend.handle.outcome = NativeCompletion(LAYOUT.block_bytes, True, False)
+        else:
+            module.cancel("job1")
+            backend.release_error = RuntimeError("release failed")
+        event = complete(module, backend)
+    assert event.status == TransferStatus.FAILED and not event.stopped
+    assert module.poisoned and module.pending is not None
+    assert module.entries[REF.entry_id].state == EntryState.QUARANTINED
+    assert backend.slots
+    with pytest.raises(RuntimeError, match="obligations"):
+        module.close()
+
+
+def test_typed_pre_submit_rejection_and_partial_completion_are_not_ready():
+    module, backend = worker()
+    backend.error = NativeSubmissionError("rejected before accept", stopped=True)
+    assert module.submit_transfer(transfer()).stopped
+    assert not backend.slots
+    backend.error = None
+    fresh = replace(REF, entry_id="next", slot_generation=2)
+    module.submit_transfer(transfer(job="partial", ref=fresh))
+    backend.handle.outcome = NativeCompletion(262144, True, True)
+    assert complete(module, backend).status == TransferStatus.FAILED
+    assert not module.entries
+
+
+def coordinator(num_blocks=12, capacity=8):
+    manager = KvCacheManager(num_blocks=num_blocks, block_size=128, enable_prefix_cache=True)
+    coord = DdrPrefixCoordinator(manager, namespace_digest=b'n' * 32, worker_epoch="worker1", max_entries=capacity)
+    return coord, manager
+
+
+def request(name="request", length=129):
+    return Request(request_id=name, prompt_token_ids=list(range(length)), max_new_tokens=2)
+
+
+def seed_ready(coord, manager, req):
+    key = PrefixKey(coord.namespace, manager.compute_block_hashes(req.prompt_token_ids)[0])
+    coord.ready[key] = REF
+    return key
+
+
+def event_for(job, status=TransferStatus.SUCCEEDED, *, stopped=True, completed=True, size=20971520):
+    return DdrTransferEvent(job.job_id, job.worker_epoch, job.operation, status, job.entry_refs,
+                             size, completed, stopped)
+
+
+def test_two_waiters_share_one_target_and_loader_pin_survives_until_lookup():
+    coord, manager = coordinator()
+    first, second = request("a"), request("b")
+    key = seed_ready(coord, manager, first)
+    assert coord.lookup_after_hbm(first, [], 128).kind == RestoreKind.WAIT
+    assert coord.lookup_after_hbm(second, [], 128).kind == RestoreKind.WAIT
+    assert len(coord.loads_by_key) == 1 and len(coord.jobs) == 1
+    job = coord.next_transfer()
+    assert job is not None and job.entry_keys == (key,)
+    block = manager.blocks[job.page_ids[0]]
+    assert block.block_hash is None and block.ref_cnt == 1
+    coord.on_transfer_event(event_for(job, TransferStatus.ACCEPTED, stopped=False, completed=False, size=0))
+    assert first.scheduling_held and second.scheduling_held
+    coord.on_transfer_event(event_for(job))
+    coord.on_transfer_event(event_for(job))  # replay must not duplicate refs
+    assert block.block_hash == key.block_hash
+    for waiter in (first, second):
+        assert not waiter.scheduling_held
+        coord.resume_request(waiter)
+        blocks = manager.get_computed_blocks(waiter.prompt_token_ids)
+        coord.after_lookup(waiter)
+        assert [b.block_id for b in blocks] == [block.block_id]
+    assert not coord.jobs
+    assert block.ref_cnt == 2
+    manager.release_blocks_by_ids([block.block_id, block.block_id])
+    assert block.ref_cnt == 0
+
+
+def test_last_waiter_cancel_and_repeated_close_cannot_release_native_target():
+    coord, manager = coordinator()
+    req = request()
+    seed_ready(coord, manager, req)
+    coord.lookup_after_hbm(req, [], 128)
+    job = coord.next_transfer()
+    block = manager.blocks[job.page_ids[0]]
+    coord.cancel_request(*coord._request_key(req))
+    assert block.ref_cnt == 1 and block.block_hash is None
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="obligations"):
+            coord.close()
+        assert block.ref_cnt == 1
+    coord.on_transfer_event(event_for(job))
+    assert block.ref_cnt == 0 and block.block_hash is None
+    assert not coord.jobs
+
+
+@pytest.mark.parametrize("case", ["failure", "old-epoch", "wrong-ref", "unknown"])
+def test_load_failure_epoch_and_unknown_never_publish_or_free_early(case):
+    coord, manager = coordinator()
+    req = request()
+    key = seed_ready(coord, manager, req)
+    coord.lookup_after_hbm(req, [], 128)
+    job = coord.next_transfer()
+    block = manager.blocks[job.page_ids[0]]
+    event = event_for(job)
+    if case == "failure":
+        event = event_for(job, TransferStatus.FAILED, completed=False, size=0)
+    elif case == "old-epoch":
+        coord.worker_epoch = "worker2"  # exact old job still must settle its own lease
+    elif case == "wrong-ref":
+        event = replace(event, entry_refs=(replace(REF, slot_generation=99),))
+    else:
+        event = replace(event, stopped=False)
+    coord.on_transfer_event(event)
+    assert block.block_hash is None
+    if case in ("wrong-ref", "unknown"):
+        assert coord.poisoned and block.ref_cnt == 1
+        assert coord.jobs[job.job_id].state == LoadState.QUARANTINED
+    else:
+        coord.resume_request(req)
+        assert manager.get_computed_blocks(req.prompt_token_ids) == []
+        coord.after_lookup(req)
+        assert block.ref_cnt == 0
+        if case == "failure":
+            assert key not in coord.ready
+
+
+def test_headroom_failure_and_one_cancel_leave_other_waiter_usable():
+    coord, manager = coordinator(num_blocks=1)
+    req = request()
+    seed_ready(coord, manager, req)
+    assert coord.lookup_after_hbm(req, [], 128).kind == RestoreKind.MISS
+    assert not coord.jobs and manager.num_free_blocks == 1
+    coord, manager = coordinator()
+    first, second = request("a"), request("b")
+    seed_ready(coord, manager, first)
+    for req in (first, second):
+        coord.lookup_after_hbm(req, [], 128)
+    job = coord.next_transfer()
+    coord.cancel_request(*coord._request_key(first))
+    coord.on_transfer_event(event_for(job))
+    assert not second.scheduling_held
+    coord.cancel_request(*coord._request_key(second))
+    assert not coord.jobs
+
+
+def test_step_snapshot_store_pin_and_unknown_worker_stop():
+    coord, manager = coordinator()
+    req = request()
+    page = manager.allocate_blocks(1)[0]
+    hashes = manager.compute_block_hashes(req.prompt_token_ids)
+    manager.cache_block_ids([page.block_id], hashes, 0, 1)
+    snapshot = (ScheduledPrefix(req.request_id, (page.block_id,), tuple(hashes), 129, 0, 128),)
+    coord.retain_step(1, snapshot)
+    assert page.ref_cnt == 2
+    coord.on_confirmed_step(1, snapshot, {req.request_id: 128})
+    assert page.ref_cnt == 2  # normal request + STORE, step released
+    job = coord.next_transfer()
+    assert job.operation == Operation.STORE
+    manager.release_blocks_by_ids([page.block_id])
+    assert page.ref_cnt == 1
+    coord.on_transfer_event(event_for(job))
+    assert page.ref_cnt == 0 and coord.ready
+    # Retain and timeout a separate model dispatch. No process boolean can
+    # discharge this pin; only the future same-owner drain receipt may do so.
+    live_page = manager.allocate_blocks(1)[0]
+    lost = (ScheduledPrefix("lost", (live_page.block_id,), (), 1, 0, 1),)
+    coord.retain_step(2, lost)
+    coord.discard_step(2)
+    with pytest.raises(RuntimeError, match="proof"):
+        coord.on_worker_stopped("worker1", True)
+    assert live_page.ref_cnt == 2
+    coord.on_worker_stopped("worker1", NativeStopProof("worker1", True, True))
+    assert live_page.ref_cnt == 1
+    manager.release_blocks_by_ids([live_page.block_id])
+
+
+def test_held_waiting_request_does_not_block_unrelated_request():
+    coord, manager = coordinator()
+    sched = Scheduler(SchedulerConfig(max_num_scheduled_tokens=512), manager)
+    sched._native_ddr = coord
+    held, unrelated = request("held"), request("unrelated", 3)
+    seed_ready(coord, manager, held)
+    sched.add_request(held)
+    sched.add_request(unrelated)
+    output = sched.schedule()
+    assert held.scheduling_held
+    assert [sr.request.request_id for sr in output.scheduled_requests] == ["unrelated"]
+    job = coord.next_transfer()
+    coord.on_transfer_event(event_for(job))
+    output = sched.schedule()
+    restored = next(sr for sr in output.scheduled_requests if sr.request.request_id == "held")
+    assert restored.num_computed_tokens == 128
+    assert restored.block_ids[0] == job.page_ids[0]
+    assert not coord.waiters and not coord.jobs
+
+
+def test_duplicate_pending_submit_never_claims_stopped_or_submits_twice():
+    module, backend = worker()
+    req = transfer()
+    module.submit_transfer(req)
+    replay = module.submit_transfer(req)
+    assert replay.status == TransferStatus.ACCEPTED and not replay.stopped
+    conflict = module.submit_transfer(replace(req, page_ids=()))
+    assert conflict.status == TransferStatus.FAILED and not conflict.stopped
+    final = complete(module, backend)
+    assert module.submit_transfer(req) == final
+    assert len(backend.submissions) == 1
+
+
+def test_idle_worker_emits_terminal_on_aux_queue_without_a_model_step():
+    import queue
+    import threading
+    from pypto_serving.serving.server.serving_worker import WorkerProcess
+    from pypto_serving.serving.server.ipc import ShutdownCommand
+
+    module, backend = worker()
+    process = WorkerProcess.__new__(WorkerProcess)
+    process._native_ddr_worker = module
+    process.input_queue, process.output_queue = queue.Queue(), queue.Queue()
+    process.native_ddr_output_queue = queue.Queue()
+    thread = threading.Thread(target=process._serial_busy_loop, name="test-host-ddr-idle")
+    thread.start()
+    try:
+        process.input_queue.put(encode_command(NativeDdrCommand(operation="submit", request=transfer())))
+        accepted = decode_native_ddr_event(process.native_ddr_output_queue.get(timeout=2))
+        assert accepted.status == TransferStatus.ACCEPTED
+        backend.handle.ready = True
+        final = decode_native_ddr_event(process.native_ddr_output_queue.get(timeout=2))
+        assert final.status == TransferStatus.SUCCEEDED
+        assert process.output_queue.empty()
+    finally:
+        process.input_queue.put(encode_command(ShutdownCommand()))
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        module.close()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_spawn_allocates_no_auxiliary_queue_when_disabled(monkeypatch, enabled):
+    import queue
+    from pypto_serving.serving.server import serving_worker
+
+    sizes = []
+    class Context:
+        def Queue(self, maxsize=0):
+            sizes.append(maxsize)
+            return queue.Queue(maxsize)
+
+        def Array(self, kind, count):
+            return [0] * count
+
+        def Event(self):
+            return object()
+
+        def Process(self, **kwargs):
+            return SimpleNamespace(start=lambda: None, **kwargs)
+
+    monkeypatch.setattr(serving_worker.mp, "get_context", lambda method: Context())
+    runtime = RuntimeConfig(native_ddr=CONFIG if enabled else NativeDdrPrefixConfig())
+    process, *_ = serving_worker.spawn_worker(EngineConfig(runtime_config=runtime))
+    assert sizes == ([0, 0, 0, 16] if enabled else [0, 0, 0])
+    assert hasattr(process, "native_ddr_output_queue") is enabled
+
+
+def test_enabled_backend_fails_before_executor_construction():
+    from pypto_serving.serving.server.serving_worker import WorkerProcess
+    process = WorkerProcess.__new__(WorkerProcess)
+    process.config = SimpleNamespace(resolve_runtime_config=lambda: RuntimeConfig(native_ddr=CONFIG))
+    with pytest.raises(NativeDdrUnavailable, match="M3 seam unresolved"):
+        process.init_device_and_model()
+    assert not hasattr(process, "executor")
+
+
+@pytest.mark.parametrize("flags,valid", [([], False), (["--block-size", "64"], False),
+                                       (["--dtype", "float32"], False),
+                                       (["--no-enable-prefix-caching"], False),
+                                       (["--native-ddr-kv-bytes", "20971520"], True)])
+def test_cli_native_config_without_reading_model_or_device(flags, valid):
+    from pypto_serving.cli.main import build_parser, _build_native_ddr_config
+    args = build_parser().parse_args(["--model", "not-a-model-load", "--enable-native-ddr-kv", *flags])
+    if valid:
+        assert _build_native_ddr_config(args).enabled
+    else:
+        with pytest.raises(ValueError):
+            _build_native_ddr_config(args)
+    disabled = build_parser().parse_args(["--model", "not-a-model-load", "--no-enable-native-ddr-kv"])
+    assert _build_native_ddr_config(disabled) == NativeDdrPrefixConfig()
+
+
+def test_partial_hbm_prefix_lookup_references_have_exact_waiter_ownership():
+    coord, manager = coordinator()
+    first, second = request("a", 257), request("b", 257)
+    hashes = manager.compute_block_hashes(first.prompt_token_ids)
+    page = manager.allocate_blocks(1)[0]
+    manager.cache_block_ids([page.block_id], hashes, 0, 1)
+    manager.release_blocks_by_ids([page.block_id])
+    key = PrefixKey(coord.namespace, hashes[1])
+    coord.ready[key] = REF
+    for req in (first, second):
+        local = manager.get_computed_blocks(req.prompt_token_ids)
+        assert coord.lookup_after_hbm(req, local, 256).kind == RestoreKind.WAIT
+    assert page.ref_cnt == 2
+    coord.cancel_request(*coord._request_key(first))
+    assert page.ref_cnt == 1
+    job = coord.next_transfer()
+    coord.on_transfer_event(event_for(job))
+    coord.resume_request(second)
+    assert page.ref_cnt == 0
+    blocks = manager.get_computed_blocks(second.prompt_token_ids)
+    coord.after_lookup(second)
+    assert len(blocks) == 2 and page.ref_cnt == 1
+    manager.release_cached_blocks(blocks)
+    assert page.ref_cnt == 0
+
+
+def test_engine_enabled_snapshot_and_aux_event_hook_only_use_host_queues():
+    import asyncio
+    import queue
+
+    core = ReplicaEngineCore(EngineConfig(enable_prefix_cache=True, async_scheduling=False,
+        runtime_config=RuntimeConfig(page_size=128, max_prefill_tokens_per_request=128)), SimpleNamespace())
+    core.kv_cache_manager.initialize(core._runtime, num_blocks=12)
+    coord = DdrPrefixCoordinator(core.kv_cache_manager, namespace_digest=b'n' * 32,
+                                 worker_epoch="worker1", max_entries=8)
+    core._native_ddr = coord
+    core.scheduler._native_ddr = coord
+    core._input_queue, core._output_queue, core._native_ddr_output_queue = queue.Queue(), queue.Queue(), queue.Queue()
+    req = request()
+    core.scheduler.add_request(req)
+    assert core._try_dispatch_step()
+    assert coord.steps and not coord.jobs  # optimistic dispatch cannot STORE
+    command = decode_command(core._input_queue.get_nowait())
+    # Host protocol fixture: a completed prefill has no final sampled token in
+    # this partial chunk, so no tokenizer/model/consumer is exercised.
+    core._output_queue.put(encode_result(StepResult(step_id=command.step_id, new_tokens={})))
+    assert asyncio.run(core._await_and_apply_oldest())
+    assert not coord.steps and coord.jobs
+    core._pump_native_ddr()
+    transfer_cmd = decode_command(core._input_queue.get_nowait())
+    assert isinstance(transfer_cmd, NativeDdrCommand)
+    core._native_ddr_output_queue.put(encode_native_ddr_event(event_for(transfer_cmd.request)))
+    core._pump_native_ddr()
+    assert coord.ready and not coord.jobs
+    assert core._output_queue.empty()
+
+
+def test_ready_capacity_and_replay_metadata_are_bounded_without_forgetting_jobs():
+    module, backend = worker()
+    first = transfer()
+    for number in range(module._receipt_limit):
+        ref = DdrEntryRef("worker1", f"entry{number}", number + 1)
+        req = transfer(job=f"receipt{number}", ref=ref)
+        if number == 0:
+            first = req
+        assert module.submit_transfer(req).status == TransferStatus.ACCEPTED
+        complete(module, backend)
+        module.evict(ref)
+    event = module.submit_transfer(transfer(job="over-budget", ref=replace(REF, slot_generation=10000)))
+    assert event.status == TransferStatus.REJECTED
+    assert "receipt budget exhausted" in event.error
+    assert len(module._jobs) == module._receipt_limit
+    assert module.submit_transfer(first).status == TransferStatus.SUCCEEDED
+    assert len(backend.submissions) == module._receipt_limit
+
+    module, backend = worker()
+    for number in range(2):
+        req = transfer(job=f"slot{number}", ref=replace(REF, entry_id=str(number), slot_generation=number + 1))
+        module.submit_transfer(req)
+        complete(module, backend)
+    event = module.submit_transfer(transfer(job="over-capacity", ref=replace(REF, slot_generation=3)))
+    assert event.status == TransferStatus.REJECTED and "capacity" in event.error
+    assert len(backend.slots) == 2
+    module.close()
+
+
+def test_failed_submit_with_accepted_handle_retains_then_settles_actual_handle():
+    module, backend = worker()
+    handle = FakeHandle()
+    backend.error = NativeSubmissionError("failure after acceptance", handle=handle)
+    event = module.submit_transfer(transfer())
+    assert not event.stopped and module.pending.handle is handle
+    assert module.poll_completed() == ()
+    handle.ready = True
+    event = module.poll_completed()[0]
+    assert event.stopped and module.poisoned
+    with pytest.raises(RuntimeError, match="obligations"):
+        module.close()  # native stopped, owner is still quarantined
+
+
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_worker_without_pending_native_job_keeps_blocking_queue_semantics(pipeline):
+    import queue
+    from pypto_serving.serving.server.serving_worker import WorkerProcess
+    from pypto_serving.serving.server.ipc import ShutdownCommand
+
+    class BlockingOnlyQueue(queue.Queue):
+        def get(self, *args, **kwargs):
+            assert not args and not kwargs  # no idle periodic query/poll
+            cmd = ShutdownCommand()
+            return (cmd, None, {}) if pipeline else encode_command(cmd)
+
+    process = WorkerProcess.__new__(WorkerProcess)
+    module, _ = worker()
+    process._native_ddr_worker = module
+    process._poll_native_ddr = lambda: pytest.fail("idle owner must not poll")
+    if pipeline:
+        output = queue.Queue()
+        process._device_execution_loop(BlockingOnlyQueue(), output)
+        assert isinstance(output.get_nowait(), ShutdownCommand)
+    else:
+        process.input_queue = BlockingOnlyQueue()
+        process._serial_busy_loop()
+    module.close()
+
+
+def test_quarantined_engine_rejects_before_scheduler_or_model_admission():
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    coord, _ = coordinator()
+    coord.poisoned = True
+    core._native_ddr = coord
+    # No scheduler/worker exists: rejection must precede touching either.
+    with pytest.raises(RuntimeError, match="quarantined"):
+        core._try_dispatch_step()
