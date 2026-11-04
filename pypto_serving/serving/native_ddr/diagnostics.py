@@ -62,3 +62,24 @@ def inspect_idle_pages(backend, module, command):
         result["ddr"] = {"entry_id": entry.ref.entry_id, "file": str(path), "bytes": len(raw),
                          "sha256": hashlib.sha256(raw).hexdigest()}
     return json.dumps(result, sort_keys=True).encode()
+
+def arm_short_receipt(backend, module, kind):
+    """Inject host receipt validation failure AFTER a genuine successful native result."""
+    from dataclasses import replace
+    if not os.environ.get("PYPTO_NATIVE_DDR_DIAGNOSTICS_DIR"):
+        raise ValueError("native DDR test faults are disabled")
+    if kind not in ("short_load_receipt", "short_store_receipt"):
+        raise ValueError("unsupported diagnostic fault")
+    if module.pending is not None or backend.worker._active_dispatch_handles:
+        raise RuntimeError("fault arming requires an already idle owner")
+    operation = "LOAD" if kind == "short_load_receipt" else "STORE"
+    armed = True
+    def shorten(request, completion):
+        nonlocal armed
+        if armed and request.operation.value == operation:
+            armed = False
+            backend.record("injected_short_host_receipt_after_native_cleanup", job=request.job_id,
+                           actual_bytes=completion.transferred_bytes, reported_bytes=0)
+            return replace(completion, transferred_bytes=0)
+        return completion
+    backend.completion_filter = shorten

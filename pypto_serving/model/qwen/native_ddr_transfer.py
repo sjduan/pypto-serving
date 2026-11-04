@@ -97,10 +97,13 @@ class NativeDdrRun:
             self.backend.record("native_result_and_cleanup", job=self.request.job_id)
             if self.request.operation == Operation.STORE:
                 self.slot.native_complete = True
-            self._result = NativeCompletion(self.backend.layout.block_bytes, True, True)
+            completion = NativeCompletion(self.backend.layout.block_bytes, True, True)
+            if self.backend.completion_filter is not None:
+                completion = self.backend.completion_filter(self.request, completion)
             self.backend.slots.busy = None
             self.backend.pending = None
             self._keepalive = None
+            self._result = completion
             self.backend.record("finalized", job=self.request.job_id)
             return self._result
 
@@ -129,6 +132,7 @@ class QwenNativeTransferBackend:
         self.pending: NativeDdrRun | None = None
         self.ambiguous = None
         self.closed = False
+        self.completion_filter = None  # explicitly armed test receipt filter, after real native cleanup only
         self._pins = []
         self.descriptors = []
         try:

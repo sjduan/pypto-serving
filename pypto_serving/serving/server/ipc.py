@@ -149,7 +149,7 @@ class ControlCommand(msgspec.Struct, tag="control"):
 class NativeDdrCommand(msgspec.Struct, tag="native_ddr"):
     """Narrow non-barrier command; replies NEVER enter the StepResult FIFO."""
 
-    operation: Literal["submit", "cancel", "evict", "drain", "diagnostic"]
+    operation: Literal["submit", "cancel", "evict", "drain", "diagnostic", "fault"]
     request: DdrTransferRequest | None = None
     job_id: str = ""
     entry_ref: DdrEntryRef | None = None
@@ -157,6 +157,7 @@ class NativeDdrCommand(msgspec.Struct, tag="native_ddr"):
     worker_epoch: str = ""
     page_ids: tuple[int, ...] = ()
     diagnostic_label: str = ""
+    fault: str = ""
 
 
 class NativeDdrMessage(msgspec.Struct):

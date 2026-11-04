@@ -75,14 +75,24 @@ async def exercise(args, report):
             if fresh:
                 last_sequence = fresh[-1]["sequence"]
 
-    async def collect(name, prompt, generation=generate):
+    async def collect(name, prompt, generation=generate, *, allow_abort=False):
         request_id = engine.generate_request_id()
         record = {"name": name, "request_id": request_id, "prompt": prompt,
                   "prompt_token_ids": engine.tokenizer.encode(prompt), "generate_config": asdict(generation),
-                  "outputs": []}
+                  "outputs": [], "begin_ns": time.monotonic_ns()}
         report["requests"].append(record)
         async for output in engine.add_request(request_id, prompt, generation):
-            record["outputs"].append(asdict(output))
+            record["outputs"].append({"time_ns": time.monotonic_ns(), **asdict(output)})
+        record["completed_ns"] = time.monotonic_ns()
+        if allow_abort and record["outputs"][-1]["finish_reason"] == "FINISHED_ABORTED":
+            final = record["outputs"][-1]
+            emitted = [o["token_id"] for o in record["outputs"] if o["token_id"] is not None]
+            assert list(final["token_ids"]) == emitted and final["completion_tokens"] == len(emitted)
+            assert final["prompt_tokens"] == len(record["prompt_token_ids"])
+            assert "".join(o["text_delta"] for o in record["outputs"]) == final["text"]
+            assert engine.tokenizer.decode(emitted) == final["text"]
+            collect_trace()
+            return record
         ids = validate_output(record)
         assert engine.tokenizer.decode(ids) == record["outputs"][-1]["text"]
         collect_trace()
@@ -274,6 +284,262 @@ async def matrix(engine, core, collect, collect_trace, args, report, cold, warm)
     finally:
         if held:
             release(tuple(held))
+
+    # Preserve exactly the first local prefix reference while the same allocator
+    # reclaims its successors. No cache hash or allocator internals are edited.
+    prefix_ids = engine.tokenizer.encode((LONG_PROMPT + " ") * 4)[:385]
+    prefix_prompt = engine.tokenizer.decode(prefix_ids)
+    assert len(engine.tokenizer.encode(prefix_prompt)) == 385
+    seed = await collect("partial-seed", prefix_prompt)
+    await idle()
+    hashes = manager.compute_block_hashes(prefix_ids)[:3]
+    keys = [PrefixKey(coord.namespace, h) for h in hashes] if coord else []
+    if coord:
+        assert all(k in coord.ready for k in keys)
+    local = manager.get_computed_blocks(prefix_ids)
+    assert len(local) == 3
+    first_pin = local[0]
+    manager.release_cached_blocks(local[1:])
+    snapshots = []
+    try:
+        if coord:
+            for i in (1, 2):
+                snapshots.append(await inspect((local[i].block_id,), coord.ready[keys[i]], f"partial-source-{i}"))
+        claim_free()
+        release(sorted(held)[:6])
+        start = len(report["coordinator_trace"])
+        partial = await collect("partial-hbm-ddr", prefix_prompt)
+        await idle()
+        partial_tokens = sum(s["tokens"] for s in scheduled(partial) if s["is_prefill"])
+        assert partial_tokens == (1 if coord else 257)
+        details = {"local_prefix_page": first_pin.block_id, "prefill_tokens": partial_tokens}
+        if coord:
+            events = report["coordinator_trace"][start:]
+            loads = [e for e in events if e["event"] == "transfer_dispatched" and e["operation"] == "LOAD"]
+            assert len(loads) == 2
+            restored_hashes = []
+            for i in (1, 2):
+                cached = manager.get_cached_block(hashes[i])
+                assert cached is not None
+                page_id = cached.block_id
+                manager.release_cached_blocks([cached])
+                restored = await inspect((page_id,), None, f"partial-restored-{i}")
+                assert Path(restored["pages"][0]["file"]).read_bytes() == Path(snapshots[i - 1]["ddr"]["file"]).read_bytes()
+                restored_hashes.append(restored["pages"][0]["sha256"])
+            details.update(canonical_loads=2, full_block_bytes_equal=True, restored_sha256=restored_hashes)
+        report["partial_contiguous_successors"] = details
+    finally:
+        if held:
+            release(tuple(held))
+        manager.release_cached_blocks([first_pin])
+
+    await idle()
+    if coord:
+        assert coord.evict(keys[1])
+        await idle()
+        assert keys[0] in coord.ready and keys[1] not in coord.ready and keys[2] in coord.ready
+    try:
+        claim_free()
+        release(sorted(held)[:6])
+        start = len(report["coordinator_trace"])
+        gap = await collect("gap-stops-at-missing-middle", prefix_prompt)
+        await idle()
+        count = sum(s["tokens"] for s in scheduled(gap) if s["is_prefill"])
+        assert count == (257 if coord else 385)
+        details = {"prefill_tokens": count, "later_block_was_not_skipped": True}
+        if coord:
+            events = report["coordinator_trace"][start:]
+            assert len([e for e in events if e["event"] == "transfer_dispatched" and e["operation"] == "LOAD"]) == 1
+            details["canonical_loads"] = 1
+        report["gap_boundary"] = details
+    finally:
+        if held:
+            release(tuple(held))
+
+    # Exercise real finite slots through normal requests; new immutable prefixes
+    # cause release-acknowledged FIFO retirement before their STORE can be admitted.
+    filled = []
+    for number in range(15):
+        filled.append(await collect(f"pool-fill-{number}", f"Geography report {number}: " + LONG_PROMPT))
+        await idle()
+        if coord:
+            assert len(coord.ready) <= coord.max_entries and not coord.retiring
+    report["capacity"] = {"actual_hbm_pages": manager.num_blocks, "new_prefixes": len(filled)}
+    if coord:
+        assert len(coord.ready) == coord.max_entries
+        releases = [e for e in report["coordinator_trace"] if e["event"] == "worker_slot_released"]
+        assert len(releases) >= 2
+        report["capacity"].update(ready_entries=len(coord.ready), slots=coord.max_entries,
+                                  real_release_receipts=len(releases))
+
+    # Ordinary client cancellation after actual output is paired in both arms.
+    from dataclasses import replace
+    active = asyncio.create_task(collect("abort-after-output", SHORT_PROMPT,
+        replace(other_generation, max_new_tokens=32), allow_abort=True))
+    await wait_for(lambda: any(r["name"] == "abort-after-output" and any(
+        o["token_id"] is not None for o in r["outputs"]) for r in report["requests"]))
+    record = next(r for r in report["requests"] if r["name"] == "abort-after-output")
+    await engine.abort_request(record["request_id"])
+    aborted = await active
+    assert aborted["outputs"][-1]["finish_reason"] == "FINISHED_ABORTED"
+    await collect("after-client-abort", SHORT_PROMPT)
+    await idle()
+
+    if coord is None:
+        report["disabled_resources_absent"] = core._native_ddr_output_queue is None
+        return
+
+    # These are real engine waiters and real accepted native LOAD obligations.
+    # Cancellation is logical; release is checked only after the actual stopped event.
+    cancel_prompt = filled[-1]["prompt"]
+    cancel_hash = manager.compute_block_hashes(engine.tokenizer.encode(cancel_prompt))[0]
+    cancel_key = PrefixKey(coord.namespace, cancel_hash)
+    report["load_cancellation"] = []
+    for all_waiters in (False, True):
+        await idle()
+        assert cancel_key in coord.ready
+        try:
+            claim_free()
+            release(sorted(held)[:6])
+            label = "all" if all_waiters else "one"
+            a_task = asyncio.create_task(collect(f"cancel-{label}-a", cancel_prompt, allow_abort=True))
+            b_task = asyncio.create_task(collect(f"cancel-{label}-b", cancel_prompt, allow_abort=True))
+            await wait_for(lambda: len(coord.waiters) == 2 and coord.active_job is not None
+                           and coord.jobs[coord.active_job].request.operation.value == "LOAD")
+            job_id = coord.active_job
+            target = coord.jobs[job_id].request.page_ids[0]
+            assert manager.blocks[target].ref_cnt >= 1 and manager.blocks[target].block_hash is None
+            names = [f"cancel-{label}-a", f"cancel-{label}-b"]
+            ids = [next(r["request_id"] for r in report["requests"] if r["name"] == n) for n in names]
+            sent_ns = time.monotonic_ns()
+            await engine.abort_request(ids[0])
+            if all_waiters:
+                await engine.abort_request(ids[1])
+            assert manager.blocks[target].ref_cnt >= 1
+            a_result, b_result = await asyncio.gather(a_task, b_task)
+            assert a_result["outputs"][-1]["finish_reason"] == "FINISHED_ABORTED"
+            if all_waiters:
+                assert b_result["outputs"][-1]["finish_reason"] == "FINISHED_ABORTED"
+            await idle()
+            terminal = next(e for e in report["coordinator_trace"]
+                            if e["event"] == "transfer_terminal" and e["job"] == job_id)
+            assert terminal["stopped"] and terminal["native_completed"]
+            if all_waiters:
+                assert manager.get_cached_block(cancel_hash) is None and cancel_key not in coord.ready
+                assert not any(e["event"] == "restored_page_valid" and e["job"] == job_id
+                               for e in report["coordinator_trace"])
+            else:
+                assert cancel_key in coord.ready
+            report["load_cancellation"].append({"all_waiters": all_waiters, "job": job_id,
+                "target": target, "cancel_sent_ns": sent_ns, "terminal": terminal,
+                "pending_target_retained": True, "early_valid": False})
+        finally:
+            if held:
+                release(tuple(held))
+    await collect("after-all-waiters-cancel", cancel_prompt)
+    await idle()
+
+    store_prompt = "A separate cancelled cache report: " + LONG_PROMPT
+    store_task = asyncio.create_task(collect("cancel-pending-store", store_prompt))
+    await wait_for(lambda: coord.active_job is not None
+                   and coord.jobs[coord.active_job].request.operation.value == "STORE")
+    job_id = coord.active_job
+    job = coord.jobs[job_id]
+    page = job.request.page_ids[0]
+    assert manager.blocks[page].ref_cnt >= 1
+    job.discard = True
+    coord._control("cancel", job_id=job_id)
+    await store_task
+    await idle()
+    assert job.request.entry_keys[0] not in coord.ready and manager.blocks[page].ref_cnt == 0
+    terminal = next(e for e in report["coordinator_trace"] if e["event"] == "transfer_terminal" and e["job"] == job_id)
+    assert terminal["stopped"] and terminal["native_completed"]
+    report["store_cancellation"] = {"job": job_id, "source_page": page, "terminal": terminal,
+                                    "source_pin_released_after_stop": True, "ddr_ready_not_published": True}
+
+    async def arm_fault(kind):
+        await idle()
+        cmd = coord._control("fault", fault=kind)
+        await wait_for(lambda: cmd.command_id in coord.diagnostic_results)
+        error, payload = coord.diagnostic_results.pop(cmd.command_id)
+        if error:
+            raise RuntimeError(error)
+        assert json.loads(payload)["armed"] == kind
+
+    # Real headroom exhaustion, then release genuine allocator reservations.
+    # The request safely cold-prefills instead of reserving a target with no suffix room.
+    try:
+        await idle()
+        claim_free()
+        release(sorted(held)[:1])
+        headroom_task = asyncio.create_task(collect("headroom-safe-cold-fallback", cancel_prompt))
+        await wait_for(lambda: any(e["event"] == "restore_reservation_no_headroom" and e["free_pages"] == 1
+                                  for e in coord.trace))
+        release(sorted(held)[:3])
+        headroom_result = await headroom_task
+        await idle()
+        assert sum(s["tokens"] for s in scheduled(headroom_result) if s["is_prefill"]) == len(headroom_result["prompt_token_ids"])
+        report["headroom_fallback"] = {"actual_free_pages": 1, "fresh_target_plus_suffix_required": 2,
+                                       "cold_prefill_completed": True, "capacity_unchanged": True}
+    finally:
+        if held:
+            release(tuple(held))
+
+    await arm_fault("short_load_receipt")
+    try:
+        claim_free()
+        release(sorted(held)[:6])
+        start = len(report["coordinator_trace"])
+        failed_load = await collect("short-receipt-load-fallback", cancel_prompt)
+        await idle()
+        events = report["coordinator_trace"][start:]
+        failure = next(e for e in events if e["event"] == "transfer_terminal" and e["status"] == "FAILED")
+        assert failure["native_completed"] and failure["stopped"] and failure["bytes"] == 0
+        assert not any(e["event"] == "restored_page_valid" and e["job"] == failure["job"] for e in events)
+        assert sum(s["tokens"] for s in scheduled(failed_load) if s["is_prefill"]) == len(failed_load["prompt_token_ids"])
+        report["postsubmit_load_failure"] = {"layer": "short host receipt after actual native result/cleanup",
+            "terminal": failure, "invalid_target_not_consumed": True, "real_cold_fallback_completed": True}
+    finally:
+        if held:
+            release(tuple(held))
+    await arm_fault("short_store_receipt")
+    start = len(report["coordinator_trace"])
+    failed_store = await collect("short-receipt-store", "A failed cache receipt report: " + LONG_PROMPT)
+    await idle()
+    events = report["coordinator_trace"][start:]
+    failure = next(e for e in events if e["event"] == "transfer_terminal" and e["status"] == "FAILED")
+    assert failure["native_completed"] and failure["stopped"] and failure["bytes"] == 0
+    assert not any(e["event"] == "ddr_ready" and e["job"] == failure["job"] for e in events)
+    report["postsubmit_store_failure"] = {"layer": "short host receipt after actual native result/cleanup",
+                                         "terminal": failure, "request_completed": failed_store["request_id"]}
+
+    # Both native operation types get a real pending shutdown across the paired
+    # main/pressure configurations. Idle shutdown is covered by smoke/disabled.
+    stop_operation = "LOAD" if args.utilization < .7 else "STORE"
+    try:
+        if stop_operation == "LOAD":
+            claim_free()
+            release(sorted(held)[:6])
+            stop_prompt = cancel_prompt
+        else:
+            stop_prompt = "A report for pending owner shutdown: " + LONG_PROMPT
+        pending_client = asyncio.create_task(collect("pending-stop-client", stop_prompt, allow_abort=True))
+        await wait_for(lambda: coord.active_job is not None
+                       and coord.jobs[coord.active_job].request.operation.value == stop_operation)
+        job_id = coord.active_job
+        page = coord.jobs[job_id].request.page_ids[0]
+        report["pending_stop"] = {"operation": stop_operation, "job": job_id, "page": page,
+                                   "invoke_ns": time.monotonic_ns(), "retained_ref_cnt": manager.blocks[page].ref_cnt}
+        assert manager.blocks[page].ref_cnt >= 1
+        assert await engine.stop()
+        await pending_client
+        assert coord.stopped and not coord.jobs and not coord.steps
+        report["pending_stop"]["owner_stop_proven"] = True
+    finally:
+        if held:
+            release(tuple(held))
+    assert all(b.ref_cnt == 0 for b in manager.blocks)
+    report["pending_stop"]["all_page_refs_released_after_proof"] = True
 
 
 def main():

@@ -9,7 +9,7 @@
 """CPU/fake control-plane tests, NOT native transfer/model/NPU verification."""
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
@@ -863,7 +863,8 @@ def test_startup_waits_for_delayed_auxiliary_metadata_and_validates_capacity():
     core.kv_cache_manager.initialize(core._runtime, num_blocks=16)
     core._native_ddr_output_queue = queue.Queue()
     descriptor = json.dumps({"worker_epoch": "worker1", "scope": "single-loaded-owner-incarnation-only",
-                             "model": {"model_id": "qwen"}}).encode()
+                             "model": {"model_id": "qwen"}, "layout": asdict(LAYOUT),
+                             "tensor_parallel": 1}).encode()
     info = DdrStartup("worker1", hashlib.sha256(descriptor).digest(), LAYOUT,
                       CONFIG.capacity_bytes, 2, descriptor)
     producer = threading.Timer(.03, lambda: core._native_ddr_output_queue.put(
@@ -983,3 +984,57 @@ def test_asset_namespace_evidence_tracks_content_and_rejects_escaping_shards(tmp
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"w": "../escape.safetensors"}}))
     with pytest.raises((ValueError, FileNotFoundError)):
         capture_assets(tmp_path)
+
+
+def test_confirmed_decode_cannot_blindly_replay_cancelled_prefix_store():
+    coord, manager = coordinator()
+    req = request()
+    page = manager.allocate_blocks(1)[0]
+    hashes = tuple(manager.compute_block_hashes(req.prompt_token_ids))
+    manager.cache_block_ids([page.block_id], list(hashes), 0, 1)
+    first = (ScheduledPrefix(req.request_id, (page.block_id,), hashes, 129, 0, 128),)
+    coord.retain_step(1, first)
+    coord.on_confirmed_step(1, first, {req.request_id: 128})
+    job = coord.next_transfer()
+    coord.jobs[job.job_id].discard = True
+    coord.on_transfer_event(event_for(job, TransferStatus.CANCELLED))
+    later = (ScheduledPrefix(req.request_id, (page.block_id,), hashes, 129, 128, 1),)
+    coord.retain_step(2, later)
+    coord.on_confirmed_step(2, later, {req.request_id: 129})
+    assert not coord.stores_by_key and not coord.jobs
+    manager.release_blocks_by_ids([page.block_id])
+    close_coordinator_with_host_receipts(coord)
+
+
+def test_production_worker_rejects_foreign_namespace_before_reserving_or_submitting():
+    backend = FakeBackend()
+    module = DdrPrefixWorker(CONFIG, LAYOUT, "worker1", backend, namespace_digest=b"q" * 32)
+    event = module.submit_transfer(transfer())
+    assert event.status == TransferStatus.REJECTED and event.stopped and "namespace" in event.error
+    assert not backend.slots and not backend.submissions
+    key = PrefixKey(b"q" * 32, KEY.block_hash)
+    assert module.submit_transfer(transfer(key=key)).status == TransferStatus.ACCEPTED
+    complete(module, backend)
+    module.close()
+
+
+def test_receipt_filter_exception_keeps_real_handle_obligations_until_explicit_result():
+    from pypto_serving.model.qwen.native_ddr_transfer import NativeDdrRun
+    calls = []
+    slot = SimpleNamespace(native_complete=False)
+    backend = SimpleNamespace(worker=object(), keys=object(), values=object(),
+        slots=SimpleNamespace(page_ids=object(), busy=slot), layout=LAYOUT,
+        record=lambda *args, **kwargs: calls.append(args[0]), pending=None)
+    def reject(_request, _result):
+        raise RuntimeError("injected host receipt exception")
+    backend.completion_filter = reject
+    native = SimpleNamespace(done=True, result=lambda **kwargs: calls.append("native_result"))
+    handle = NativeDdrRun(backend, transfer(), slot, native)
+    backend.pending = handle
+    with pytest.raises(RuntimeError, match="receipt exception"):
+        handle.result()
+    assert handle._result is None and handle._keepalive is not None
+    assert backend.pending is handle and backend.slots.busy is slot
+    backend.completion_filter = None  # explicit host-fixture repair, not production recovery
+    assert handle.result() == NativeCompletion(LAYOUT.block_bytes, True, True)
+    assert backend.pending is None and backend.slots.busy is None and handle._keepalive is None

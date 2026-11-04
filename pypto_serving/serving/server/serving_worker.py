@@ -279,7 +279,8 @@ class WorkerProcess:
                                                           observer=self._trace_native_ddr)
                 self._native_ddr_backend = backend
                 namespace, descriptor = build_compatibility(loaded, assets, epoch, backend.layout)
-                self._native_ddr_worker = DdrPrefixWorker(native_config, backend.layout, epoch, backend)
+                self._native_ddr_worker = DdrPrefixWorker(native_config, backend.layout, epoch, backend,
+                                                        namespace_digest=namespace)
                 count = len(backend.slots.tensors)
                 self._native_ddr_startup = DdrStartup(epoch, namespace, backend.layout,
                                                      count * backend.layout.block_bytes, count, descriptor)
@@ -1586,6 +1587,11 @@ class WorkerProcess:
                     raise ValueError("native DDR control identity replay conflict")
                 self._emit_native_ddr(NativeDdrMessage("control", control=previous[1]))
                 return
+            if len(self._native_ddr_control_receipts) >= 4096 and cmd.operation != "drain":
+                event = DdrControlEvent(cmd.command_id, module.worker_epoch, cmd.operation,
+                    cmd.entry_ref, error="bounded control replay budget exhausted; owner retirement required")
+                self._emit_native_ddr(NativeDdrMessage("control", control=event))
+                return
             if cmd.command_id in self._native_ddr_controls:
                 if self._native_ddr_controls[cmd.command_id] != cmd:
                     raise ValueError("native DDR pending control replay conflict")
@@ -1598,7 +1604,13 @@ class WorkerProcess:
             elif cmd.operation == "evict":
                 if cmd.entry_ref is None:
                     raise ValueError("native DDR evict requires an entry ref")
-                module.evict(cmd.entry_ref)
+                try:
+                    module.evict(cmd.entry_ref)
+                except ValueError as error:
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, "evict",
+                                            cmd.entry_ref, error=str(error))
+                    self._emit_native_ddr(NativeDdrMessage("control", control=event))
+                    return
                 self._native_ddr_controls[cmd.command_id] = cmd
                 self._poll_native_ddr_controls()
             elif cmd.operation == "diagnostic":
@@ -1609,6 +1621,16 @@ class WorkerProcess:
                 except (ValueError, RuntimeError, OSError) as error:
                     event = DdrControlEvent(cmd.command_id, module.worker_epoch, "diagnostic", error=str(error))
                 self._emit_native_ddr(NativeDdrMessage("control", control=event))
+            elif cmd.operation == "fault":
+                from pypto_serving.serving.native_ddr.diagnostics import arm_short_receipt
+                try:
+                    arm_short_receipt(self._native_ddr_backend, module, cmd.fault)
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, "fault",
+                                            payload=json.dumps({"armed": cmd.fault}).encode())
+                except (ValueError, RuntimeError) as error:
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, "fault", error=str(error))
+                self._emit_native_ddr(NativeDdrMessage("control", control=event))
+                self._native_ddr_control_receipts[cmd.command_id] = (cmd, event)
             else:
                 self._native_ddr_drain_commands[cmd.command_id] = cmd
                 module.closed = True

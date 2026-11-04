@@ -18,7 +18,7 @@ import queue
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Callable
 
 import msgspec
@@ -502,6 +502,10 @@ class ReplicaEngineCore:
             "cleanup_error": None,
         }
         try:
+            if native_ddr is not None:
+                native_ddr.closed = True
+                for request_id in tuple(self._request_contexts):
+                    await self.abort_request(request_id)
             await self._drain_loop_task()
             if native_ddr is not None:
                 try:
@@ -526,7 +530,10 @@ class ReplicaEngineCore:
             else:
                 reap_task = asyncio.create_task(asyncio.to_thread(self._shutdown_worker, timeout=max(timeout, 65)))
                 while not reap_task.done():
-                    self._pump_native_ddr(raise_poison=False)
+                    try:
+                        self._pump_native_ddr(raise_poison=False)
+                    except Exception as exc:
+                        self.shutdown_report["cleanup_error"] = f"auxiliary cleanup: {type(exc).__name__}: {exc}"
                     await asyncio.sleep(0.002)
                 reaped = await reap_task
                 # Queue feeders may lag the process/reap observation briefly.
@@ -536,6 +543,18 @@ class ReplicaEngineCore:
                     await asyncio.sleep(0.002)
                 if not native_ddr.stopped:
                     self.shutdown_report["cleanup_error"] = "native Qwen owner close/argument release proof unavailable"
+                else:
+                    # A strict owner-close proof, not merely process reap, may
+                    # acknowledge request resources for consumers stopped in flight.
+                    for ctx in self._request_contexts.values():
+                        ctx.worker_release_done.set()
+                        ack = getattr(ctx, "worker_release_ack", None)
+                        if ack is not None:
+                            ack.set()
+                    self._worker_known_req_ids.clear()
+                    self._pending_free_ids.clear()
+                    self._worker_free_ids_by_step.clear()
+                    self._batch_queue.clear()
         except BaseException as exc:
             self._worker_stranded = True
             self.shutdown_report["cleanup_error"] = f"{type(exc).__name__}: {exc}"
@@ -801,9 +820,11 @@ class ReplicaEngineCore:
                 request_id,
                 "FINISHED_ABORTED",
             )
-        await ctx.queue.put(
-            TokenOutput(finished=True, finish_reason="FINISHED_ABORTED")
-        )
+        ids = tuple(getattr(ctx.request, "output_token_ids", ()))
+        terminal = TokenOutput(finished=True, finish_reason="FINISHED_ABORTED",
+            prompt_tokens=len(getattr(ctx.request, "prompt_token_ids", ())),
+            completion_tokens=len(ids), token_ids=ids, text=getattr(ctx, "detok_text", ""))
+        await ctx.queue.put(terminal)
         # See note in add_request's finally block: schedule worker-side cleanup.
         self._schedule_worker_free(request_id)
 
@@ -956,6 +977,7 @@ class ReplicaEngineCore:
                 or hashlib.sha256(info.compatibility_json).digest() != info.namespace_digest
                 or descriptor["worker_epoch"] != info.worker_epoch
                 or descriptor["scope"] != "single-loaded-owner-incarnation-only"
+                or descriptor["layout"] != asdict(info.layout) or descriptor["tensor_parallel"] != 1
                 or descriptor["model"]["model_id"] != self.config.model_id):
             raise RuntimeError("native DDR owner/layout/capacity/compatibility handshake mismatch")
         self._native_ddr_startup = info
@@ -997,7 +1019,7 @@ class ReplicaEngineCore:
             self._input_queue.put(encode_command(NativeDdrCommand(
                 operation=command.operation, command_id=command.command_id, worker_epoch=command.worker_epoch,
                 job_id=command.job_id, entry_ref=command.entry_ref, page_ids=command.page_ids,
-                diagnostic_label=command.diagnostic_label)))
+                diagnostic_label=command.diagnostic_label, fault=command.fault)))
         request = native_ddr.next_transfer()
         if request is not None:
             self._input_queue.put(encode_command(NativeDdrCommand(operation="submit", request=request)))
@@ -1146,6 +1168,8 @@ class ReplicaEngineCore:
             snapshot = self._native_ddr.steps[step_id][1]
             self._native_ddr.on_confirmed_step(step_id, snapshot, {
                 item.request_id: item.computed_before + item.scheduled_tokens for item in snapshot})
+            self._native_ddr.record("model_step_confirmed", step_id=step_id,
+                                    requests=[item.request_id for item in snapshot])
         return True
 
     async def _get_live_result(self) -> bytes:
@@ -1156,7 +1180,23 @@ class ReplicaEngineCore:
         drop them so a stale result is never applied to a live batch.
         """
         while True:
-            raw = await asyncio.to_thread(self._output_queue.get, timeout=self._step_timeout)
+            if getattr(self, "_native_ddr", None) is None:
+                raw = await asyncio.to_thread(self._output_queue.get, timeout=self._step_timeout)
+            else:
+                # Progress this module while a different model result is awaited.
+                # There is no device/control RPC or extra poll on the disabled path.
+                deadline = time.monotonic() + self._step_timeout
+                while True:
+                    pending = self._native_ddr.active_job or self._native_ddr.controls
+                    quantum = .002 if pending else min(self._step_timeout, .1)
+                    try:
+                        raw = await asyncio.to_thread(self._output_queue.get,
+                            timeout=min(quantum, max(.001, deadline - time.monotonic())))
+                        break
+                    except queue.Empty:
+                        self._pump_native_ddr()
+                        if time.monotonic() >= deadline:
+                            raise
             if not self._discard_result_step_ids:
                 return raw
             sid = decode_result(raw).step_id

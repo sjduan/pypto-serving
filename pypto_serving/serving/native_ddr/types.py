@@ -161,6 +161,8 @@ class DdrTransferRequest:
             raise ValueError("Run02 transfers require one complete one-to-one block and lease identity")
         if not isinstance(self.operation, Operation):
             raise ValueError("invalid transfer operation")
+        if self.operation == Operation.STORE and (type(self.source_step_id) is not int or self.source_step_id <= 0):
+            raise ValueError("STORE requires a confirmed source step identity")
         if len(set(self.page_ids)) != n or len(set(self.entry_keys)) != n or len(set(self.entry_refs)) != n:
             raise ValueError("duplicate transfer mapping")
         for page, ref in zip(self.page_ids, self.entry_refs):
@@ -222,3 +224,4 @@ class DdrControlRequest:
     entry_ref: DdrEntryRef | None = None
     page_ids: tuple[int, ...] = ()
     diagnostic_label: str = ""
+    fault: str = ""

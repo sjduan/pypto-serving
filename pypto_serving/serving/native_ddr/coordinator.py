@@ -91,9 +91,9 @@ class DdrPrefixCoordinator:
         self.trace.append(item)
         logger.info("native_ddr_coordinator %s", json.dumps(item, sort_keys=True))
 
-    def _control(self, operation, *, job_id="", entry_ref=None, page_ids=(), diagnostic_label=""):
+    def _control(self, operation, *, job_id="", entry_ref=None, page_ids=(), diagnostic_label="", fault=""):
         command = DdrControlRequest(self._id(operation), self.worker_epoch, operation, job_id, entry_ref,
-                                    tuple(page_ids), diagnostic_label)
+                                    tuple(page_ids), diagnostic_label, fault)
         self.controls[command.command_id] = command
         self.control_outbound.append(command.command_id)
         return command
@@ -118,8 +118,8 @@ class DdrPrefixCoordinator:
         command = self.controls.get(event.command_id)
         if command is None:
             return
-        if command.operation == "diagnostic":
-            if event.worker_epoch != command.worker_epoch or event.operation != "diagnostic":
+        if command.operation in ("diagnostic", "fault"):
+            if event.worker_epoch != command.worker_epoch or event.operation != command.operation:
                 raise RuntimeError("diagnostic receipt identity mismatch")
             self.diagnostic_results[event.command_id] = (event.error, event.payload)
             del self.controls[event.command_id]
@@ -181,6 +181,8 @@ class DdrPrefixCoordinator:
         # checks the actual chunk allocation and can relinquish completed
         # restore pins before retrying; no private suffix/free-page pool exists.
         if self.manager.num_free_blocks < len(fresh) + 1 or len(self.jobs) + len(fresh) > self.max_entries:
+            self.record("restore_reservation_no_headroom", request=request.request_id,
+                        free_pages=self.manager.num_free_blocks, fresh_blocks=len(fresh), jobs=len(self.jobs))
             return RestoreDecision(RestoreKind.MISS)
         blocks = self.manager.allocate_blocks(len(fresh))
         if blocks is None:
@@ -252,7 +254,11 @@ class DdrPrefixCoordinator:
                 confirmed = confirmed_tokens.get(item.request_id, 0)
                 limit = min(confirmed, item.prompt_tokens,
                             item.computed_before + item.scheduled_tokens) // 128
-                for page, block_hash in zip(item.page_ids[:limit], item.block_hashes[:limit]):
+                # Promote only blocks newly sealed by this confirmed step.
+                # A later suffix/decode confirmation must not blindly retry a
+                # cancelled/failed STORE of an older immutable prefix.
+                start = min(limit, item.computed_before // 128)
+                for page, block_hash in zip(item.page_ids[start:limit], item.block_hashes[start:limit]):
                     key = PrefixKey(self.namespace, block_hash)
                     if key in self.ready or key in self.stores_by_key:
                         continue
@@ -307,6 +313,9 @@ class DdrPrefixCoordinator:
         if event.status == TransferStatus.ACCEPTED:
             self.record("transfer_accepted", job=req.job_id)
             return
+        self.record("transfer_terminal", job=req.job_id, status=event.status.value,
+                    native_completed=event.native_completed, stopped=event.stopped,
+                    bytes=event.transferred_bytes)
         if not event.stopped:
             job.state = LoadState.QUARANTINED
             self.poisoned = True
@@ -390,6 +399,7 @@ class DdrPrefixCoordinator:
         if self.loads_by_key.get(index_key) == job_id:
             del self.loads_by_key[index_key]
         self._release(job.lease)
+        self.record("load_target_lease_released", job=job_id, pages=list(job.lease.block_ids))
         job.state = LoadState.RELEASED
 
     def release_completed_restores(self):
@@ -401,6 +411,7 @@ class DdrPrefixCoordinator:
         Requests stay WAITING and may use normal lookup/cold prefill later.
         """
         before = self.manager.num_free_blocks
+        self.record("suffix_headroom_pressure", free_pages=before, waiters=len(self.waiters))
         for req_key, waiter in tuple(self.waiters.items()):
             if all(self.jobs[j].state in (LoadState.COMMITTED, LoadState.DISCARD_PENDING)
                    for j in waiter.jobs):

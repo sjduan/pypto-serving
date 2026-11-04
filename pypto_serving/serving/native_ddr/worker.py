@@ -79,11 +79,14 @@ class _Pending:
 
 class DdrPrefixWorker:
     def __init__(self, config: NativeDdrPrefixConfig, layout: QwenKvLayout, worker_epoch: str,
-                 backend: NativeTransferBackend | None = None):
+                 backend: NativeTransferBackend | None = None, *, namespace_digest: bytes | None = None):
         if not config.enabled:
             raise ValueError("do not construct DDR worker when disabled")
         self.layout = layout
         self.worker_epoch = worker_epoch
+        if namespace_digest is not None and (not isinstance(namespace_digest, bytes) or len(namespace_digest) != 32):
+            raise ValueError("invalid worker compatibility namespace")
+        self.namespace_digest = namespace_digest
         self.backend = backend
         self.capacity = config.capacity_bytes // layout.block_bytes
         self.entries: dict[str, _Entry] = {}
@@ -121,6 +124,9 @@ class DdrPrefixWorker:
             request.validate(self.layout)
             if request.worker_epoch != self.worker_epoch:
                 raise ValueError("worker epoch mismatch")
+            if self.namespace_digest is not None and any(
+                    key.namespace_digest != self.namespace_digest for key in request.entry_keys):
+                raise ValueError("worker compatibility namespace mismatch")
             if self.closed or self.poisoned or self.pending is not None:
                 raise ValueError("worker closed, quarantined, busy, or duplicate job")
             if len(self._jobs) >= self._receipt_limit:
