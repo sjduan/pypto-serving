@@ -848,3 +848,138 @@ def test_joining_committed_canonical_target_does_not_wait_for_another_event():
     assert not coord.loads_by_key and not coord.jobs
     close_coordinator_with_host_receipts(coord)
     assert manager.num_free_blocks == 12
+
+
+def test_startup_waits_for_delayed_auxiliary_metadata_and_validates_capacity():
+    import asyncio
+    import hashlib
+    import json
+    import queue
+    import threading
+    from pypto_serving.serving.native_ddr.types import DdrStartup
+
+    core = ReplicaEngineCore(EngineConfig(model_id="qwen", runtime_config=RuntimeConfig(
+        page_size=128, native_ddr=CONFIG)), SimpleNamespace())
+    core.kv_cache_manager.initialize(core._runtime, num_blocks=16)
+    core._native_ddr_output_queue = queue.Queue()
+    descriptor = json.dumps({"worker_epoch": "worker1", "scope": "single-loaded-owner-incarnation-only",
+                             "model": {"model_id": "qwen"}}).encode()
+    info = DdrStartup("worker1", hashlib.sha256(descriptor).digest(), LAYOUT,
+                      CONFIG.capacity_bytes, 2, descriptor)
+    producer = threading.Timer(.03, lambda: core._native_ddr_output_queue.put(
+        encode_native_ddr_message(NativeDdrMessage("startup", startup=info))))
+    producer.start()
+    try:
+        asyncio.run(core._install_native_ddr(SimpleNamespace(is_alive=lambda: True), 16))
+    finally:
+        producer.join()
+    assert core._native_ddr.worker_epoch == "worker1"
+    assert core.scheduler._native_ddr is core._native_ddr
+    assert core._native_ddr.max_entries == 2
+    core._native_ddr_output_queue.put(encode_native_ddr_message(
+        NativeDdrMessage("startup", startup=replace(info, max_entries=3))))
+    with pytest.raises(RuntimeError, match="mismatch"):
+        asyncio.run(core._install_native_ddr(SimpleNamespace(is_alive=lambda: True), 16))
+
+
+def test_store_waits_for_worker_eviction_release_instead_of_overselling():
+    coord, manager = coordinator(capacity=1)
+    old_key = seed_ready(coord, manager, request("old"))
+    req = Request(request_id="new", prompt_token_ids=[999] + list(range(128)), max_new_tokens=2)
+    page = manager.allocate_blocks(1)[0]
+    hashes = manager.compute_block_hashes(req.prompt_token_ids)
+    manager.cache_block_ids([page.block_id], hashes, 0, 1)
+    snapshot = (ScheduledPrefix(req.request_id, (page.block_id,), tuple(hashes), 129, 0, 128),)
+    coord.retain_step(1, snapshot)
+    coord.on_confirmed_step(1, snapshot, {req.request_id: 128})
+    manager.release_blocks_by_ids([page.block_id])
+    assert old_key not in coord.ready and coord.retiring and page.ref_cnt == 1
+    assert coord.next_transfer() is None
+    cmd = coord.next_control()
+    assert cmd.operation == "evict"
+    coord.on_control_event(DdrControlEvent(cmd.command_id, cmd.worker_epoch, "evict", cmd.entry_ref, True))
+    job = coord.next_transfer()
+    assert job.operation == Operation.STORE
+    coord.on_transfer_event(event_for(job))
+    assert page.ref_cnt == 0 and len(coord.ready) == 1
+    close_coordinator_with_host_receipts(coord)
+
+
+def test_eviction_with_pending_load_retains_reader_until_actual_completion():
+    coord, manager = coordinator(capacity=2)
+    req = request()
+    key = seed_ready(coord, manager, req)
+    module, backend = worker()
+    store = transfer(key=key)
+    module.submit_transfer(store)
+    complete(module, backend)
+    coord.lookup_after_hbm(req, [], 128)
+    load = coord.next_transfer()
+    assert module.submit_transfer(load).status == TransferStatus.ACCEPTED
+    assert coord.evict(key)
+    cmd = coord.next_control()
+    module.evict(cmd.entry_ref)
+    assert module.entries[REF.entry_id].readers == 1 and backend.slots
+    terminal = complete(module, backend)
+    assert terminal.status == TransferStatus.SUCCEEDED and not backend.slots
+    coord.on_transfer_event(terminal)
+    assert coord.retiring  # worker terminal and physical-release receipt are distinct
+    coord.on_control_event(DdrControlEvent(cmd.command_id, cmd.worker_epoch, "evict", cmd.entry_ref, True))
+    coord.resume_request(req)
+    blocks = manager.get_computed_blocks(req.prompt_token_ids)
+    coord.after_lookup(req)
+    assert len(blocks) == 1 and not coord.jobs
+    manager.release_cached_blocks(blocks)
+    close_coordinator_with_host_receipts(coord)
+    module.close()
+
+
+@pytest.mark.parametrize("owner_error", [False, True])
+def test_stop_proof_follows_strict_owner_close_not_module_drain(owner_error):
+    import queue
+    from pypto_serving.serving.server.serving_worker import WorkerProcess
+
+    calls = []
+    def owner_close(_model):
+        calls.append("owner_close")
+        if owner_error:
+            raise RuntimeError("injected owner cleanup failure")
+    process = WorkerProcess.__new__(WorkerProcess)
+    process.config = SimpleNamespace(model_id="qwen")
+    process._native_ddr_worker = SimpleNamespace(pending=None, poisoned=False, worker_epoch="worker1",
+        close=lambda: calls.append("module_close"), entries={})
+    process._native_ddr_backend = SimpleNamespace(close=lambda: calls.append("backend_close"))
+    process._native_ddr_controls = {}
+    process._native_ddr_control_receipts = {}
+    process._native_ddr_drain_commands = {}
+    process._native_ddr_stop_sent = False
+    process.native_ddr_output_queue = queue.Queue()
+    process.executor = SimpleNamespace(close_native_ddr_owner=owner_close,
+                                       close=lambda: calls.append("executor_close"))
+    if owner_error:
+        with pytest.raises(RuntimeError, match="owner cleanup"):
+            process.close()
+        assert process.native_ddr_output_queue.empty()
+    else:
+        process.close()
+        proof = decode_native_ddr_message(process.native_ddr_output_queue.get_nowait()).proof
+        assert proof == NativeStopProof("worker1", True, True)
+        assert calls == ["module_close", "backend_close", "owner_close", "executor_close"]
+
+
+def test_asset_namespace_evidence_tracks_content_and_rejects_escaping_shards(tmp_path):
+    import json
+    import struct
+    from pypto_serving.serving.native_ddr.compatibility import capture_assets
+
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"w": "weights.safetensors"}}))
+    (tmp_path / "weights.safetensors").write_bytes(struct.pack("<Q", 2) + b"{}" + b"payload")
+    (tmp_path / "tokenizer.json").write_text('{"vocab":1}')
+    first = capture_assets(tmp_path)
+    assert "payload not rescanned" in first["files"]["weights.safetensors"]["evidence"]
+    (tmp_path / "tokenizer.json").write_text('{"vocab":2}')
+    second = capture_assets(tmp_path)
+    assert first["files"]["tokenizer.json"]["sha256"] != second["files"]["tokenizer.json"]["sha256"]
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"w": "../escape.safetensors"}}))
+    with pytest.raises((ValueError, FileNotFoundError)):
+        capture_assets(tmp_path)

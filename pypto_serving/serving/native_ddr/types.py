@@ -210,6 +210,7 @@ class DdrControlEvent:
     entry_ref: DdrEntryRef | None = None
     released: bool = False
     error: str | None = None
+    payload: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -219,3 +220,5 @@ class DdrControlRequest:
     operation: str
     job_id: str = ""
     entry_ref: DdrEntryRef | None = None
+    page_ids: tuple[int, ...] = ()
+    diagnostic_label: str = ""

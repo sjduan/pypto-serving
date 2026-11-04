@@ -1601,6 +1601,14 @@ class WorkerProcess:
                 module.evict(cmd.entry_ref)
                 self._native_ddr_controls[cmd.command_id] = cmd
                 self._poll_native_ddr_controls()
+            elif cmd.operation == "diagnostic":
+                from pypto_serving.serving.native_ddr.diagnostics import inspect_idle_pages
+                try:
+                    payload = inspect_idle_pages(self._native_ddr_backend, module, cmd)
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, "diagnostic", payload=payload)
+                except (ValueError, RuntimeError, OSError) as error:
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, "diagnostic", error=str(error))
+                self._emit_native_ddr(NativeDdrMessage("control", control=event))
             else:
                 self._native_ddr_drain_commands[cmd.command_id] = cmd
                 module.closed = True

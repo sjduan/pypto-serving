@@ -81,15 +81,19 @@ class DdrPrefixCoordinator:
         self.stopped = False
         self.drained = False
         self.trace = deque(maxlen=512)
+        self.diagnostic_results = {}
+        self._trace_sequence = 0
 
     def record(self, event, **fields):
         import time
-        item = {"event": event, "time_ns": time.monotonic_ns(), **fields}
+        self._trace_sequence += 1
+        item = {"event": event, "sequence": self._trace_sequence, "time_ns": time.monotonic_ns(), **fields}
         self.trace.append(item)
         logger.info("native_ddr_coordinator %s", json.dumps(item, sort_keys=True))
 
-    def _control(self, operation, *, job_id="", entry_ref=None):
-        command = DdrControlRequest(self._id(operation), self.worker_epoch, operation, job_id, entry_ref)
+    def _control(self, operation, *, job_id="", entry_ref=None, page_ids=(), diagnostic_label=""):
+        command = DdrControlRequest(self._id(operation), self.worker_epoch, operation, job_id, entry_ref,
+                                    tuple(page_ids), diagnostic_label)
         self.controls[command.command_id] = command
         self.control_outbound.append(command.command_id)
         return command
@@ -113,6 +117,12 @@ class DdrPrefixCoordinator:
     def on_control_event(self, event):
         command = self.controls.get(event.command_id)
         if command is None:
+            return
+        if command.operation == "diagnostic":
+            if event.worker_epoch != command.worker_epoch or event.operation != "diagnostic":
+                raise RuntimeError("diagnostic receipt identity mismatch")
+            self.diagnostic_results[event.command_id] = (event.error, event.payload)
+            del self.controls[event.command_id]
             return
         if ((event.worker_epoch, event.operation, event.entry_ref) !=
                 (command.worker_epoch, command.operation, command.entry_ref)

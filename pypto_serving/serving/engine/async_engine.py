@@ -996,7 +996,8 @@ class ReplicaEngineCore:
                 break
             self._input_queue.put(encode_command(NativeDdrCommand(
                 operation=command.operation, command_id=command.command_id, worker_epoch=command.worker_epoch,
-                job_id=command.job_id, entry_ref=command.entry_ref)))
+                job_id=command.job_id, entry_ref=command.entry_ref, page_ids=command.page_ids,
+                diagnostic_label=command.diagnostic_label)))
         request = native_ddr.next_transfer()
         if request is not None:
             self._input_queue.put(encode_command(NativeDdrCommand(operation="submit", request=request)))
@@ -1052,6 +1053,11 @@ class ReplicaEngineCore:
                     sr.request.num_prompt_tokens, sr.num_computed_tokens, sr.num_new_tokens,
                 ) for sr in scheduler_output.scheduled_requests)
                 self._native_ddr.retain_step(self._step_counter, snapshot)
+                self._native_ddr.record("model_step_dispatch", step_id=self._step_counter, requests=[{
+                    "request_id": sr.request.request_id, "pages": list(sr.block_ids),
+                    "computed_before": sr.num_computed_tokens, "tokens": sr.num_new_tokens,
+                    "is_prefill": sr.is_prefill,
+                } for sr in scheduler_output.scheduled_requests])
             self._input_queue.put(encode_command(step_cmd))
         reregistered_ids = {
             request.request_id for request in step_cmd.new_requests
