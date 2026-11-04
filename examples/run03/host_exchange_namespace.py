@@ -23,6 +23,9 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
+
+from examples.run03.host_exchange_lifecycle import OuterProtection, StopReader, owned_tree, supervise_owned
 
 TASK = Path('/workspace/uflow/runs/run03-host-exchange-20261105')
 RUN = Path('/workspace/uflow/runs/host-exchange')
@@ -85,22 +88,33 @@ def process_fds(pid):
 
 
 class Peer:
-    def __init__(self, role, endpoint, env, fds):
+    def __init__(self, role, endpoint, env, fds, stop):
+        self.stop = stop
         self.log = (RUN / f'{role}.log').open('x')
         command = [str(RUN/'venv/bin/python'), '-u', '-m', 'examples.run03.host_exchange_peer', role, endpoint]
         if role == 'consumer':
             command.append(str(RUN/'consumer-result.json'))
-        self.proc = subprocess.Popen(command, env=env, cwd=RUN/'serving', pass_fds=fds,
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
-                                     text=True, bufsize=1)
+        try:
+            self.proc = subprocess.Popen(command, env=env, cwd=RUN/'serving', pass_fds=fds,
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
+                                         text=True, bufsize=1)
+        except BaseException:
+            self.log.close()
+            raise
 
     def send(self, **message):
+        self.stop.check()
         self.proc.stdin.write(json.dumps(message)+'\n')
         self.proc.stdin.flush()
 
     def receive(self, expected):
-        if not select.select([self.proc.stdout], [], [], 30)[0]:
-            raise TimeoutError(f'{self.proc.pid} did not emit {expected}')
+        deadline = time.monotonic()+30
+        while True:
+            self.stop.check()
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f'{self.proc.pid} did not emit {expected}')
+            if self.proc.stdout in select.select([self.proc.stdout, self.stop.fd], [], [], .1)[0]:
+                break
         row = self.proc.stdout.readline()
         if not row:
             raise RuntimeError(f'peer exited before {expected}: {self.proc.poll()}')
@@ -110,6 +124,8 @@ class Peer:
 
 
 def inner(args):
+    stop = StopReader(args.control_fd)
+    stop.check()
     # Exact E10 T3 order: namespace/parent first, then canonical inode, then mount.
     require_isolated(args.outer_fd, args.outer_pid)
     nsroot = args.nsroot.resolve(strict=True)
@@ -145,6 +161,7 @@ def inner(args):
     report['bootstrap_exit'] = bootstrap.returncode
     peers, daemon = [], None
     try:
+        stop.check()
         with (RUN/'daemon.log').open('x') as log:
             daemon = subprocess.Popen([binary, '--socket', endpoint, '--execution-mode', 'simulated',
                                        '--startup-probe-bytes', '0'], env=env,
@@ -152,6 +169,7 @@ def inner(args):
             report['daemon_pid'] = daemon.pid
             deadline = time.monotonic()+20
             while not Path(endpoint+'.external-ddr').exists():
+                stop.check()
                 assert daemon.poll() is None and time.monotonic() < deadline
                 time.sleep(.02)
             report['owned_fds']['daemon-before'] = process_fds(daemon.pid)
@@ -162,10 +180,10 @@ def inner(args):
             assert any(str(RUN/'shim/libuf_acl_shim.so') in line for line in report['loaded_shim_and_cann'])
             report['loaded_shim_sha256'] = sha(RUN/'shim/libuf_acl_shim.so')
             assert report['loaded_shim_sha256'] == args.shim_sha
-            producer = Peer('producer', endpoint, env, (args.outer_fd, args.root_fd))
+            producer = Peer('producer', endpoint, env, (args.outer_fd, args.root_fd), stop)
             peers.append(producer)
             registered = producer.receive('registered')
-            consumer = Peer('consumer', endpoint, env, (args.outer_fd, args.root_fd))
+            consumer = Peer('consumer', endpoint, env, (args.outer_fd, args.root_fd), stop)
             peers.append(consumer)
             consumer.send(op='begin', record=registered['record'], authority_source=registered['authority_source'])
             held = consumer.receive('held')
@@ -197,73 +215,111 @@ def inner(args):
         assert all(not Path(f'/proc/{peer.proc.pid}').exists() for peer in peers)
         assert not Path(f'/proc/{daemon.pid}').exists()
         report.update(passed=True, clean_log=True, owned_processes_exited=True, sockets_removed=True)
+    except BaseException:
+        report['primary_error'] = traceback.format_exc()
+        raise
     finally:
-        for peer in peers:
+        for peer in reversed(peers):
             if peer.proc.poll() is None:
-                peer.proc.stdin.close()  # bounded cooperative EOF, never kill unrelated processes
                 try:
+                    peer.proc.stdin.close()  # consumer explicitly closes stage on EOF
                     peer.proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    report['unresolved_peer'] = peer.proc.pid
+                except BaseException as cleanup_error:
+                    report.setdefault('unresolved_peers', []).append({'pid': peer.proc.pid,
+                                                                      'error': repr(cleanup_error),
+                                                                      'identity': owned_tree(peer.proc.pid)})
             peer.log.close()
         if daemon is not None and daemon.poll() is None:
             try:
                 report['cleanup_shutdown'] = control(endpoint, 'op=ShutdownDaemon')
                 daemon.wait(timeout=30)
             except Exception as error:
-                report['unresolved_daemon'] = {'pid': daemon.pid, 'error': repr(error)}
+                report['unresolved_daemon'] = {'pid': daemon.pid, 'error': repr(error),
+                                               'identity': owned_tree(daemon.pid)}
+        consumer_report = RUN/'consumer-result.json'
+        if consumer_report.exists():
+            try:
+                consumer_cleanup = json.loads(consumer_report.read_text())
+                report['consumer_exit_cleanup'] = {key: consumer_cleanup[key] for key in (
+                    'stage_exit_cleanup', 'unresolved_stage', 'failed_prepare_cleanups',
+                    'unresolved_unexpected_views', 'primary_error') if key in consumer_cleanup}
+            except BaseException as error:
+                report['consumer_cleanup_read_error'] = repr(error)
         (RUN/'result.json').write_text(json.dumps(report, indent=2)+'\n')
 
 
 def outer():
-    if TASK.resolve(strict=True) != TASK:
-        raise RuntimeError('task root is not canonical')
-    source = Path(__file__).resolve()
-    nsroot = TASK/'sandbox/nsroot'
-    nsroot.mkdir(mode=0o700, parents=True, exist_ok=False)
-    (nsroot/'authority').mkdir(mode=0o700)
-    fixture = nsroot/'runs/host-exchange'
-    fixture.mkdir(mode=0o700, parents=True)
-    for name in ('shim', 'tmp'):
-        (fixture/name).mkdir(mode=0o700)
-    shutil.copy2(TASK/'build/bin/uf-daemon', fixture/'uf-daemon')
-    shutil.copy2(TASK/'build/shim/lib/libuf_acl_shim.so', fixture/'shim/libuf_acl_shim.so')
-    shutil.copytree(TASK/'src/data-service/sdk/python/uflow', fixture/'sdk/uflow',
-                    ignore=shutil.ignore_patterns('__pycache__'))
-    shutil.copytree(TASK/'src/serving', fixture/'serving', symlinks=True,
-                    ignore=shutil.ignore_patterns('__pycache__', '.git'))
-    subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(fixture/'venv')], check=True)
-    fd = os.open(nsroot, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    nsfd = os.open('/proc/self/ns/mnt', os.O_RDONLY | os.O_CLOEXEC)
-    before, mounts = identity(Path('/workspace/uflow')), Path('/proc/self/mountinfo').read_bytes()
-    result = {'passed': False, 'before': before, 'outer_pid': os.getpid(), 'pinned_root': identity(nsroot)}
+    result = {'passed': False, 'outer_pid': os.getpid()}
+    protection = OuterProtection(result, Path('/workspace/uflow'), Path('/proc/self/mountinfo'),
+                                  Path('/proc/self/ns/mnt'))
+    fd = nsfd = proc = None
     try:
-        command = ['unshare', '--mount', '--propagation', 'private', sys.executable, str(source),
-                   '--inner', '--nsroot', str(nsroot), '--root-fd', str(fd), '--outer-fd', str(nsfd),
-                   '--outer-pid', str(os.getpid()), '--daemon-sha', sha(fixture/'uf-daemon'),
-                   '--shim-sha', sha(fixture/'shim/libuf_acl_shim.so')]
-        with (TASK/'logs/namespace-child.log').open('x') as log:
-            proc = subprocess.Popen(command, pass_fds=(fd, nsfd), stdout=log, stderr=subprocess.STDOUT)
-            result['child_pid'] = proc.pid
-            result['child_exit'] = proc.wait(timeout=240)
-        after, mounts_after = identity(Path('/workspace/uflow')), Path('/proc/self/mountinfo').read_bytes()
-        result.update(after=after, mountinfo_unchanged=mounts == mounts_after,
-                      outer_namespace_inode=os.fstat(nsfd).st_ino)
-        assert before == after and mounts == mounts_after
-        assert result['child_exit'] == 0, (TASK/'logs/namespace-child.log').read_text()
-        inner_result = json.loads((fixture/'result.json').read_text())
-        assert inner_result['passed']
-        with (nsroot/'authority/external-ddr-v0/authority.lock').open('a+') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(lock, fcntl.LOCK_UN)
-        result['private_lock_reacquired_released'] = True
-        result['passed'] = True
+        with protection:
+            if TASK.resolve(strict=True) != TASK:
+                raise RuntimeError('task root is not canonical')
+            source, nsroot = Path(__file__).resolve(), TASK/'sandbox/nsroot'
+            nsroot.mkdir(mode=0o700, parents=True, exist_ok=False)
+            (nsroot/'authority').mkdir(mode=0o700)
+            fixture = nsroot/'runs/host-exchange'
+            fixture.mkdir(mode=0o700, parents=True)
+            for name in ('shim', 'tmp'):
+                (fixture/name).mkdir(mode=0o700)
+            shutil.copy2(TASK/'build/bin/uf-daemon', fixture/'uf-daemon')
+            shutil.copy2(TASK/'build/shim/lib/libuf_acl_shim.so', fixture/'shim/libuf_acl_shim.so')
+            shutil.copytree(TASK/'src/data-service/sdk/python/uflow', fixture/'sdk/uflow',
+                            ignore=shutil.ignore_patterns('__pycache__'))
+            shutil.copytree(TASK/'src/serving', fixture/'serving', symlinks=True,
+                            ignore=shutil.ignore_patterns('__pycache__', '.git'))
+            subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(fixture/'venv')], check=True)
+            fd = os.open(nsroot, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            nsfd = os.open('/proc/self/ns/mnt', os.O_RDONLY | os.O_CLOEXEC)
+            result.update(pinned_root=identity(nsroot), outer_namespace_inode=os.fstat(nsfd).st_ino)
+            command = ['unshare', '--mount', '--propagation', 'private', sys.executable, str(source),
+                       '--inner', '--control-fd', '0', '--nsroot', str(nsroot), '--root-fd', str(fd),
+                       '--outer-fd', str(nsfd), '--outer-pid', str(os.getpid()),
+                       '--daemon-sha', sha(fixture/'uf-daemon'), '--shim-sha', sha(fixture/'shim/libuf_acl_shim.so')]
+            with (TASK/'logs/namespace-child.log').open('x') as log:
+                proc = subprocess.Popen(command, pass_fds=(fd, nsfd), stdin=subprocess.PIPE,
+                                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                result['child_supervision'] = supervise_owned(proc, timeout=240, cleanup_grace=120)
+            assert result['child_supervision']['passed'], result['child_supervision']
+            inner_result = json.loads((fixture/'result.json').read_text())
+            assert inner_result['passed']
+            with (nsroot/'authority/external-ddr-v0/authority.lock').open('a+') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            result.update(private_lock_reacquired_released=True, passed=True)
+    except BaseException:
+        result.update(passed=False, primary_error=traceback.format_exc())
+        raise
     finally:
+        if proc is not None and proc.poll() is None and 'child_supervision' not in result:
+            result['exception_cleanup'] = supervise_owned(proc, timeout=0, cleanup_grace=120)
+        fixture_report = TASK/'sandbox/nsroot/runs/host-exchange/result.json'
+        if fixture_report.exists():
+            try:
+                result['inner_report'] = json.loads(fixture_report.read_text())
+            except BaseException as error:
+                result['inner_report_read_error'] = repr(error)
+        if protection.before_mounts is not None:
+            protection.capture_after()  # Also after any exception-path child cleanup.
+            if not protection.report.get('unchanged'):
+                result['passed'] = False
+        for anchor in (fd, nsfd):
+            if anchor is not None:
+                os.close(anchor)
+        if proc is not None and proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except OSError as error:
+                result['control_close_error'] = repr(error)
         (TASK/'results/namespace.json').write_text(json.dumps(result, indent=2)+'\n')
-        (TASK/'results/mountinfo.before').write_bytes(mounts)
-        (TASK/'results/mountinfo.after').write_bytes(Path('/proc/self/mountinfo').read_bytes())
-        os.close(fd)
-        os.close(nsfd)
+        if protection.before_mounts is not None:
+            (TASK/'results/mountinfo.before').write_bytes(protection.before_mounts)
+        if protection.after_mounts is not None:
+            (TASK/'results/mountinfo.after').write_bytes(protection.after_mounts)
+    if not result['passed']:
+        raise RuntimeError('outer workflow not clean; inspect namespace.json')
     print(json.dumps(result))
 
 
@@ -271,6 +327,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--inner', action='store_true')
     parser.add_argument('--nsroot', type=Path)
+    parser.add_argument('--control-fd', type=int, default=0)
     for flag in ('root-fd', 'outer-fd', 'outer-pid'):
         parser.add_argument('--'+flag, type=int)
     for flag in ('daemon-sha', 'shim-sha'):

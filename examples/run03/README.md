@@ -139,3 +139,20 @@ execution. Compatibility/deployment/worker/page contexts remain named host
 fixtures, not new loaded-model evidence or production sharing. Full NPU/model,
 cross-replica Ready, multi-card and performance gates remain NOT-RUN. H2 does
 not install a scheduler path, enable shared serving, merge main or push.
+
+The outer supervisor owns a separate inner session and a dedicated STOP pipe.
+A 240-second workflow timeout requests normal inner cleanup and allows at most
+120 seconds of cleanup grace; it never signals the process group. Inner peer
+waits check the pipe and unwind through explicit peer EOF/stage release and
+normal broker shutdown. A surviving owned child is recorded with bounded
+descendant identities/FDs, not killed or called clean. Real outer inode,
+namespace and mountinfo are compared on success, exception and timeout.
+
+The consumer explicitly closes an acquired stage on post-acquire assertions or
+handshake failures too. Cleanup errors preserve the original failure and record
+unresolved view/lease identities and slot ownership. A failed new acquire after
+revoke counts as revocation evidence only when the pinned SDK's actual
+`_exchange` error frame contains the expected non-ok broker response with no FD.
+Transport, malformed/protocol replies and unknown outcomes are failures. This
+additional SDK-private inspection belongs only to the negative test driver;
+it does not change the SDK or turn arbitrary exceptions into permission proofs.

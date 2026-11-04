@@ -15,6 +15,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import traceback
+from types import SimpleNamespace
 
 
 class NoRuntime(importlib.abc.MetaPathFinder):
@@ -32,6 +34,7 @@ from pypto_serving.serving.native_ddr.shared_exchange import E10Adapter, Exchang
 from pypto_serving.serving.native_ddr.shared_prefix_record import (
     ExternalBackingIdentity, SharedPrefixRecord, SourceBinding,
 )
+from examples.run03.host_exchange_lifecycle import close_stage_on_exit, require_revoked_acquire
 
 CHUNK = bytes(range(256)) * 256
 
@@ -151,6 +154,8 @@ def producer(endpoint):
 
 
 def consumer(endpoint, output):
+    from uflow import ExternalDdrError
+
     request = receive()
     record = SharedPrefixRecord.from_dict(request['record'])
     # Separate parent-authenticated producer context, never copied out of record.
@@ -161,6 +166,8 @@ def consumer(endpoint, output):
     report = {'pid': os.getpid(), 'passed': False, 'cases': {}, 'snapshots': {},
               'compatibility': 'H1 historical-assets/synthetic-deployment host fixture only',
               'native_ready': False, 'npu_run': False, 'initial_fds': own_fds(), 'sdk': sdk_identity()}
+    stage, unexpected_views, failed_resources = None, [], []
+    report.update(source_record=record.to_dict(), authority_source=asdict(source), destination=asdict(destination))
 
     def copy(rec=record, src=source, **extra):
         return stage_block(rec, compatibility=fixture_compatibility(), current_source=lambda: src,
@@ -183,6 +190,8 @@ def consumer(endpoint, output):
             action()
         except (ValueError, ExchangeFailure) as error:
             if isinstance(error, ExchangeFailure):
+                if not error.resources.closed:
+                    failed_resources.append(error.resources)
                 assert error.resources.closed and not error.resources.unresolved_acquire
             assert storage_hash() == before and staging.guards_ok() and not staging.busy
             assert refs(name)['active_views'] == 0
@@ -243,12 +252,9 @@ def consumer(endpoint, output):
         raw = retained.read()
         exact_pattern(raw)
         del raw
-        try:
-            adapter.acquire(source)
-        except Exception as error:
-            report['new_acquire_after_revoke'] = {'rejected': type(error).__name__, 'detail': str(error)}
-        else:
-            raise AssertionError('revoked backing accepted new acquire')
+        require_revoked_acquire(adapter.acquire, source,
+                                exchange_code=adapter.client._exchange.__func__.__code__,
+                                error_type=ExternalDdrError, report=report, unexpected_views=unexpected_views)
         assert refs('after-revoke-old-view-readable')['active_views'] == 1
         emit(event='old-view-live-after-revoke')
         assert receive()['op'] == 'owner-exited'
@@ -278,11 +284,36 @@ def consumer(endpoint, output):
                       verified_cpu_copied_bytes=staging.verified_copied_bytes,
                       buffer_bound='one20MiB slot+128B guards, one20MiB read/hash temporary; no tensor/runtime')
         assert report['staging_sha256'] == expected_digest()
-        emit(event='consumer-done', passed=True, snapshot=final)
+    except BaseException as error:
+        if isinstance(error, ExchangeFailure) and all(item is not error.resources for item in failed_resources):
+            failed_resources.append(error.resources)
+        report['primary_error'] = traceback.format_exc()
+        raise
     finally:
+        # SDK release is bounded by its configured socket timeout. Confirm it
+        # explicitly on assertion/handshake failures too, not only the happy path.
+        cleanup = close_stage_on_exit(stage, report)
+        for resources in failed_resources:
+            note = {}
+            proxy = SimpleNamespace(resources=resources, lease=resources.lease, close=resources.close)
+            close_stage_on_exit(proxy, note)
+            report.setdefault('failed_prepare_cleanups', []).append(note)
+            if not note['stage_exit_cleanup']['confirmed']:
+                report['passed'] = False
+        for view in unexpected_views[:]:
+            try:
+                view.release()
+                unexpected_views.remove(view)
+            except BaseException as error:
+                report.setdefault('unresolved_unexpected_views', []).append({
+                    'error': repr(error), 'view_id': getattr(getattr(view, '_view', None), 'view_id', None),
+                    'lease_id': getattr(getattr(view, '_view', None), 'lease_id', None)})
+                report['passed'] = False
         output.write_text(json.dumps(report, indent=2)+'\n')
-        # Only the normal explicit handshake proves a clean result. Exceptions
-        # retain logs and cause the parent to report failure, never fake zero.
+        unresolved_prepare = any(not item.closed for item in failed_resources)
+        if (not cleanup['confirmed'] or unexpected_views or unresolved_prepare) and sys.exc_info()[0] is None:
+            raise RuntimeError('consumer cleanup unresolved; retained identities in report')
+    emit(event='consumer-done', passed=True, snapshot=final)
 
 
 if __name__ == '__main__':
