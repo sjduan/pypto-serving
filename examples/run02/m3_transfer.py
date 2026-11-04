@@ -138,22 +138,26 @@ def fixture(output, device=0):
     try:
         assert byte_equal(read_arena(worker, keys), host_k)
         assert byte_equal(read_arena(worker, values), host_v)
-        # Ordinary post-fork private CPU endpoints exercise the runtime's legal POSIX staging.
+        # The fixed public copy APIs stage ordinary post-fork CPU memory legally.
+        # Kernel submit deliberately requires inherited shared mappings; prove its rejection too.
         private_page = torch.tensor([5], dtype=torch.int32)
         private_out = torch.empty((81920, 128), dtype=torch.bfloat16)
         assert worker._named_host_buffer(private_out.data_ptr(), private_out.numel() * 2) is None
-        h = worker.submit(copies[0].compiled, keys, values, private_page, private_out)
-        h.result(timeout=60)
-        assert byte_equal(private_out, block_oracle(host_k, host_v, 16, 5))
-        private_page[0] = 7
-        h = worker.submit(copies[1].compiled, private_out, private_page, keys, values)
-        h.result(timeout=60)
-        source = private_out.reshape(40, 2, 128, 8, 128)
-        host_k.reshape(40, 16, 128, 8, 128)[:, 7].copy_(source[:, 0])
-        host_v.reshape(40, 16, 128, 8, 128)[:, 7].copy_(source[:, 1])
-        assert byte_equal(read_arena(worker, keys), host_k)
-        assert byte_equal(read_arena(worker, values), host_v)
+        try:
+            worker.submit(copies[0].compiled, keys, values, private_page, private_out)
+        except TypeError as error:
+            assert "shared memory allocated BEFORE" in str(error)
+            report["negatives"].append("private_postfork_kernel_arg")
+        else:
+            raise AssertionError("private postfork pointer crossed the prepared boundary")
+        private_source = block_oracle(host_k, host_v, 16, 5)
+        staged = worker.alloc_tensor(private_source.shape, private_source.dtype)
+        worker.copy_to(staged.data_ptr, private_source.data_ptr(), staged.nbytes)
+        worker.copy_from(private_out.data_ptr(), staged.data_ptr, staged.nbytes)
+        assert byte_equal(private_out, private_source)
+        worker.free_tensor(staged)
         report["postfork_staging_passed"] = True
+        report["postfork_staging_scope"] = "public synchronous copy_to/from; native kernels use prefork inherited slots"
         unrelated_args = [
             worker.alloc_tensor((16, 152064), torch.float32, init=torch.zeros((16, 152064))),
             worker.alloc_tensor((2,), torch.int32, init=torch.tensor([1, 1], dtype=torch.int32)),
