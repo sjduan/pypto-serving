@@ -103,7 +103,7 @@ async def exercise(args, root, result, sock):
                               top_k=None, seed=0, stream=True)
     result.update(cli_arguments=cli_args, engine_config=asdict(config), generate_config=asdict(generate),
                   prompt_mode="raw completion; no chat template or thinking-mode transformation",
-                  offload="not implemented or enabled; original HBM prefix caching remains enabled",
+                  offload="native DDR disabled; original HBM prefix caching remains enabled",
                   imports={"serving": artifact(pypto_serving.__file__),
                            "pypto": artifact(pypto.__file__), "core": artifact(pypto.pypto_core.__file__)},
                   torch_version=torch.__version__, python_version=sys.version)
@@ -147,7 +147,10 @@ async def exercise(args, root, result, sock):
     try:
         await engine.start()
         result["processes_loaded"] = record_processes()
-        if not any("host_build_graph/libhost_runtime.so" in line
+        from simpler_setup.runtime_builder import RuntimeBuilder
+        backend = RuntimeBuilder("a2a3").get_binaries("tensormap_and_ringbuffer", build=False)
+        result["expected_native_backend"] = artifact(backend.host_path)
+        if not any(str(backend.host_path) in line
                    for proc in result["processes_loaded"].values() for line in proc["maps"]):
             raise RuntimeError("Expected native child backend was not mapped")
         short = [await collect(f"short-cold-{i}", SHORT_PROMPT) for i in range(3)]
@@ -268,6 +271,7 @@ def main():
         result["device_users_before"] = device_users(args.device)
         if (status["health"] != "OK" or status["hbm_total_mib"] - status["hbm_used_mib"] < 40000
                 or result["device_users_before"] or os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+                or os.environ.get("ASCEND_VISIBLE_DEVICES")
                 or f"No running processes found in NPU {status['board']}" not in before):
             raise RuntimeError("Selected physical device is busy, remapped, unhealthy or lacks HBM")
         try:
