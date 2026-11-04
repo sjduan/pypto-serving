@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Bounded external owner supervision for M2; only the baseline driver holds the device lock."""
 import ctypes
+import argparse
 import datetime
 import fcntl
 import json
@@ -91,11 +92,21 @@ def snapshot(root, tag):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--attempt", default="baseline")
+    parser.add_argument("--driver", choices=("m2_baseline.py", "m2_precision_probe.py"), default="m2_baseline.py")
+    args = parser.parse_args()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.attempt):
+        raise ValueError("Invalid attempt name")
     root = Path(os.environ["UFLOW_RUN02_ROOT"]).resolve()
+    attempt_root = root / "attempts" / args.attempt
+    attempt_root.mkdir(parents=True, exist_ok=False)
+    (attempt_root / "results").mkdir()
+    (attempt_root / "logs").mkdir()
     report = {"owner": os.getpid(), "started": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "scope": "external owned-process supervision; M2 driver owns the device lock and port",
               "deadline_s": 1800, "reset_called": False, "signals": [], "passed": False}
-    receipt = root / "results/m2-external-receipt.json"
+    receipt = attempt_root / "results/m2-external-receipt.json"
     try:
         if not root.is_relative_to("/workspace/uflow"):
             raise ValueError("Invalid task root")
@@ -113,7 +124,7 @@ def main():
             raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
         report["lock_preflight"] = check_free_lock()
         report["port_preflight"] = check_free_port()
-        before = snapshot(root, "before")
+        before = snapshot(attempt_root, "before")
         report["before"] = before
         status = before["status"]
         if (status["health"] != "OK" or status["hbm_total_mib"] - status["hbm_used_mib"] < 40000
@@ -121,17 +132,18 @@ def main():
                 or f"No running processes found in NPU {status['board']}" not in before["npu"]
                 or os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get("ASCEND_VISIBLE_DEVICES")):
             raise RuntimeError("Selected device is occupied, remapped, unhealthy, or not fully observable")
-        output = root / "results/m2-baseline.json"
+        output = attempt_root / "results/m2-baseline.json"
         if output.exists():
             raise ValueError("Refusing to overwrite an earlier M2 result")
-        command = [sys.executable, "-u", "examples/run02/m2_baseline.py",
+        command = [sys.executable, "-u", "examples/run02/" + args.driver,
                    "--device", "0", "--port", "18892", "--output", str(output)]
         report["command"] = command
         owned, maps = {}, {}
-        logpath = root / "logs/m2-baseline.log"
+        logpath = attempt_root / "logs/m2-baseline.log"
         with logpath.open("w") as log:
             child = subprocess.Popen(command, cwd=os.environ["PYPTO_SERVING_HOME"],
-                                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                                     env=dict(os.environ, UFLOW_M2_ATTEMPT_ROOT=str(attempt_root)))
             report["driver_pid"] = child.pid
             deadline = time.monotonic() + 1800
             while child.poll() is None and time.monotonic() < deadline:
@@ -177,7 +189,7 @@ def main():
                 break
         report["adopted_reaped"] = reaped
         report["remaining_adopted"] = children(os.getpid())
-        after = snapshot(root, "after")
+        after = snapshot(attempt_root, "after")
         report["after"] = after
         report["task_sockets"] = [line for line in Path("/proc/net/unix").read_text().splitlines()
                                   if str(root) in line]
