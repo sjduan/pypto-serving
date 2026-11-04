@@ -10,11 +10,13 @@
 import argparse
 import ctypes
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import socket
 import stat
 import subprocess
@@ -78,6 +80,23 @@ def main():
               "scope": "parent owns advisory Run02 lock and reserved18892; no global allocator",
               "device_reset": False, "deadline_s": 1800, "signals": []}
     try:
+        manifest_path = root / "configs/source-manifest.json"
+        audit_path = root / "results/environment-audit.json"
+        manifest = json.loads(manifest_path.read_text())
+        audit = json.loads(audit_path.read_text())
+        manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        if not audit["passed"] or audit["source_manifest"]["sha256"] != manifest_sha:
+            raise RuntimeError("source/environment identity does not match the current attempt")
+        shutil.copy2(manifest_path, attempt / "results/source-manifest.json")
+        shutil.copy2(audit_path, attempt / "results/environment-audit.json")
+        report["serving_sha"] = manifest["serving"]
+        report["source_manifest_sha256"] = manifest_sha
+        expected_timeouts = {"SIMPLER_SCHEDULER_TIMEOUT_MS": "20000",
+            "SIMPLER_OP_EXECUTE_TIMEOUT_US": "45000000", "SIMPLER_STREAM_SYNC_TIMEOUT_MS": "50000",
+            "PYPTO_WORKER_INIT_TIMEOUT": "900"}
+        report["native_timeouts"] = {k: os.environ.get(k) for k in expected_timeouts}
+        if report["native_timeouts"] != expected_timeouts:
+            raise RuntimeError("finite native/startup timeouts changed")
         lockpath = Path(f"/workspace/uflow/locks/run02-npu-{args.device}.lock")
         with lockpath.open("a+") as lock, socket.socket() as sock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

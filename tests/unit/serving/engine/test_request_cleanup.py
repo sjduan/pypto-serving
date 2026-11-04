@@ -109,7 +109,8 @@ def test_abort_request_schedules_worker_cleanup():
     core.scheduler = SimpleNamespace(abort_request=aborted.append)
     core._pending_free_ids = []
     core._request_contexts = {"req-x": SimpleNamespace(
-        queue=asyncio.Queue(), worker_release_done=asyncio.Event())}
+        queue=asyncio.Queue(), worker_release_done=asyncio.Event(),
+        request=SimpleNamespace(prompt_token_ids=[7, 8], output_token_ids=[]))}
 
     asyncio.run(core.abort_request("req-x"))
 
@@ -134,7 +135,8 @@ def test_abort_request_emits_abort_token_before_scheduling_free():
     core.scheduler = SimpleNamespace(abort_request=lambda _req_id: None)
     core._pending_free_ids = []
     queue: asyncio.Queue = asyncio.Queue()
-    core._request_contexts = {"req-y": SimpleNamespace(queue=queue)}
+    core._request_contexts = {"req-y": SimpleNamespace(queue=queue, detok_text="hello",
+        request=SimpleNamespace(prompt_token_ids=[7, 8], output_token_ids=[9]))}
 
     asyncio.run(core.abort_request("req-y"))
 
@@ -142,6 +144,8 @@ def test_abort_request_emits_abort_token_before_scheduling_free():
     assert isinstance(token, TokenOutput)
     assert token.finished is True
     assert token.finish_reason == "FINISHED_ABORTED"
+    assert token.prompt_tokens == 2 and token.completion_tokens == 1
+    assert token.token_ids == (9,) and token.text == "hello"
     assert core._pending_free_ids == ["req-y"]
 
 
