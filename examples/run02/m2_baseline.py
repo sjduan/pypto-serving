@@ -32,7 +32,18 @@ from identity import artifact
 from worker_probe import device_users, selected_chip_status
 
 SHORT_PROMPT = "The capital of France is"
-LONG_PROMPT = "Paris is the capital of France. " * 25
+LONG_PROMPT = (
+    "This geography lesson describes a country in western Europe. France shares borders with Spain, "
+    "Italy, Germany, Belgium, Luxembourg, Switzerland, Andorra, and Monaco. Its landscape includes "
+    "mountains, forests, farmland, river valleys, and coastlines along the Atlantic Ocean and the "
+    "Mediterranean Sea. French is the official language. Many visitors enjoy its museums, historic "
+    "buildings, regional food, and public gardens. The national government and several famous cultural "
+    "institutions are located in its largest city. A river runs through that city, and bridges connect "
+    "the neighborhoods on its two banks. Railways connect the city with other regions and nearby "
+    "European countries. This note provides background for a simple question about the country and "
+    "its national capital. Complete the following sentence clearly: The capital of France is"
+)
+BATCH_PROMPTS = [f"The capital of {country} is" for country in ("France", "Japan", "Italy", "Germany")]
 M1_SHA = "ae0666ce937bafb456c50606705ec28c3d8ad489"
 
 
@@ -73,8 +84,18 @@ def validate_output(record):
     final = record["outputs"][-1]
     if not final["finished"] or final["finish_reason"] == "error":
         raise AssertionError(f"No normal completion: {record['name']}")
-    if len(final["token_ids"]) < 8 or not final["text"].strip():
+    if (len(final["token_ids"]) != record["generate_config"]["max_new_tokens"]
+            or not final["text"].strip() or "\ufffd" in final["text"]):
         raise AssertionError(f"Trivial output: {record['name']}")
+    if final["completion_tokens"] != len(final["token_ids"]):
+        raise AssertionError(f"Output token count mismatch: {record['name']}")
+    streamed_ids = [output["token_id"] for output in record["outputs"] if output["token_id"] is not None]
+    if streamed_ids != final["token_ids"]:
+        raise AssertionError(f"Stream/final token data mismatch: {record['name']}")
+    if "".join(output["text_delta"] for output in record["outputs"]) != final["text"]:
+        raise AssertionError(f"Stream/final text data mismatch: {record['name']}")
+    if any(output["prompt_tokens"] != len(record["prompt_token_ids"]) for output in record["outputs"]):
+        raise AssertionError(f"Prompt token count changed: {record['name']}")
     return final["token_ids"]
 
 
@@ -102,6 +123,7 @@ async def exercise(args, root, result, sock):
     generate = GenerateConfig(max_new_tokens=32, temperature=0.0, top_p=1.0,
                               top_k=None, seed=0, stream=True)
     result.update(cli_arguments=cli_args, engine_config=asdict(config), generate_config=asdict(generate),
+                  acceptance="user-directed serving/data-flow sanity; cross-run model token equality is informational",
                   prompt_mode="raw completion; no chat template or thinking-mode transformation",
                   offload="native DDR disabled; original HBM prefix caching remains enabled",
                   imports={"serving": artifact(pypto_serving.__file__),
@@ -112,14 +134,23 @@ async def exercise(args, root, result, sock):
         raise RuntimeError("Wrong serving import source")
     engine = AsyncLLMEngine(config=config, tokenizer=load_tokenizer(config.model_dir))
     events = []
+    expected_prompts = {}
+    valid_tokens = set(engine.tokenizer.get_vocab().values())
     original_schedule = engine.scheduler.schedule
 
     def observe_schedule(*call_args, **kwargs):
         output = original_schedule(*call_args, **kwargs)
         if output.scheduled_requests:
+            for sr in output.scheduled_requests:
+                request_id = sr.request.request_id
+                if request_id not in expected_prompts and request_id.startswith("cmpl-"):
+                    expected_prompts[request_id] = engine.tokenizer.encode(SHORT_PROMPT)
+                if list(sr.request.prompt_token_ids) != expected_prompts.get(request_id):
+                    raise AssertionError(f"Scheduled prompt data differs from its request: {request_id}")
             events.append({"time": time.monotonic(), "requests": [
                 {"request_id": sr.request.request_id, "is_prefill": sr.is_prefill,
-                 "num_new_tokens": sr.num_new_tokens} for sr in output.scheduled_requests]})
+                 "num_new_tokens": sr.num_new_tokens,
+                 "prompt_token_ids": list(sr.request.prompt_token_ids)} for sr in output.scheduled_requests]})
         return output
 
     engine.scheduler.schedule = observe_schedule
@@ -134,6 +165,7 @@ async def exercise(args, root, result, sock):
                   "generate_config": asdict(generation), "outputs": [],
                   "metrics_before": engine.metrics.snapshot()}
         result["requests"].append(record)
+        expected_prompts[request_id] = list(record["prompt_token_ids"])
         start = time.monotonic()
         async for output in engine.add_request(request_id, prompt, generation):
             record["outputs"].append({"elapsed_s": time.monotonic() - start, **asdict(output)})
@@ -141,7 +173,13 @@ async def exercise(args, root, result, sock):
         record["elapsed_s"] = time.monotonic() - start
         write_json(args.output, result)
         print(json.dumps({"request": name, "final": record["outputs"][-1]}), flush=True)
-        validate_output(record)
+        ids = validate_output(record)
+        if any(token not in valid_tokens for token in ids):
+            raise AssertionError(f"Generated token outside the tokenizer vocabulary: {name}")
+        record["decoded_token_text"] = engine.tokenizer.decode(ids)
+        record["decoded_tokens_match_text"] = record["decoded_token_text"] == record["outputs"][-1]["text"]
+        if not record["decoded_tokens_match_text"]:
+            raise AssertionError(f"Final token/text data mismatch: {name}")
         return record
 
     try:
@@ -158,7 +196,7 @@ async def exercise(args, root, result, sock):
         long = [await collect(f"long-{'cold' if i == 0 else 'warm'}-{i}", LONG_PROMPT) for i in range(3)]
         if not 128 < len(long[0]["prompt_token_ids"]) < 480:
             raise AssertionError("Long prompt does not cross a complete prefix page")
-        batch = await asyncio.gather(*(collect(f"batch-{i}", SHORT_PROMPT) for i in range(4)))
+        batch = await asyncio.gather(*(collect(f"batch-{i}", prompt) for i, prompt in enumerate(BATCH_PROMPTS)))
         # Serve the same production API over a real exclusively bound TCP socket.
         app = create_serving_app(engine, config.model_id, replace(generate, stream=False))
         server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=args.port,
@@ -182,12 +220,16 @@ async def exercise(args, root, result, sock):
                               "status": response.status_code, "raw_body": response.text}
             response.raise_for_status()
             body = response.json()
-            if body["choices"][0]["text"] != short[0]["outputs"][-1]["text"]:
-                raise AssertionError("HTTP response differs from the token-recorded engine baseline")
+            if not body["choices"][0]["text"].strip() or "\ufffd" in body["choices"][0]["text"]:
+                raise AssertionError("HTTP response is empty or contains invalid text")
             if body["usage"]["completion_tokens"] != 32:
                 raise AssertionError("HTTP request did not execute the expected decode length")
+            if (body["usage"]["prompt_tokens"] != len(engine.tokenizer.encode(SHORT_PROMPT))
+                    or body["usage"]["total_tokens"] != body["usage"]["prompt_tokens"] + 32):
+                raise AssertionError("HTTP token usage is inconsistent with its request")
         # Cancel after actual output, then complete a fresh request to prove continued usability.
         cancel_id = engine.generate_request_id()
+        expected_prompts[cancel_id] = engine.tokenizer.encode(SHORT_PROMPT)
         stream = engine.add_request(cancel_id, SHORT_PROMPT, replace(generate, max_new_tokens=128))
         try:
             async for output in stream:
@@ -198,11 +240,8 @@ async def exercise(args, root, result, sock):
         finally:
             await stream.aclose()
         recovery = await collect("after-cancel", SHORT_PROMPT)
-        same_short = [*short, *batch, recovery]
-        if any(validate_output(r) != validate_output(short[0]) for r in same_short):
-            raise AssertionError("Greedy short repeat/batch/cancel baseline is not token-exact")
-        if any(validate_output(r) != validate_output(long[0]) for r in long):
-            raise AssertionError("Greedy cold/warm prefix baseline is not token-exact")
+        if "cancel" not in result:
+            raise AssertionError("Cancellation did not follow an actual generated token")
         counters = Counter(sr["request_id"] for event in events for sr in event["requests"] if sr["is_prefill"])
         if counters[long[0]["request_id"]] < 2:
             raise AssertionError("Chunked long prefill was not actually scheduled")
@@ -212,10 +251,19 @@ async def exercise(args, root, result, sock):
         warm_metrics = long[-1]["metrics_after"]["replicas"][0]["counters"]
         if warm_metrics["prefix_cache_hits"] <= cold_metrics["prefix_cache_hits"]:
             raise AssertionError("Repeated long prefix did not actually hit HBM cache")
-        result["comparison"] = {"short_repeat_batch_and_after_cancel": "exact_full_token_ids",
-                                "long_cold_warm": "exact_full_token_ids",
-                                "http": "exact_text_and_completion_count",
-                                "tolerance": "none; greedy observations, not a universal determinism guarantee"}
+        final_counters = engine.metrics.snapshot()["replicas"][0]["counters"]
+        if (final_counters["requests_error"] != 0 or final_counters["requests_aborted"] != 1
+                or final_counters["requests_finished"] != 13):
+            raise AssertionError("Request completion/cancellation accounting mismatch")
+        result["comparison"] = {
+            "model_token_equality": "informational only, per direct user instruction; not a model accuracy audit",
+            "short_repeat_and_after_cancel_equal": all(validate_output(r) == validate_output(short[0])
+                                                       for r in [*short, recovery]),
+            "long_cold_warm_equal": all(validate_output(r) == validate_output(long[0]) for r in long),
+            "data_checks": "request/prompt ownership, exact stream/final IDs and text, tokenizer decode, counts",
+            "serving_checks": "32-token responses, real chunks/co-batch/cache hits, HTTP, cancel/recovery, cleanup",
+            "future_offload_data_integrity": "unchanged; not tested by this native-DDR-disabled M2",
+        }
         result["passed"] = True
     finally:
         if server is not None:
