@@ -6,13 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Qwen layout and lazy pure-copy program construction, NOT a validated backend.
-
-Construction/compilation is explicit. Importing this file never imports PyPTO,
-creates a device context, allocates backing, or registers a native program.
-M3 must validate these candidate programs on the pinned compiler before wiring
-same-owner startup registration, prefork shared slots, and real native handles.
-"""
+"""Lazy, bit-preserving Qwen prefix programs. Production native-DDR assembly stays fail-closed."""
 from pypto_serving.serving.native_ddr.types import QwenKvLayout
 
 
@@ -22,8 +16,8 @@ class NativeDdrUnavailable(RuntimeError):
 
 def require_native_ddr_backend():
     raise NativeDdrUnavailable(
-        "native DDR M3 seam unresolved: same-owner startup registration, prefork shared backing, "
-        "resident InOut unpack and native completion/cleanup must be verified; no CPU/mock fallback"
+        "native DDR M3 seam unresolved: production startup namespace, page leases and completion "
+        "publication are not assembled; no CPU/mock fallback"
     )
 
 
@@ -32,68 +26,86 @@ def layout_from_model(model, runtime, num_pages):
                         model.num_key_value_heads, model.head_dim, runtime.kv_dtype)
 
 
-def qwen3_prefix_pack_host(layout: QwenKvLayout):
-    """Construct the candidate HOST entry; do not compile or execute it."""
+def qwen3_prefix_pack_host(layout: QwenKvLayout | None = None):
+    """Construct a full-block copy with a runtime arena row dimension."""
     import pypto.language as pl
 
-    rows = layout.num_layers * layout.num_pages * 1024
-    pages = layout.num_pages
+    rows = pl.dynamic("QWEN_PREFIX_KV_ROWS")
 
     @pl.jit
+    def prefix_pack(
+        keys: pl.Tensor[[rows, 128], pl.BF16],
+        values: pl.Tensor[[rows, 128], pl.BF16],
+        page_ids: pl.Tensor[[1], pl.INT32],
+        compact: pl.Out[pl.Tensor[[81920, 128], pl.BF16]],
+    ) -> pl.Tensor[[81920, 128], pl.BF16]:
+        pages = pl.tensor.dim(keys, 0) // 40960
+        for layer in pl.parallel(40):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefix_pack"):
+                page = pl.cast(pl.tensor.read(page_ids, [0]), pl.INDEX)
+                for tile in pl.range(64):
+                    hbm_row = (layer * pages + page) * 1024 + tile * 16
+                    k_row = layer * 2048 + tile * 16
+                    v_row = k_row + 1024
+                    k = pl.slice(keys, [16, 128], [hbm_row, 0])
+                    v = pl.slice(values, [16, 128], [hbm_row, 0])
+                    compact = pl.assemble(compact, k, [k_row, 0])
+                    compact = pl.assemble(compact, v, [v_row, 0])
+        return compact
+
+    @pl.jit.host
     def qwen3_prefix_pack_host(
         keys: pl.Tensor[[rows, 128], pl.BF16],
         values: pl.Tensor[[rows, 128], pl.BF16],
         page_ids: pl.Tensor[[1], pl.INT32],
         compact: pl.Out[pl.Tensor[[81920, 128], pl.BF16]],
     ) -> pl.Tensor[[81920, 128], pl.BF16]:
-        for layer in pl.range(40):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefix_pack"):
-                page = pl.cast(pl.read(page_ids, [0]), pl.INDEX)
-                for tile in pl.range(64):
-                    hbm_row = (layer * pages + page) * 1024 + tile * 16
-                    k_row = layer * 2048 + tile * 16
-                    v_row = k_row + 1024
-                    k = pl.load(keys, [hbm_row, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
-                    v = pl.load(values, [hbm_row, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
-                    pl.store(k, [k_row, 0], compact)
-                    pl.store(v, [v_row, 0], compact)
-        return compact
+        return prefix_pack(keys, values, page_ids, compact)
 
     return qwen3_prefix_pack_host
 
 
-def qwen3_prefix_unpack_host(layout: QwenKvLayout):
-    """Construct resident InOut scatter; never substitute a second KV output."""
+def qwen3_prefix_unpack_host(layout: QwenKvLayout | None = None):
+    """Construct a resident InOut scatter into the original owning KV allocations."""
     import pypto.language as pl
 
-    rows = layout.num_layers * layout.num_pages * 1024
-    pages = layout.num_pages
+    rows = pl.dynamic("QWEN_PREFIX_KV_ROWS")
 
     @pl.jit
+    def prefix_unpack(
+        compact: pl.Tensor[[81920, 128], pl.BF16],
+        page_ids: pl.Tensor[[1], pl.INT32],
+        keys: pl.InOut[pl.Tensor[[rows, 128], pl.BF16]],
+        values: pl.InOut[pl.Tensor[[rows, 128], pl.BF16]],
+    ) -> tuple[pl.Tensor[[rows, 128], pl.BF16], pl.Tensor[[rows, 128], pl.BF16]]:
+        pages = pl.tensor.dim(keys, 0) // 40960
+        for layer in pl.parallel(40):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefix_unpack"):
+                page = pl.cast(pl.tensor.read(page_ids, [0]), pl.INDEX)
+                for tile in pl.range(64):
+                    hbm_row = (layer * pages + page) * 1024 + tile * 16
+                    k_row = layer * 2048 + tile * 16
+                    v_row = k_row + 1024
+                    k = pl.slice(compact, [16, 128], [k_row, 0])
+                    v = pl.slice(compact, [16, 128], [v_row, 0])
+                    keys = pl.assemble(keys, k, [hbm_row, 0])
+                    values = pl.assemble(values, v, [hbm_row, 0])
+        return keys, values
+
+    @pl.jit.host
     def qwen3_prefix_unpack_host(
         compact: pl.Tensor[[81920, 128], pl.BF16],
         page_ids: pl.Tensor[[1], pl.INT32],
         keys: pl.InOut[pl.Tensor[[rows, 128], pl.BF16]],
         values: pl.InOut[pl.Tensor[[rows, 128], pl.BF16]],
     ) -> tuple[pl.Tensor[[rows, 128], pl.BF16], pl.Tensor[[rows, 128], pl.BF16]]:
-        for layer in pl.range(40):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefix_unpack"):
-                page = pl.cast(pl.read(page_ids, [0]), pl.INDEX)
-                for tile in pl.range(64):
-                    hbm_row = (layer * pages + page) * 1024 + tile * 16
-                    k_row = layer * 2048 + tile * 16
-                    v_row = k_row + 1024
-                    k = pl.load(compact, [k_row, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
-                    v = pl.load(compact, [v_row, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
-                    pl.store(k, [hbm_row, 0], keys)
-                    pl.store(v, [hbm_row, 0], values)
-        return keys, values
+        return prefix_unpack(compact, page_ids, keys, values)
 
     return qwen3_prefix_unpack_host
 
 
-def compile_programs(compiler, layout):
-    """Explicit KernelCompiler adapter. Not called by this host-only delivery."""
+def compile_programs(compiler, layout=None):
+    """Compile both programs before creating their owning DistributedWorker."""
     return (
         compiler.compile("qwen3_prefix_pack_host", qwen3_prefix_pack_host(layout)),
         compiler.compile("qwen3_prefix_unpack_host", qwen3_prefix_unpack_host(layout)),

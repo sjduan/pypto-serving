@@ -83,6 +83,8 @@ class _CompiledKernels:
     padded_embed_weight: torch.Tensor
     decode_weights: dict[str, torch.Tensor]
     layout: QwenLayout
+    native_ddr_programs: tuple | None = None
+    native_ddr_slots: Any | None = None
 
 
 @dataclass
@@ -818,13 +820,37 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         if worker is None:
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
-            worker = DistributedWorker([
+            programs = [
                 self._compiled.prefill.compiled,
                 self._compiled.decode.compiled,
                 self._compiled.topk_select.compiled,
-            ])
+            ]
+            extra = getattr(self._compiled, "native_ddr_programs", None)
+            if extra is None:
+                worker = DistributedWorker(programs)
+            else:
+                programs.extend(program.compiled for program in extra)
+                worker = DistributedWorker(
+                    programs, inherited_host_tensors=self._compiled.native_ddr_slots.inherited_host_tensors,
+                    startup_timeout_s=60,
+                )
             self._l3_worker = worker
         return worker
+
+    def create_native_ddr_backend(self, model, worker_epoch, *, observer=None):
+        """Explicit M3 seam; production enabled still requires the separate startup assembly."""
+        if self._compiled.native_ddr_programs is None:
+            raise RuntimeError("native transfer programs were not registered at owner startup")
+        from pypto_serving.model.qwen.native_ddr_kv import layout_from_model
+        from pypto_serving.model.qwen.native_ddr_transfer import QwenNativeTransferBackend
+
+        pool = self._kv_caches[model.config.model_id]
+        pages = pool.key_pages.shape[0] // (40 * 1024)
+        return QwenNativeTransferBackend(
+            self._shared_l3_worker(), self._compiled.native_ddr_programs, self._compiled.native_ddr_slots,
+            layout_from_model(model.config, model.runtime, pages), pool.key_pages, pool.value_pages,
+            worker_epoch, run_config=self._l3_run_config, observer=observer,
+        )
 
     def _decode_logits_device_arg(self) -> DeviceTensor:
         """Device-resident decode logits scratch for device sampling.

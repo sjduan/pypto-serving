@@ -128,11 +128,15 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         platform: str = "a2a3sim",
         device_ids: Sequence[int] = (0,),
         pypto_build_dir: str | None = None,
+        native_ddr_probe_slots: int = 0,
     ) -> None:
         # ``pypto_build_dir`` is an explicit diagnostic/output request (set by
         # the serving worker only when the user asks for build output); it
         # bypasses PyPTO's JIT cache. The persistent cache policy reaches pypto
         # through the run config instead.
+        if type(native_ddr_probe_slots) is not int or not 0 <= native_ddr_probe_slots <= 2:
+            raise ValueError("native_ddr_probe_slots must be 0, 1 or 2")
+        self._native_ddr_probe_slots = native_ddr_probe_slots
         super().__init__(
             kv_cache_manager,
             platform=platform,
@@ -307,6 +311,13 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             sampled_ids_width=sampled_ids_width,
             topk_width=topk_width,
         )
+        native_programs = native_slots = None
+        if self._native_ddr_probe_slots:
+            from pypto_serving.model.qwen.native_ddr_kv import compile_programs
+            from pypto_serving.model.qwen.native_ddr_transfer import PreforkDdrSlots
+
+            native_programs = compile_programs(self._compiler)
+            native_slots = PreforkDdrSlots(self._native_ddr_probe_slots)
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
@@ -319,6 +330,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             padded_embed_weight=padded_embed_weight,
             decode_weights=decode_weights,
             layout=layout,
+            native_ddr_programs=native_programs,
+            native_ddr_slots=native_slots,
         )
 
     def _compile_jit_fwd_callable(
