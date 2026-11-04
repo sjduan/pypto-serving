@@ -142,6 +142,8 @@ async def exercise(args, report):
             report["http"] = {"status": response.status_code, "payload": payload, "body": body}
         if args.case == "matrix":
             await matrix(engine, core, collect, collect_trace, args, report, cold, warm)
+        elif args.case in ("stop-load", "stop-store"):
+            await native_pending_stop(engine, core, collect, args, report)
         collect_trace()
         report["passed"] = True
     finally:
@@ -157,6 +159,73 @@ async def exercise(args, report):
         write_json(args.output, report)
     assert report["stop_ok"]
     return report
+
+
+async def native_pending_stop(engine, core, collect, args, report):
+    """Passively observe the real backend accept trace; never hold a host completion event."""
+    import re
+    coord = core._native_ddr
+    assert coord is not None
+    deadline = time.monotonic() + 30
+    while coord.jobs or coord.controls or core._batch_queue:
+        if time.monotonic() > deadline:
+            raise TimeoutError("stop probe did not reach its initial idle state")
+        await asyncio.sleep(.001)
+    held = set()
+    log_path = args.output.parent.parent / "logs/probe.log"
+    with log_path.open() as observer:
+        observer.seek(0, 2)
+        try:
+            if args.case == "stop-load":
+                blocks = core.kv_cache_manager.allocate_blocks(core.kv_cache_manager.num_free_blocks)
+                held = {b.block_id for b in blocks}
+                free = sorted(held)[:6]
+                core.kv_cache_manager.release_blocks_by_ids(free)
+                held.difference_update(free)
+                prompt = LONG_PROMPT
+            else:
+                prompt = "A native accepted stop observation: " + LONG_PROMPT
+            task = asyncio.create_task(collect("native-pending-stop-client", prompt, allow_abort=True))
+            accepted = None
+            deadline = time.monotonic() + 30
+            while accepted is None:
+                line = observer.readline()
+                if line:
+                    if "native_ddr_trace {" in line:
+                        item = json.loads(line.split("native_ddr_trace ", 1)[1])
+                        if (item["event"] == "accepted" and item["native_pending"]
+                                and coord.active_job == item["job"]):
+                            accepted = item
+                else:
+                    if time.monotonic() > deadline or task.done():
+                        raise TimeoutError("real native acceptance window was not observed")
+                    # Yield for actual model/IPC progress; no delay or override is
+                    # introduced into the producer, native handle or aux consumer.
+                    await asyncio.sleep(0)
+            invoke_ns = time.monotonic_ns()
+            job = coord.jobs[accepted["job"]]
+            page = job.request.page_ids[0]
+            report["native_pending_stop"] = {"operation": job.request.operation.value,
+                "job": accepted["job"], "native_run_id": accepted["native_run_id"],
+                "accepted_ns": accepted["time_ns"], "invoke_ns": invoke_ns,
+                "retained_ref_cnt": core.kv_cache_manager.blocks[page].ref_cnt,
+                "observation": "passive backend native_pending=true trace; no event withholding"}
+            assert await engine.stop()
+            await task
+            lines = log_path.read_text().splitlines()
+            complete = [s for s in lines if "name=node.complete " in s and
+                        re.search(r"\brun_id=" + str(accepted["native_run_id"]) + r"\b", s)]
+            assert len(complete) == 1
+            complete_ns = int(re.search(r"\bts=(\d+)", complete[0])[1])
+            report["native_pending_stop"].update(native_complete_ns=complete_ns, owner_stop_proven=coord.stopped,
+                raw_native_pending_at_stop=accepted["time_ns"] <= invoke_ns < complete_ns)
+            assert accepted["time_ns"] <= invoke_ns < complete_ns, "native observation window was already completed"
+            assert coord.stopped and not coord.jobs and not coord.steps
+        finally:
+            if held:
+                core.kv_cache_manager.release_blocks_by_ids(list(held))
+    assert all(b.ref_cnt == 0 for b in core.kv_cache_manager.blocks)
+    report["native_pending_stop"]["all_page_refs_released_after_proof"] = True
 
 
 async def matrix(engine, core, collect, collect_trace, args, report, cold, warm):
@@ -546,7 +615,7 @@ async def matrix(engine, core, collect, collect_trace, args, report, cold, warm)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--case", choices=["smoke", "matrix"], required=True)
+    parser.add_argument("--case", choices=["smoke", "matrix", "stop-load", "stop-store"], required=True)
     parser.add_argument("--native-enabled", type=int, choices=[0, 1], required=True)
     parser.add_argument("--utilization", type=float, default=.80)
     parser.add_argument("--device", type=int, required=True)

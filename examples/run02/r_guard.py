@@ -58,7 +58,7 @@ def snapshot(root, tag, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--case", choices=["smoke", "matrix"], required=True)
+    parser.add_argument("--case", choices=["smoke", "matrix", "stop-load", "stop-store"], required=True)
     parser.add_argument("--attempt", required=True)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--native-enabled", type=int, choices=[0, 1], required=True)
