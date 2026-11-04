@@ -1,4 +1,4 @@
-# Run03 H1: host metadata protocol
+# Run03: dormant host metadata and explicit E10 staging
 
 This example and the new shared modules are dormant. They do not change Run02
 single-owner compatibility, IPC, scheduling, page leases or native transfers.
@@ -76,3 +76,66 @@ digest in the example are explicitly **host-only fixtures**. A passing probe
 means two-process metadata compatibility and strict stale-identity rejection.
 It is not real E10 exchange, a native LOAD, NPU/model consumption, cross-replica
 Ready, DMA overlap or performance evidence. Those gates remain pending.
+
+## H2: explicit real E10 acquisition and CPU staging
+
+`shared_exchange.py` adds an opt-in E10 adapter and one preallocated 20MiB CPU
+slot with 64-byte guards on each side. The independent trusted H1 context is
+validated before acquisition and again before copying. All thirteen returned
+E10 backing fields, the exact nonzero range and the read-only mmap are checked.
+The adapter deliberately isolates its private `_identity.backing`/`_mapping`
+coupling to fixed SDK revision `4fba229373f0b27f0d1c0f6a7aab405542c8fdda`.
+SDK imports remain lazy; ordinary metadata/module imports require no SDK or
+tensor/runtime packages.
+
+The host snapshot is completely read and hashed before a target write. A
+successful `StagedBlock` owns the retained source view and the actual CPU slot
+lease; it is explicitly **not native Ready**. `close()` first confirms the SDK
+release, then returns the local slot. A failed/unknown release preserves the
+handle and busy slot for retry. An ambiguous acquire/retain is conservatively
+unresolved; its `ExchangeFailure.resources` must be retained for external
+resolution. A mid-copy host exception can partially write invalid target bytes;
+it never promises unchanged bytes or native cancellation. Copy metrics count
+verified successful CPU copies separately from mapped bytes and failed attempts.
+
+Run both standard-library suites without hardware:
+
+```console
+python -m unittest discover -s tests/unit/serving -p "test_shared*.py" -v
+```
+
+`host_exchange_namespace.py` is a Linux-only real broker integration driver,
+not a general deployment utility. Its task root is fixed to
+`/workspace/uflow/runs/run03-host-exchange-20261105`. Provision fixed-version
+sources and CPU-built daemon/shim there first. Run only its **outer** mode:
+
+```console
+python src/serving/examples/run03/host_exchange_namespace.py
+```
+
+It pins the outer mount namespace and new task directory FDs, uses private
+`unshare --mount`, and verifies parent/namespace/propagation/canonical inode
+before binding that new directory over `/workspace/uflow` in the child only.
+Only then can the previously absent private authority be initialized. Peers
+also validate inherited namespace/root anchors. The original dirty authority
+is never opened for mutation, initialized, recovered or cleared. Insufficient
+namespace privileges are a hard boundary, not permission to run unisolated.
+
+The real independent producer creates/seals 60MiB of immutable memfd backing:
+20MiB left sentinel, 20MiB deterministic payload, 20MiB right sentinel. The
+consumer uses the ordinary `uflow` SDK, acquires the middle block read-only,
+retains it and releases the root view, then makes a real bounded CPU copy.
+Examples verify complete bytes/guards, response-only placement/binding/lease
+mismatches, stale metadata/destination, a bad digest, busy slot and host cancel.
+After producer revoke and exit, the old legal view remains readable while new
+acquisition fails. All references and budget must drain before normal daemon
+shutdown; final socket/PID/FD/lock and unchanged outer-mount evidence are kept.
+Broker mapped-byte telemetry is not relabeled as our local CPU copied bytes.
+
+This driver uses `--execution-mode simulated --startup-probe-bytes 0` to disable
+HBM startup; its memfd, SCM_RIGHTS, mappings and CPU data are real. It never calls
+NPU resource probes, ACL device initialization, PyPTO/Simpler or model/native
+execution. Compatibility/deployment/worker/page contexts remain named host
+fixtures, not new loaded-model evidence or production sharing. Full NPU/model,
+cross-replica Ready, multi-card and performance gates remain NOT-RUN. H2 does
+not install a scheduler path, enable shared serving, merge main or push.
