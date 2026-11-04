@@ -142,6 +142,9 @@ async def exercise(args, report):
             report["http"] = {"status": response.status_code, "payload": payload, "body": body}
         if args.case == "matrix":
             await matrix(engine, core, collect, collect_trace, args, report, cold, warm)
+        elif args.case == "ledger":
+            from r_replay_probe import ledger
+            await ledger(engine, core, collect, collect_trace, args, report)
         elif args.case in ("stop-load", "stop-store"):
             await native_pending_stop(engine, core, collect, args, report)
         collect_trace()
@@ -615,7 +618,7 @@ async def matrix(engine, core, collect, collect_trace, args, report, cold, warm)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--case", choices=["smoke", "matrix", "stop-load", "stop-store"], required=True)
+    parser.add_argument("--case", choices=["smoke", "matrix", "ledger", "stop-load", "stop-store"], required=True)
     parser.add_argument("--native-enabled", type=int, choices=[0, 1], required=True)
     parser.add_argument("--utilization", type=float, default=.80)
     parser.add_argument("--device", type=int, required=True)

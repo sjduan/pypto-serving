@@ -1634,6 +1634,9 @@ class WorkerProcess:
                 from pypto_serving.serving.native_ddr.diagnostics import inspect_idle_pages
                 try:
                     payload = inspect_idle_pages(self._native_ddr_backend, module, cmd)
+                    details = json.loads(payload)
+                    details["control_replay"] = self._native_ddr_control_replay.stats()
+                    payload = json.dumps(details, sort_keys=True).encode()
                     event = DdrControlEvent(cmd.command_id, module.worker_epoch, "diagnostic", payload=payload)
                 except (ValueError, RuntimeError, OSError) as error:
                     event = DdrControlEvent(cmd.command_id, module.worker_epoch, "diagnostic", error=str(error))

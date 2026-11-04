@@ -1262,3 +1262,22 @@ def test_conflicting_invalid_payload_on_pending_sequence_never_claims_stopped():
     assert module.pending is not None and len(backend.submissions) == 1
     complete(module, backend)
     module.close()
+
+
+def test_terminal_but_quarantined_owner_cannot_retire_its_protected_receipt():
+    from pypto_serving.serving.native_ddr.replay import DeliverySender
+    module, backend = worker()
+    sender = DeliverySender()
+    handle = FakeHandle()
+    backend.error = NativeSubmissionError('ambiguous accepted submission', handle=handle)
+    req = sender.stamp(transfer())
+    module.submit_transfer(req)
+    handle.ready = True
+    done = module.poll_completed()[0]
+    assert done.stopped and module.poisoned
+    sender.consume(done.delivery_sequence)
+    fresh = sender.stamp(transfer(job='new', ref=replace(REF, entry_id='new', slot_generation=2)))
+    error = module.submit_transfer(fresh)
+    assert not error.stopped and 'retained' in error.error
+    assert module.transfer_replay.acknowledged == module.transfer_replay.retired_through == 0
+    assert module.transfer_replay.records[1].protected

@@ -60,7 +60,8 @@ def inspect_idle_pages(backend, module, command):
         path = root / (command.diagnostic_label + "-ddr.bin")
         with path.open("xb") as stream:
             stream.write(raw)
-        result["ddr"] = {"entry_id": entry.ref.entry_id, "file": str(path), "bytes": len(raw),
+        result["ddr"] = {"entry_id": entry.ref.entry_id, "slot": entry.slot,
+                         "generation": entry.ref.slot_generation, "file": str(path), "bytes": len(raw),
                          "sha256": hashlib.sha256(raw).hexdigest()}
     return json.dumps(result, sort_keys=True).encode()
 
