@@ -922,9 +922,9 @@ def test_eviction_with_pending_load_retains_reader_until_actual_completion():
     req = request()
     key = seed_ready(coord, manager, req)
     module, backend = worker()
-    store = transfer(key=key)
+    store = coord.transfer_delivery.stamp(transfer(key=key))
     module.submit_transfer(store)
-    complete(module, backend)
+    coord.transfer_delivery.consume(complete(module, backend).delivery_sequence)
     coord.lookup_after_hbm(req, [], 128)
     load = coord.next_transfer()
     assert module.submit_transfer(load).status == TransferStatus.ACCEPTED
@@ -1137,6 +1137,10 @@ def _control_process(module, backend):
     return process
 
 
+def _control_wire(cmd):
+    return decode_command(encode_command(NativeDdrCommand(**asdict(cmd))))
+
+
 def test_control_receipts_continue_after_4096_and_old_evict_cannot_release_new_generation():
     from pypto_serving.serving.native_ddr.replay import DeliverySender, REPLAY_WINDOW
     from pypto_serving.serving.native_ddr.types import DdrControlRequest
@@ -1148,7 +1152,7 @@ def test_control_receipts_continue_after_4096_and_old_evict_cannot_release_new_g
     process = _control_process(module, backend)
 
     def invoke(cmd):
-        process._handle_native_ddr_command(NativeDdrCommand(**asdict(cmd)))
+        process._handle_native_ddr_command(_control_wire(cmd))
         return decode_native_ddr_message(process.native_ddr_output_queue.get_nowait()).control
 
     evict = sender.stamp(DdrControlRequest("old-evict", "worker1", "evict", entry_ref=REF))
@@ -1186,16 +1190,16 @@ def test_pending_control_eviction_blocks_ack_frontier_while_later_cancel_complet
     module.submit_transfer(load)
     process = _control_process(module, backend)
     evict = sender.stamp(DdrControlRequest("pending-evict", "worker1", "evict", entry_ref=REF))
-    process._handle_native_ddr_command(NativeDdrCommand(**asdict(evict)))
-    process._handle_native_ddr_command(NativeDdrCommand(**asdict(evict)))
+    process._handle_native_ddr_command(_control_wire(evict))
+    process._handle_native_ddr_command(_control_wire(evict))
     assert process.native_ddr_output_queue.empty() and len(backend.slots) == 1
     cancel = sender.stamp(DdrControlRequest("cancel", "worker1", "cancel", job_id=load.job_id))
-    process._handle_native_ddr_command(NativeDdrCommand(**asdict(cancel)))
+    process._handle_native_ddr_command(_control_wire(cancel))
     response = decode_native_ddr_message(process.native_ddr_output_queue.get_nowait()).control
     sender.consume(response.delivery_sequence)
     assert sender.acknowledged == 0  # completion 2 cannot cross pending command 1
     forged = DdrControlRequest("forged", "worker1", "cancel", delivery_sequence=3, retire_through=2)
-    process._handle_native_ddr_command(NativeDdrCommand(**asdict(forged)))
+    process._handle_native_ddr_command(_control_wire(forged))
     error = decode_native_ddr_message(process.native_ddr_output_queue.get_nowait()).control
     assert "retained" in error.error and module.pending is not None and backend.slots
     backend.handle.ready = True
