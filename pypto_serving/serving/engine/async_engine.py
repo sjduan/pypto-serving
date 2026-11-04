@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import hashlib
+import json
 import queue
 import time
 from collections import deque
@@ -53,7 +55,7 @@ from pypto_serving.serving.server.ipc import (
     ShutdownCommand,
     StepCommand,
     NativeDdrCommand,
-    decode_native_ddr_event,
+    decode_native_ddr_message,
     decode_profile_result,
     decode_control_result,
     decode_result,
@@ -306,6 +308,7 @@ class ReplicaEngineCore:
         # Native DDR resources exist only on the explicitly enabled path.
         self._native_ddr_output_queue = None
         self._native_ddr: DdrPrefixCoordinator | None = None
+        self._native_ddr_startup = None
         self._profile_lock = asyncio.Lock()
         self._control_counter = 0
         # Tracks which request_ids the worker has already received via
@@ -402,6 +405,8 @@ class ReplicaEngineCore:
                     num_blocks=reported_num_blocks,
                     group_num_blocks=group_sizes if any(group_sizes.values()) else None,
                 )
+                if self._runtime.native_ddr.enabled:
+                    await self._install_native_ddr(process, reported_num_blocks)
             except BaseException as exc:
                 self.startup_error = f"{type(exc).__name__}: {exc}"
                 self.shutdown_report["startup_error"] = self.startup_error
@@ -502,18 +507,35 @@ class ReplicaEngineCore:
                 try:
                     native_ddr.close()
                 except RuntimeError:
-                    if self._input_queue is None:
-                        raise RuntimeError("native drain unavailable: worker channel is gone")
-                    self._input_queue.put(encode_command(NativeDdrCommand(operation="drain")))
-                    deadline = asyncio.get_running_loop().time() + min(timeout, 5)
-                    while native_ddr.jobs and asyncio.get_running_loop().time() < deadline:
-                        self._pump_native_ddr(raise_poison=False)
-                        await asyncio.sleep(0.02)
+                    pass  # retained jobs/slots are discharged only by matching owner receipts
+                if self._input_queue is None:
+                    raise RuntimeError("native drain unavailable: worker channel is gone")
+                native_ddr._control("drain")
+                deadline = asyncio.get_running_loop().time() + max(timeout, 65)
+                while not native_ddr.drained and asyncio.get_running_loop().time() < deadline:
+                    self._pump_native_ddr(raise_poison=False)
+                    await asyncio.sleep(0.002)
+                if not native_ddr.drained:
+                    raise RuntimeError("native DDR module drain was not proven before shutdown")
         except Exception as exc:
             self.shutdown_report["cleanup_error"] = f"{type(exc).__name__}: {exc}"
         # Even auxiliary cleanup failure cannot skip the sole bounded reap owner.
         try:
-            reaped = await asyncio.to_thread(self._shutdown_worker, timeout=timeout)
+            if native_ddr is None:
+                reaped = await asyncio.to_thread(self._shutdown_worker, timeout=timeout)
+            else:
+                reap_task = asyncio.create_task(asyncio.to_thread(self._shutdown_worker, timeout=max(timeout, 65)))
+                while not reap_task.done():
+                    self._pump_native_ddr(raise_poison=False)
+                    await asyncio.sleep(0.002)
+                reaped = await reap_task
+                # Queue feeders may lag the process/reap observation briefly.
+                deadline = time.monotonic() + 2
+                while reaped and not native_ddr.stopped and time.monotonic() < deadline:
+                    self._pump_native_ddr(raise_poison=False)
+                    await asyncio.sleep(0.002)
+                if not native_ddr.stopped:
+                    self.shutdown_report["cleanup_error"] = "native Qwen owner close/argument release proof unavailable"
         except BaseException as exc:
             self._worker_stranded = True
             self.shutdown_report["cleanup_error"] = f"{type(exc).__name__}: {exc}"
@@ -907,20 +929,74 @@ class ReplicaEngineCore:
 
         logger.info("Engine loop stopped")
 
+    async def _install_native_ddr(self, process, reported_num_blocks):
+        from pypto_serving.serving.native_ddr.coordinator import DdrPrefixCoordinator
+
+        channel = self._native_ddr_output_queue
+        if channel is None:
+            raise RuntimeError("enabled worker has no native DDR startup channel")
+        deadline = time.monotonic() + min(self._init_timeout, 10)
+        while True:
+            if self._stop_task is not None:
+                raise RuntimeError("native DDR startup interrupted by stop")
+            try:
+                raw = await asyncio.to_thread(channel.get, timeout=min(0.1, max(0.001, deadline - time.monotonic())))
+                break
+            except queue.Empty:
+                if time.monotonic() >= deadline or not process.is_alive():
+                    raise RuntimeError("native DDR startup metadata did not arrive")
+        message = decode_native_ddr_message(raw)
+        if message.kind != "startup":
+            raise RuntimeError("native DDR startup channel did not begin with a handshake")
+        info = message.startup
+        count = self._runtime.native_ddr.capacity_bytes // 20971520
+        descriptor = json.loads(info.compatibility_json)
+        if (not info.worker_epoch or info.layout.num_pages != reported_num_blocks
+                or info.max_entries != count or info.capacity_bytes != count * info.layout.block_bytes
+                or hashlib.sha256(info.compatibility_json).digest() != info.namespace_digest
+                or descriptor["worker_epoch"] != info.worker_epoch
+                or descriptor["scope"] != "single-loaded-owner-incarnation-only"
+                or descriptor["model"]["model_id"] != self.config.model_id):
+            raise RuntimeError("native DDR owner/layout/capacity/compatibility handshake mismatch")
+        self._native_ddr_startup = info
+        self._native_ddr = DdrPrefixCoordinator(self.kv_cache_manager,
+            namespace_digest=info.namespace_digest, worker_epoch=info.worker_epoch, max_entries=info.max_entries)
+        self.scheduler._native_ddr = self._native_ddr
+        logger.info("native_ddr_startup epoch=%s pages=%d slots=%d bytes=%d namespace=%s compatibility=%s",
+                    info.worker_epoch, reported_num_blocks, info.max_entries, info.capacity_bytes,
+                    info.namespace_digest.hex(), info.compatibility_json.decode())
+
     def _pump_native_ddr(self, *, raise_poison=True):
         # No new query/RPC/thread on the disabled path. Auxiliary events are
         # never consumed from, or injected into, the ordered StepResult FIFO.
         native_ddr = self._native_ddr
-        if native_ddr is None or self._native_ddr_output_queue is None or self._input_queue is None:
+        if native_ddr is None or self._native_ddr_output_queue is None:
             raise RuntimeError("native DDR owner/channel unavailable")
         for _ in range(16):
             try:
                 raw = self._native_ddr_output_queue.get_nowait()
             except queue.Empty:
                 break
-            native_ddr.on_transfer_event(decode_native_ddr_event(raw))
+            message = decode_native_ddr_message(raw)
+            if message.kind == "transfer":
+                native_ddr.on_transfer_event(message.event)
+            elif message.kind == "control":
+                native_ddr.on_control_event(message.control)
+            elif message.kind == "stopped":
+                native_ddr.on_worker_stopped(message.proof.worker_epoch, message.proof)
+            elif message.startup != self._native_ddr_startup:
+                raise RuntimeError("native DDR incarnation changed after startup")
         if native_ddr.poisoned and raise_poison:
             raise RuntimeError("native DDR owner quarantined; no further model admission")
+        if self._input_queue is None:
+            return
+        for _ in range(16):
+            command = native_ddr.next_control()
+            if command is None:
+                break
+            self._input_queue.put(encode_command(NativeDdrCommand(
+                operation=command.operation, command_id=command.command_id, worker_epoch=command.worker_epoch,
+                job_id=command.job_id, entry_ref=command.entry_ref)))
         request = native_ddr.next_transfer()
         if request is not None:
             self._input_queue.put(encode_command(NativeDdrCommand(operation="submit", request=request)))

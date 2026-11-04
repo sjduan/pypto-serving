@@ -32,8 +32,8 @@ class PreforkDdrSlots:
     """Owning shared allocations created before the chip child forks."""
 
     def __init__(self, count: int):
-        if type(count) is not int or not 1 <= count <= 2:
-            raise ValueError("M3 requires one or two explicit prefork slots")
+        if type(count) is not int or count <= 0:
+            raise ValueError("native DDR requires an explicit finite positive prefork slot count")
         import torch
         from pypto_serving.model.common.runner.buffer_set import shared_empty
 

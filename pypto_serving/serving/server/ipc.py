@@ -27,7 +27,10 @@ from __future__ import annotations
 from typing import Any, Literal, Union
 
 import msgspec
-from pypto_serving.serving.native_ddr.types import DdrEntryRef, DdrTransferEvent, DdrTransferRequest
+from pypto_serving.serving.native_ddr.types import (
+    DdrControlEvent, DdrEntryRef, DdrStartup, DdrTransferEvent, DdrTransferRequest,
+)
+from pypto_serving.serving.native_ddr.worker import NativeStopProof
 
 # Sentinel for a decode input token the worker must resolve from its own cache.
 # Under async (pipelined) scheduling the engine builds step N+1 before step N's
@@ -150,6 +153,17 @@ class NativeDdrCommand(msgspec.Struct, tag="native_ddr"):
     request: DdrTransferRequest | None = None
     job_id: str = ""
     entry_ref: DdrEntryRef | None = None
+    command_id: str = ""
+    worker_epoch: str = ""
+
+
+class NativeDdrMessage(msgspec.Struct):
+    """Tagged auxiliary metadata; never interpreted as an inference result."""
+    kind: Literal["startup", "transfer", "control", "stopped"]
+    startup: DdrStartup | None = None
+    event: DdrTransferEvent | None = None
+    control: DdrControlEvent | None = None
+    proof: NativeStopProof | None = None
 
 
 # Union used for the decoder — tag field ("type") discriminates.
@@ -256,3 +270,21 @@ def decode_native_ddr_event(data: bytes) -> DdrTransferEvent:
     if len(data) > 65536:
         raise ValueError("native DDR metadata event exceeds bounded payload")
     return msgspec.msgpack.decode(data, type=DdrTransferEvent)
+
+
+def encode_native_ddr_message(message: NativeDdrMessage) -> bytes:
+    data = msgspec.msgpack.encode(message)
+    if len(data) > 65536:
+        raise ValueError("native DDR auxiliary metadata exceeds bounded payload")
+    return data
+
+
+def decode_native_ddr_message(data: bytes) -> NativeDdrMessage:
+    if len(data) > 65536:
+        raise ValueError("native DDR auxiliary metadata exceeds bounded payload")
+    result = msgspec.msgpack.decode(data, type=NativeDdrMessage)
+    fields = {"startup": result.startup, "transfer": result.event,
+              "control": result.control, "stopped": result.proof}
+    if fields[result.kind] is None or sum(v is not None for v in fields.values()) != 1:
+        raise ValueError("native DDR auxiliary message must have exactly its tagged payload")
+    return result

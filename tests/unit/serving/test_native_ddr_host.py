@@ -20,7 +20,7 @@ from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngin
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.native_ddr.coordinator import DdrPrefixCoordinator, ScheduledPrefix
 from pypto_serving.serving.native_ddr.types import (
-    DdrEntryRef, DdrTransferEvent, DdrTransferRequest, EntryState, LoadState,
+    DdrControlEvent, DdrEntryRef, DdrTransferEvent, DdrTransferRequest, EntryState, LoadState,
     NativeDdrPrefixConfig, Operation, PrefixKey, QwenKvLayout, RestoreKind, TransferStatus,
 )
 from pypto_serving.serving.native_ddr.worker import (
@@ -29,6 +29,7 @@ from pypto_serving.serving.native_ddr.worker import (
 from pypto_serving.serving.server.ipc import (
     NativeDdrCommand, StepResult, decode_command, decode_native_ddr_event,
     decode_result, encode_command, encode_native_ddr_event, encode_result,
+    NativeDdrMessage, decode_native_ddr_message, encode_native_ddr_message,
 )
 from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
 
@@ -447,10 +448,10 @@ def test_idle_worker_emits_terminal_on_aux_queue_without_a_model_step():
     thread.start()
     try:
         process.input_queue.put(encode_command(NativeDdrCommand(operation="submit", request=transfer())))
-        accepted = decode_native_ddr_event(process.native_ddr_output_queue.get(timeout=2))
+        accepted = decode_native_ddr_message(process.native_ddr_output_queue.get(timeout=2)).event
         assert accepted.status == TransferStatus.ACCEPTED
         backend.handle.ready = True
-        final = decode_native_ddr_event(process.native_ddr_output_queue.get(timeout=2))
+        final = decode_native_ddr_message(process.native_ddr_output_queue.get(timeout=2)).event
         assert final.status == TransferStatus.SUCCEEDED
         assert process.output_queue.empty()
     finally:
@@ -563,7 +564,8 @@ def test_engine_enabled_snapshot_and_aux_event_hook_only_use_host_queues():
     core._pump_native_ddr()
     transfer_cmd = decode_command(core._input_queue.get_nowait())
     assert isinstance(transfer_cmd, NativeDdrCommand)
-    core._native_ddr_output_queue.put(encode_native_ddr_event(event_for(transfer_cmd.request)))
+    core._native_ddr_output_queue.put(encode_native_ddr_message(
+        NativeDdrMessage("transfer", event=event_for(transfer_cmd.request))))
     core._pump_native_ddr()
     assert coord.ready and not coord.jobs
     assert core._output_queue.empty()
@@ -648,6 +650,19 @@ def test_quarantined_engine_rejects_before_scheduler_or_model_admission():
         core._try_dispatch_step()
 
 
+
+def close_coordinator_with_host_receipts(coord):
+    """Host-only control fixture: acknowledge actual queued release commands explicitly."""
+    try:
+        coord.close()
+    except RuntimeError:
+        assert not coord.jobs and not coord.steps
+    while (cmd := coord.next_control()) is not None:
+        coord.on_control_event(DdrControlEvent(cmd.command_id, cmd.worker_epoch, cmd.operation,
+                                              cmd.entry_ref, cmd.operation == "evict"))
+    assert not coord.controls and not coord.retiring
+    coord.close()
+
 def _seed_full_prefix(coord, manager, req, count):
     keys = [PrefixKey(coord.namespace, block_hash)
             for block_hash in manager.compute_block_hashes(req.prompt_token_ids)[:count]]
@@ -687,7 +702,7 @@ def test_completed_multi_block_restores_allow_actual_suffix_admission(chunk, req
     assert len(first.block_ids) == 2 + (first.num_new_tokens + 127) // 128
     for req in list(sched.requests.values()):
         sched.abort_request(req.request_id)
-    coord.close()
+    close_coordinator_with_host_receipts(coord)
     assert not coord.loads_by_key and not coord.waiters and not coord.jobs
     assert manager.num_free_blocks == pages
     assert all(page.ref_cnt == 0 for page in manager.blocks)
@@ -720,7 +735,7 @@ def test_restore_capacity_change_can_fall_back_to_cold_without_losing_other_pins
     assert not coord.jobs and not coord.loads_by_key and not coord.waiters
     sched.abort_request(req.request_id)
     manager.release_blocks_by_ids([other_page.block_id])
-    coord.close()
+    close_coordinator_with_host_receipts(coord)
     assert manager.num_free_blocks == 4
 
 
@@ -786,7 +801,7 @@ def test_partial_multi_block_completion_late_join_and_cancel_balance_refs(comple
     manager.release_blocks_by_ids(acquired)
     coord.on_transfer_event(event_for(done))  # replay after final retirement
     coord.on_transfer_event(final)
-    coord.close()
+    close_coordinator_with_host_receipts(coord)
     assert manager.num_free_blocks == 12
     assert all(page.ref_cnt == 0 for page in manager.blocks)
 
@@ -807,7 +822,7 @@ def test_suffix_pressure_cannot_relinquish_unsettled_native_target(state):
     if job is not None:
         assert sum(page.ref_cnt for page in manager.blocks) == 1
         coord.on_transfer_event(event_for(job))
-    coord.close()
+    close_coordinator_with_host_receipts(coord)
     assert not coord.jobs and not coord.loads_by_key
     assert manager.num_free_blocks == 12
 
@@ -831,5 +846,5 @@ def test_joining_committed_canonical_target_does_not_wait_for_another_event():
         assert len(blocks) == 1
         manager.release_cached_blocks(blocks)
     assert not coord.loads_by_key and not coord.jobs
-    coord.close()
+    close_coordinator_with_host_receipts(coord)
     assert manager.num_free_blocks == 12

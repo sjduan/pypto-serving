@@ -10,11 +10,13 @@
 from __future__ import annotations
 
 import logging
+import json
 import multiprocessing as mp
 import os
 import queue
 import sys
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -48,7 +50,8 @@ from pypto_serving.serving.server.ipc import (
     StepCommand,
     StepResult,
     NativeDdrCommand,
-    encode_native_ddr_event,
+    NativeDdrMessage,
+    encode_native_ddr_message,
     decode_command,
     encode_control_result,
     encode_profile_result,
@@ -161,6 +164,12 @@ class WorkerProcess:
         self.profile_output_queue = profile_output_queue
         self.native_ddr_output_queue = native_ddr_output_queue
         self._native_ddr_worker: DdrPrefixWorker | None = None
+        self._native_ddr_backend = None
+        self._native_ddr_startup = None
+        self._native_ddr_stop_sent = False
+        self._native_ddr_controls = {}
+        self._native_ddr_control_receipts = {}
+        self._native_ddr_drain_commands = {}
         self._decode_metrics = DecodeStepRecorder.from_env()
 
         self._services_factory = services_factory
@@ -183,10 +192,9 @@ class WorkerProcess:
 
     def init_device_and_model(self) -> int:
         native_config = self.config.resolve_runtime_config().native_ddr
-        if native_config.enabled:
-            # Fail BEFORE executor construction/device initialization. A future
-            # M3-approved same-owner adapter must replace this explicit seam;
-            # host unit tests never install a production mock fallback.
+        if native_config.enabled and getattr(self, "native_ddr_output_queue", None) is None:
+            # A direct caller without the enabled auxiliary channel cannot
+            # install a partial assembly or fall back to host execution.
             from pypto_serving.model.qwen.native_ddr_kv import require_native_ddr_backend
             require_native_ddr_backend()
         from pypto_serving.config.types import ModelRecord
@@ -221,11 +229,18 @@ class WorkerProcess:
             self.sampler = Sampler()
 
             executor_cls = self._resolve_executor_cls()
+            executor_kwargs = dict(self.config.executor_kwargs)
+            if native_config.enabled:
+                from pypto_serving.serving.native_ddr.compatibility import capture_assets
+                assets = capture_assets(self.config.model_dir)
+                if "native_ddr_config" in executor_kwargs or "native_ddr_probe_slots" in executor_kwargs:
+                    raise ValueError("native DDR startup owns the executor configuration")
+                executor_kwargs["native_ddr_config"] = native_config
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_ids=device_ids,
                 pypto_build_dir=str(pypto_build_dir) if pypto_build_dir is not None else None,
-                **self.config.executor_kwargs,
+                **executor_kwargs,
             )
 
             loaded = ModelLoader().load(
@@ -249,6 +264,26 @@ class WorkerProcess:
                 num_pages = register_model(self.config.model_id, self.model_record)
             else:
                 raise RuntimeError("Executor has no register_model method")
+
+            if native_config.enabled:
+                import uuid
+                from pypto_serving.serving.native_ddr.compatibility import build_compatibility
+                from pypto_serving.serving.native_ddr.types import DdrStartup
+                from pypto_serving.serving.native_ddr.worker import DdrPrefixWorker
+
+                if capture_assets(self.config.model_dir) != assets:
+                    raise RuntimeError("model assets changed during owner initialization")
+                epoch = uuid.uuid4().hex
+                runner = self.executor._runners[self.config.model_id]
+                backend = runner.create_native_ddr_backend(loaded.runtime_model, epoch,
+                                                          observer=self._trace_native_ddr)
+                self._native_ddr_backend = backend
+                namespace, descriptor = build_compatibility(loaded, assets, epoch, backend.layout)
+                self._native_ddr_worker = DdrPrefixWorker(native_config, backend.layout, epoch, backend)
+                count = len(backend.slots.tensors)
+                self._native_ddr_startup = DdrStartup(epoch, namespace, backend.layout,
+                                                     count * backend.layout.block_bytes, count, descriptor)
+                self._emit_native_ddr(NativeDdrMessage("startup", startup=self._native_ddr_startup))
 
             if self._services_factory is not None:
                 self._services = self._services_factory(
@@ -1421,9 +1456,21 @@ class WorkerProcess:
     def close(self) -> None:
         """Release executor-owned runtime and device resources."""
         if getattr(self, "_native_ddr_worker", None) is not None:
-            events = self._native_ddr_worker.close()
-            for event in events:
-                self.native_ddr_output_queue.put(encode_native_ddr_event(event))
+            module = self._native_ddr_worker
+            module.closed = True
+            if module.pending is not None:
+                module.cancel(module.pending.request.job_id)
+            deadline = time.monotonic() + 65
+            while module.pending is not None and not module.poisoned and time.monotonic() < deadline:
+                self._poll_native_ddr()
+                if module.pending is not None:
+                    time.sleep(0.002)
+            if module.pending is not None or module.poisoned:
+                raise RuntimeError("native DDR shutdown has unproven native obligations")
+            self._finish_native_ddr_drain()
+        elif getattr(self, "_native_ddr_backend", None) is not None:
+            # Startup failed between backend retention and handshake assembly.
+            self._native_ddr_backend.close()
         for constraint_state in getattr(self, "_constraint_states", {}).values():
             constraint_state.close()
         if hasattr(self, "_constraint_states"):
@@ -1435,9 +1482,18 @@ class WorkerProcess:
             return
 
         close = getattr(executor, "close", None)
+        if getattr(self, "_native_ddr_backend", None) is not None:
+            # This strict path propagates owner-close errors; the generic
+            # executor.close logger must not turn them into a stop proof.
+            executor.close_native_ddr_owner(self.config.model_id)
         if callable(close):
             close()
         self.executor = None
+        if getattr(self, "_native_ddr_worker", None) is not None and not self._native_ddr_stop_sent:
+            from pypto_serving.serving.native_ddr.worker import NativeStopProof
+            proof = NativeStopProof(self._native_ddr_worker.worker_epoch, True, True)
+            self._emit_native_ddr(NativeDdrMessage("stopped", proof=proof))
+            self._native_ddr_stop_sent = True
 
     def _sample_result_row(
         self,
@@ -1470,12 +1526,43 @@ class WorkerProcess:
             raise ValueError("host sampling requires logits when device sampling is unavailable")
         return self.sampler.sample(logits, params, request_id)
 
+    def _trace_native_ddr(self, item):
+        logger.info("native_ddr_trace %s", json.dumps(item, sort_keys=True))
+
+    def _emit_native_ddr(self, message):
+        self.native_ddr_output_queue.put(encode_native_ddr_message(message))
+
+    def _finish_native_ddr_drain(self):
+        module = self._native_ddr_worker
+        module.close()
+        backend = self._native_ddr_backend
+        backend.close()
+        self._poll_native_ddr_controls()
+        from pypto_serving.serving.native_ddr.types import DdrControlEvent
+        for command_id, cmd in tuple(self._native_ddr_drain_commands.items()):
+            event = DdrControlEvent(command_id, module.worker_epoch, "drain", released=True)
+            self._emit_native_ddr(NativeDdrMessage("control", control=event))
+            self._native_ddr_control_receipts[command_id] = (cmd, event)
+            del self._native_ddr_drain_commands[command_id]
+
+    def _poll_native_ddr_controls(self):
+        from pypto_serving.serving.native_ddr.types import DdrControlEvent
+        module = self._native_ddr_worker
+        for command_id, cmd in tuple(getattr(self, "_native_ddr_controls", {}).items()):
+            entry = module.entries.get(cmd.entry_ref.entry_id)
+            if entry is None:
+                event = DdrControlEvent(command_id, module.worker_epoch, "evict", cmd.entry_ref, True)
+                self._emit_native_ddr(NativeDdrMessage("control", control=event))
+                del self._native_ddr_controls[command_id]
+                self._native_ddr_control_receipts[command_id] = (cmd, event)
+
     def _poll_native_ddr(self):
         for event in self._native_ddr_worker.poll_completed():
-            self.native_ddr_output_queue.put(encode_native_ddr_event(event))
+            self._emit_native_ddr(NativeDdrMessage("transfer", event=event))
+        self._poll_native_ddr_controls()
         module = self._native_ddr_worker
         if module.closed and module.pending is None and not module.poisoned:
-            module.close()
+            self._finish_native_ddr_drain()
 
     def _handle_native_ddr_command(self, cmd):
         module = self._native_ddr_worker
@@ -1485,18 +1572,41 @@ class WorkerProcess:
             if cmd.request is None:
                 raise ValueError("native DDR submit requires a request")
             event = module.submit_transfer(cmd.request)
-            self.native_ddr_output_queue.put(encode_native_ddr_event(event))
-        elif cmd.operation == "cancel":
-            module.cancel(cmd.job_id)
-        elif cmd.operation == "evict":
-            if cmd.entry_ref is None:
-                raise ValueError("native DDR evict requires an entry ref")
-            module.evict(cmd.entry_ref)
+            self._emit_native_ddr(NativeDdrMessage("transfer", event=event))
         else:
-            module.closed = True
-            if module.pending is not None:
-                module.cancel(module.pending.request.job_id)
-            self._poll_native_ddr()
+            from pypto_serving.serving.native_ddr.types import DdrControlEvent
+            if cmd.worker_epoch != module.worker_epoch or not cmd.command_id:
+                event = DdrControlEvent(cmd.command_id, cmd.worker_epoch, cmd.operation,
+                                        cmd.entry_ref, error="invalid control epoch/identity")
+                self._emit_native_ddr(NativeDdrMessage("control", control=event))
+                return
+            previous = self._native_ddr_control_receipts.get(cmd.command_id)
+            if previous is not None:
+                if previous[0] != cmd:
+                    raise ValueError("native DDR control identity replay conflict")
+                self._emit_native_ddr(NativeDdrMessage("control", control=previous[1]))
+                return
+            if cmd.command_id in self._native_ddr_controls:
+                if self._native_ddr_controls[cmd.command_id] != cmd:
+                    raise ValueError("native DDR pending control replay conflict")
+                return
+            if cmd.operation == "cancel":
+                module.cancel(cmd.job_id)
+                event = DdrControlEvent(cmd.command_id, module.worker_epoch, "cancel")
+                self._emit_native_ddr(NativeDdrMessage("control", control=event))
+                self._native_ddr_control_receipts[cmd.command_id] = (cmd, event)
+            elif cmd.operation == "evict":
+                if cmd.entry_ref is None:
+                    raise ValueError("native DDR evict requires an entry ref")
+                module.evict(cmd.entry_ref)
+                self._native_ddr_controls[cmd.command_id] = cmd
+                self._poll_native_ddr_controls()
+            else:
+                self._native_ddr_drain_commands[cmd.command_id] = cmd
+                module.closed = True
+                if module.pending is not None:
+                    module.cancel(module.pending.request.job_id)
+                self._poll_native_ddr()
 
     def _accept_output_tokens(self, request_id: str, count: int) -> None:
         lengths = getattr(self, "_accepted_output_lengths", {})

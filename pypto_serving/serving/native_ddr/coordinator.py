@@ -15,11 +15,15 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+import json
+import logging
 
 from .types import (
-    DdrEntryRef, DdrTransferEvent, DdrTransferRequest, KvPageLease, LoadState,
+    DdrControlRequest, DdrEntryRef, DdrTransferEvent, DdrTransferRequest, KvPageLease, LoadState,
     Operation, PrefixKey, RestoreDecision, RestoreKind, TransferStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,57 @@ class DdrPrefixCoordinator:
         self._sequence = 0
         self.closed = False
         self.poisoned = False
+        self.controls = {}
+        self.control_outbound = deque()
+        self.retiring = {}
+        self.stopped = False
+        self.drained = False
+        self.trace = deque(maxlen=512)
+
+    def record(self, event, **fields):
+        import time
+        item = {"event": event, "time_ns": time.monotonic_ns(), **fields}
+        self.trace.append(item)
+        logger.info("native_ddr_coordinator %s", json.dumps(item, sort_keys=True))
+
+    def _control(self, operation, *, job_id="", entry_ref=None):
+        command = DdrControlRequest(self._id(operation), self.worker_epoch, operation, job_id, entry_ref)
+        self.controls[command.command_id] = command
+        self.control_outbound.append(command.command_id)
+        return command
+
+    def next_control(self):
+        while self.control_outbound:
+            command = self.controls.get(self.control_outbound.popleft())
+            if command is not None:
+                return command
+        return None
+
+    def evict(self, key):
+        ref = self.ready.pop(key, None)
+        if ref is None:
+            return False
+        self.retiring[ref.entry_id] = ref
+        self._control("evict", entry_ref=ref)
+        self.record("evict_lookup_withdrawn", entry=ref.entry_id)
+        return True
+
+    def on_control_event(self, event):
+        command = self.controls.get(event.command_id)
+        if command is None:
+            return
+        if ((event.worker_epoch, event.operation, event.entry_ref) !=
+                (command.worker_epoch, command.operation, command.entry_ref)
+                or event.error or (command.operation in ("evict", "drain") and not event.released)):
+            self.poisoned = True
+            raise RuntimeError("native DDR control has no matching release receipt")
+        if command.operation == "evict":
+            self.retiring.pop(command.entry_ref.entry_id, None)
+            self.record("worker_slot_released", entry=command.entry_ref.entry_id)
+        if command.operation == "drain":
+            self.drained = True
+            self.record("module_drained_before_executor_close")
+        del self.controls[event.command_id]
 
     @staticmethod
     def _request_key(request):
@@ -104,6 +159,7 @@ class DdrPrefixCoordinator:
                 break
             keys.append(key)
         if not keys:
+            self.record("hbm_or_cold", request=request.request_id, hbm_blocks=len(local_blocks))
             return RestoreDecision(RestoreKind.READY if len(local_blocks) >= limit and limit else RestoreKind.MISS,
                                    reuse_limit=len(local_blocks) * 128)
         return self.reserve_restore(request, keys, local_blocks)
@@ -138,6 +194,8 @@ class DdrPrefixCoordinator:
         # Transfer ownership of the initial lookup refs only on WAIT.
         self.waiters[req_key] = _Waiter(request, job_ids, tuple(b.block_id for b in local_blocks))
         request.scheduling_held = True
+        self.record("restore_held", request=request.request_id, jobs=sorted(job_ids),
+                    local_pages=list(self.waiters[req_key].local_ids))
         # All canonical targets may already be committed behind a prefix gap.
         # Such a late waiter must not need another event to become runnable.
         self._wake_waiters()
@@ -151,9 +209,15 @@ class DdrPrefixCoordinator:
             job = self.jobs.get(job_id)
             if job is None:
                 continue
+            if (job.request.operation == Operation.STORE
+                    and len(self.ready) + len(self.retiring) + len(self.stores_by_key) > self.max_entries):
+                self.outbound.append(job_id)
+                return None
             job.submitted = True
             job.state = LoadState.LOADING
             self.active_job = job_id
+            self.record("transfer_dispatched", job=job_id, operation=job.request.operation.value,
+                        pages=list(job.request.page_ids))
             return job.request
         return None
 
@@ -180,9 +244,12 @@ class DdrPrefixCoordinator:
                             item.computed_before + item.scheduled_tokens) // 128
                 for page, block_hash in zip(item.page_ids[:limit], item.block_hashes[:limit]):
                     key = PrefixKey(self.namespace, block_hash)
-                    if (key in self.ready or key in self.stores_by_key
-                            or len(self.jobs) + len(self.ready) >= self.max_entries):
+                    if key in self.ready or key in self.stores_by_key:
                         continue
+                    if len(self.stores_by_key) + len(self.ready) >= self.max_entries:
+                        victim = next((k for k in self.ready if (self.worker_epoch, k) not in self.loads_by_key), None)
+                        if victim is None or not self.evict(victim):
+                            continue
                     # get_cached_block references the canonical hash. It must
                     # refer to THIS snapshot page, not a later duplicate page.
                     block = self.manager.get_cached_block(block_hash)
@@ -199,6 +266,7 @@ class DdrPrefixCoordinator:
                     self.jobs[job_id] = _Job(transfer, pin)
                     self.stores_by_key[key] = job_id
                     self.outbound.append(job_id)
+                    self.record("store_source_pinned", job=job_id, page=page, step_id=step_id)
         finally:
             del self.steps[step_id]
             self._release(lease)
@@ -227,6 +295,7 @@ class DdrPrefixCoordinator:
             job.state = LoadState.QUARANTINED
             return
         if event.status == TransferStatus.ACCEPTED:
+            self.record("transfer_accepted", job=req.job_id)
             return
         if not event.stopped:
             job.state = LoadState.QUARANTINED
@@ -241,18 +310,27 @@ class DdrPrefixCoordinator:
         if req.operation == Operation.STORE:
             if publish:
                 self.ready[key] = event.entry_refs[0]
+                self.record("ddr_ready", job=req.job_id, entry=event.entry_refs[0].entry_id)
+            elif not self.stopped:
+                self.retiring[req.entry_refs[0].entry_id] = req.entry_refs[0]
+                self._control("evict", entry_ref=req.entry_refs[0])
             self.stores_by_key.pop(key, None)
             self._release(job.lease)
+            self.record("store_source_released", job=req.job_id, page=req.page_ids[0])
         else:
             if publish:
                 job.state = LoadState.NATIVE_COMPLETED
                 self.manager.cache_block_ids(list(req.page_ids), [key.block_hash], 0, 1)
                 job.state = LoadState.COMMITTED
+                self.record("restored_page_valid", job=req.job_id, page=req.page_ids[0])
             else:
                 job.state = LoadState.DISCARD_PENDING
                 if not success and self.ready.get(key) == req.entry_refs[0]:
                     self.ready.pop(key, None)
                 self.loads_by_key.pop((req.worker_epoch, key), None)
+                if not self.stopped and not success:
+                    self.retiring[req.entry_refs[0].entry_id] = req.entry_refs[0]
+                    self._control("evict", entry_ref=req.entry_refs[0])
             # A committed target stays canonical across gaps in ordinary HBM
             # lookup until its LAST waiter has acquired a ref or left waiting.
         if self.active_job == req.job_id:
@@ -341,6 +419,7 @@ class DdrPrefixCoordinator:
                 self._finish_load(job_id)
             else:
                 job.discard = True
+                self._control("cancel", job_id=job_id)
                 # Native-owned until an actual stopped event; a second cancel
                 # must not confuse an in-flight loader with a settled discard.
 
@@ -355,7 +434,11 @@ class DdrPrefixCoordinator:
                 self.stores_by_key.pop(job.request.entry_keys[0], None)
                 self.loads_by_key.pop((job.request.worker_epoch, job.request.entry_keys[0]), None)
                 del self.jobs[job_id]
-        if self.jobs or self.steps:
+            else:
+                self._control("cancel", job_id=job_id)
+        for key in tuple(self.ready):
+            self.evict(key)
+        if self.jobs or self.steps or self.retiring or self.controls:
             raise RuntimeError("DDR close incomplete: native/step obligations retained")
 
     def on_worker_stopped(self, worker_epoch, proof):
@@ -366,6 +449,9 @@ class DdrPrefixCoordinator:
                 or proof.worker_epoch != worker_epoch or not proof.native_drained
                 or not proof.arguments_released):
             raise RuntimeError("native stop proof unavailable; pages remain quarantined")
+        if worker_epoch != self.worker_epoch:
+            return
+        self.stopped = True
         for job in tuple(self.jobs.values()):
             req = job.request
             if req.worker_epoch != worker_epoch:
@@ -375,3 +461,8 @@ class DdrPrefixCoordinator:
         for step_id in tuple(self.steps):
             if self.steps[step_id][0].cache_epoch == worker_epoch:
                 self.discard_step(step_id, stopped=True)
+        self.ready.clear()
+        self.retiring.clear()
+        self.controls.clear()
+        self.control_outbound.clear()
+        self.record("owner_drained_arguments_released")

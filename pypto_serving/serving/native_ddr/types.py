@@ -189,3 +189,33 @@ class RestoreDecision:
     kind: RestoreKind
     job_ids: tuple[str, ...] = ()
     reuse_limit: int = 0
+
+
+@dataclass(frozen=True)
+class DdrStartup:
+    """Owner-created, address-free incarnation handshake, published before readiness."""
+    worker_epoch: str
+    namespace_digest: bytes
+    layout: QwenKvLayout
+    capacity_bytes: int
+    max_entries: int
+    compatibility_json: bytes
+
+
+@dataclass(frozen=True)
+class DdrControlEvent:
+    command_id: str
+    worker_epoch: str
+    operation: str
+    entry_ref: DdrEntryRef | None = None
+    released: bool = False
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class DdrControlRequest:
+    command_id: str
+    worker_epoch: str
+    operation: str
+    job_id: str = ""
+    entry_ref: DdrEntryRef | None = None
