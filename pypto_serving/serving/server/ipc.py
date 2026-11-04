@@ -158,6 +158,8 @@ class NativeDdrCommand(msgspec.Struct, tag="native_ddr"):
     page_ids: tuple[int, ...] = ()
     diagnostic_label: str = ""
     fault: str = ""
+    delivery_sequence: int = 0
+    retire_through: int = 0
 
 
 class NativeDdrMessage(msgspec.Struct):

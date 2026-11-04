@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-export UFLOW_RUN02_ROOT=/workspace/uflow/phase-f/run02/codex-r-native-ddr-20261104
+export UFLOW_RUN02_ROOT=/workspace/uflow/phase-f/run02/codex-r-native-ddr-20261104/revision-ledger-20261104
 export PYPTO_SERVING_HOME="$UFLOW_RUN02_ROOT/src/serving"
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.0.0
 export CANN_ROOT="$ASCEND_HOME_PATH" ASCEND_OPP_PATH="$ASCEND_HOME_PATH/opp"

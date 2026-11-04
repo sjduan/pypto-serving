@@ -168,7 +168,7 @@ class WorkerProcess:
         self._native_ddr_startup = None
         self._native_ddr_stop_sent = False
         self._native_ddr_controls = {}
-        self._native_ddr_control_receipts = {}
+        self._native_ddr_control_replay = None
         self._native_ddr_drain_commands = {}
         self._decode_metrics = DecodeStepRecorder.from_env()
 
@@ -1531,7 +1531,24 @@ class WorkerProcess:
         logger.info("native_ddr_trace %s", json.dumps(item, sort_keys=True))
 
     def _emit_native_ddr(self, message):
+        if message.kind in ("transfer", "control"):
+            event = message.event if message.kind == "transfer" else message.control
+            logger.info("native_ddr_receipt %s", json.dumps({
+                "kind": message.kind, "identity": getattr(event, "job_id", getattr(event, "command_id", "")),
+                "delivery_sequence": event.delivery_sequence,
+                "status": event.status.value if message.kind == "transfer" else "control",
+                "error": event.error,
+                "transfer_replay": self._native_ddr_worker.transfer_replay.stats(),
+                "control_replay": (self._native_ddr_control_replay.stats()
+                                   if getattr(self, "_native_ddr_control_replay", None) is not None else None),
+            }, sort_keys=True))
         self.native_ddr_output_queue.put(encode_native_ddr_message(message))
+
+    def _complete_native_ddr_control(self, cmd, event):
+        from dataclasses import replace
+        event = replace(event, delivery_sequence=cmd.delivery_sequence)
+        self._native_ddr_control_replay.finish(cmd, event)
+        self._emit_native_ddr(NativeDdrMessage("control", control=event))
 
     def _finish_native_ddr_drain(self):
         module = self._native_ddr_worker
@@ -1542,8 +1559,7 @@ class WorkerProcess:
         from pypto_serving.serving.native_ddr.types import DdrControlEvent
         for command_id, cmd in tuple(self._native_ddr_drain_commands.items()):
             event = DdrControlEvent(command_id, module.worker_epoch, "drain", released=True)
-            self._emit_native_ddr(NativeDdrMessage("control", control=event))
-            self._native_ddr_control_receipts[command_id] = (cmd, event)
+            self._complete_native_ddr_control(cmd, event)
             del self._native_ddr_drain_commands[command_id]
 
     def _poll_native_ddr_controls(self):
@@ -1553,9 +1569,8 @@ class WorkerProcess:
             entry = module.entries.get(cmd.entry_ref.entry_id)
             if entry is None:
                 event = DdrControlEvent(command_id, module.worker_epoch, "evict", cmd.entry_ref, True)
-                self._emit_native_ddr(NativeDdrMessage("control", control=event))
+                self._complete_native_ddr_control(cmd, event)
                 del self._native_ddr_controls[command_id]
-                self._native_ddr_control_receipts[command_id] = (cmd, event)
 
     def _poll_native_ddr(self):
         for event in self._native_ddr_worker.poll_completed():
@@ -1575,32 +1590,34 @@ class WorkerProcess:
             event = module.submit_transfer(cmd.request)
             self._emit_native_ddr(NativeDdrMessage("transfer", event=event))
         else:
-            from pypto_serving.serving.native_ddr.types import DdrControlEvent
+            from pypto_serving.serving.native_ddr.types import DdrControlEvent, DdrControlRequest
+            from pypto_serving.serving.native_ddr.replay import ReplayError, ReplayLedger
+            cmd = DdrControlRequest(cmd.command_id, cmd.worker_epoch, cmd.operation, cmd.job_id,
+                                    cmd.entry_ref, cmd.page_ids, cmd.diagnostic_label, cmd.fault,
+                                    cmd.delivery_sequence, cmd.retire_through)
             if cmd.worker_epoch != module.worker_epoch or not cmd.command_id:
                 event = DdrControlEvent(cmd.command_id, cmd.worker_epoch, cmd.operation,
-                                        cmd.entry_ref, error="invalid control epoch/identity")
+                                        cmd.entry_ref, error="invalid control epoch/identity",
+                                        delivery_sequence=cmd.delivery_sequence)
                 self._emit_native_ddr(NativeDdrMessage("control", control=event))
                 return
-            previous = self._native_ddr_control_receipts.get(cmd.command_id)
-            if previous is not None:
-                if previous[0] != cmd:
-                    raise ValueError("native DDR control identity replay conflict")
-                self._emit_native_ddr(NativeDdrMessage("control", control=previous[1]))
-                return
-            if len(self._native_ddr_control_receipts) >= 4096 and cmd.operation != "drain":
+            if self._native_ddr_control_replay is None:
+                self._native_ddr_control_replay = ReplayLedger()
+            try:
+                receipt, fresh = self._native_ddr_control_replay.begin(cmd, cmd.command_id)
+            except ReplayError as error:
                 event = DdrControlEvent(cmd.command_id, module.worker_epoch, cmd.operation,
-                    cmd.entry_ref, error="bounded control replay budget exhausted; owner retirement required")
+                    cmd.entry_ref, error=str(error), delivery_sequence=cmd.delivery_sequence)
                 self._emit_native_ddr(NativeDdrMessage("control", control=event))
                 return
-            if cmd.command_id in self._native_ddr_controls:
-                if self._native_ddr_controls[cmd.command_id] != cmd:
-                    raise ValueError("native DDR pending control replay conflict")
+            if not fresh:
+                if receipt.response is not None:
+                    self._emit_native_ddr(NativeDdrMessage("control", control=receipt.response))
                 return
             if cmd.operation == "cancel":
                 module.cancel(cmd.job_id)
                 event = DdrControlEvent(cmd.command_id, module.worker_epoch, "cancel")
-                self._emit_native_ddr(NativeDdrMessage("control", control=event))
-                self._native_ddr_control_receipts[cmd.command_id] = (cmd, event)
+                self._complete_native_ddr_control(cmd, event)
             elif cmd.operation == "evict":
                 if cmd.entry_ref is None:
                     raise ValueError("native DDR evict requires an entry ref")
@@ -1609,7 +1626,7 @@ class WorkerProcess:
                 except ValueError as error:
                     event = DdrControlEvent(cmd.command_id, module.worker_epoch, "evict",
                                             cmd.entry_ref, error=str(error))
-                    self._emit_native_ddr(NativeDdrMessage("control", control=event))
+                    self._complete_native_ddr_control(cmd, event)
                     return
                 self._native_ddr_controls[cmd.command_id] = cmd
                 self._poll_native_ddr_controls()
@@ -1620,7 +1637,7 @@ class WorkerProcess:
                     event = DdrControlEvent(cmd.command_id, module.worker_epoch, "diagnostic", payload=payload)
                 except (ValueError, RuntimeError, OSError) as error:
                     event = DdrControlEvent(cmd.command_id, module.worker_epoch, "diagnostic", error=str(error))
-                self._emit_native_ddr(NativeDdrMessage("control", control=event))
+                self._complete_native_ddr_control(cmd, event)
             elif cmd.operation == "fault":
                 from pypto_serving.serving.native_ddr.diagnostics import arm_short_receipt
                 try:
@@ -1629,8 +1646,7 @@ class WorkerProcess:
                                             payload=json.dumps({"armed": cmd.fault}).encode())
                 except (ValueError, RuntimeError) as error:
                     event = DdrControlEvent(cmd.command_id, module.worker_epoch, "fault", error=str(error))
-                self._emit_native_ddr(NativeDdrMessage("control", control=event))
-                self._native_ddr_control_receipts[cmd.command_id] = (cmd, event)
+                self._complete_native_ddr_control(cmd, event)
             else:
                 self._native_ddr_drain_commands[cmd.command_id] = cmd
                 module.closed = True

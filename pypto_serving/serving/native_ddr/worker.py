@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from .replay import ReplayError, ReplayLedger
+
 from .types import (
     DdrEntryRef, DdrTransferEvent, DdrTransferRequest, EntryState,
     NativeDdrPrefixConfig, Operation, QwenKvLayout, TransferStatus,
@@ -92,45 +94,37 @@ class DdrPrefixWorker:
         self.entries: dict[str, _Entry] = {}
         self.pending: _Pending | None = None
         self._generation = 0
-        self._jobs: dict[str, DdrTransferRequest] = {}
-        self._terminal_events: dict[str, DdrTransferEvent] = {}
-        # Bounded incarnation-local replay ledger. Never forget a receipt and
-        # accidentally replay an old native write into a reused HBM page.
-        # Exhaustion explicitly rejects NEW jobs (normal prefill fallback);
-        # recycling this budget requires a new, genuinely drained owner.
-        self._receipt_limit = max(64, min(4096, self.capacity * 4))
+        self.transfer_replay = ReplayLedger()
         self.closed = False
         self.poisoned = False
 
     def _event(self, req, status, *, stopped=False, completed=False, size=0, error=None):
         event = DdrTransferEvent(req.job_id, req.worker_epoch, req.operation, status,
-                                 req.entry_refs, size, completed, stopped, error)
-        if stopped and self._jobs.get(req.job_id) == req:
-            self._terminal_events[req.job_id] = event
+                                 req.entry_refs, size, completed, stopped, error, req.delivery_sequence)
+        if stopped:
+            self.transfer_replay.finish(req, event, protected=self.poisoned)
         return event
 
     def submit_transfer(self, request: DdrTransferRequest) -> DdrTransferEvent:
         try:
-            previous = self._jobs.get(request.job_id)
-            if previous is not None:
-                if previous != request:
-                    return self._event(request, TransferStatus.FAILED, error="job identity replay conflict")
-                if request.job_id in self._terminal_events:
-                    return self._terminal_events[request.job_id]
-                # A duplicate pending command owns the SAME native obligation;
-                # REJECTED/stopped=True would prematurely release its source.
-                return self._event(request, TransferStatus.FAILED if self.poisoned else TransferStatus.ACCEPTED,
-                                   error="native obligation retained" if self.poisoned else None)
+            known = self.transfer_replay.records.get(request.delivery_sequence)
+            if known is not None and known.identity != request:
+                raise ReplayError("delivery identity replay conflict", stopped=False)
             request.validate(self.layout)
             if request.worker_epoch != self.worker_epoch:
                 raise ValueError("worker epoch mismatch")
             if self.namespace_digest is not None and any(
                     key.namespace_digest != self.namespace_digest for key in request.entry_keys):
                 raise ValueError("worker compatibility namespace mismatch")
+            receipt, fresh = self.transfer_replay.begin(request, request.job_id)
+            if not fresh:
+                if receipt.response is not None:
+                    return receipt.response
+                # A duplicate pending command owns the SAME native obligation.
+                return self._event(request, TransferStatus.FAILED if self.poisoned else TransferStatus.ACCEPTED,
+                                   error="native obligation retained" if self.poisoned else None)
             if self.closed or self.poisoned or self.pending is not None:
                 raise ValueError("worker closed, quarantined, busy, or duplicate job")
-            if len(self._jobs) >= self._receipt_limit:
-                raise ValueError("native DDR replay receipt budget exhausted; a drained new owner is required")
             if self.backend is None:
                 raise ValueError("native backend unavailable: M3 same-owner adapter not verified")
             ref = request.entry_refs[0]
@@ -152,10 +146,12 @@ class DdrPrefixWorker:
                 if entry.key != request.entry_keys[0]:
                     raise ValueError("LOAD key does not match resident entry")
                 entry.readers += 1
+        except ReplayError as exc:
+            return self._event(request, TransferStatus.REJECTED if exc.stopped else TransferStatus.FAILED,
+                               stopped=exc.stopped, error=str(exc))
         except (ValueError, MemoryError) as exc:
             return self._event(request, TransferStatus.REJECTED, stopped=True, error=str(exc))
         # Publish the obligation BEFORE crossing a potentially side-effectful seam.
-        self._jobs[request.job_id] = request
         pending = self.pending = _Pending(request, entry)
         if request.operation == Operation.STORE:
             entry.state = EntryState.OFFLOADING

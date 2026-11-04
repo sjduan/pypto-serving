@@ -9,7 +9,7 @@
 """Address-free, immutable Run02 host contracts. Importing this module allocates no pool."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -153,6 +153,8 @@ class DdrTransferRequest:
     page_lease_id: str
     page_ids: tuple[int, ...]
     source_step_id: int | None
+    delivery_sequence: int = 0
+    retire_through: int = field(default=0, compare=False)
 
     def validate(self, layout: QwenKvLayout):
         n = len(self.page_ids)
@@ -184,6 +186,7 @@ class DdrTransferEvent:
     native_completed: bool
     stopped: bool
     error: str | None = None
+    delivery_sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -213,6 +216,7 @@ class DdrControlEvent:
     released: bool = False
     error: str | None = None
     payload: bytes = b""
+    delivery_sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -225,3 +229,5 @@ class DdrControlRequest:
     page_ids: tuple[int, ...] = ()
     diagnostic_label: str = ""
     fault: str = ""
+    delivery_sequence: int = 0
+    retire_through: int = field(default=0, compare=False)

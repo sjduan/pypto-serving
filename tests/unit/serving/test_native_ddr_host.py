@@ -38,10 +38,17 @@ LAYOUT = QwenKvLayout(40, 16, 128, 8, 128)
 CONFIG = NativeDdrPrefixConfig(True, LAYOUT.block_bytes * 2)
 KEY = PrefixKey(b'n' * 32, b'h' * 32)
 REF = DdrEntryRef("worker1", "entry1", 1)
+_wire_sequences = {}
+
+
+@pytest.fixture(autouse=True)
+def reset_delivery_fixture():
+    _wire_sequences.clear()
 
 
 def transfer(operation=Operation.STORE, *, job="job1", page=0, ref=REF, key=KEY):
-    return DdrTransferRequest(job, "worker1", operation, (key,), (ref,), "lease1", (page,), 1)
+    sequence = _wire_sequences.setdefault(job, len(_wire_sequences) + 1)
+    return DdrTransferRequest(job, "worker1", operation, (key,), (ref,), "lease1", (page,), 1, sequence)
 
 
 class FakeHandle:
@@ -92,6 +99,7 @@ class FakeBackend:
 
 
 def worker(backend=None):
+    _wire_sequences.clear()
     backend = backend or FakeBackend()
     return DdrPrefixWorker(CONFIG, LAYOUT, "worker1", backend), backend
 
@@ -270,7 +278,7 @@ def seed_ready(coord, manager, req):
 
 def event_for(job, status=TransferStatus.SUCCEEDED, *, stopped=True, completed=True, size=20971520):
     return DdrTransferEvent(job.job_id, job.worker_epoch, job.operation, status, job.entry_refs,
-                             size, completed, stopped)
+                             size, completed, stopped, delivery_sequence=job.delivery_sequence)
 
 
 def test_two_waiters_share_one_target_and_loader_pin_survives_until_lookup():
@@ -571,10 +579,11 @@ def test_engine_enabled_snapshot_and_aux_event_hook_only_use_host_queues():
     assert core._output_queue.empty()
 
 
-def test_ready_capacity_and_replay_metadata_are_bounded_without_forgetting_jobs():
+def test_unacknowledged_receipts_are_bounded_and_cannot_forget_pending_native_writes():
+    from pypto_serving.serving.native_ddr.replay import MAX_UNACKNOWLEDGED
     module, backend = worker()
-    first = transfer()
-    for number in range(module._receipt_limit):
+    first = None
+    for number in range(MAX_UNACKNOWLEDGED):
         ref = DdrEntryRef("worker1", f"entry{number}", number + 1)
         req = transfer(job=f"receipt{number}", ref=ref)
         if number == 0:
@@ -584,10 +593,10 @@ def test_ready_capacity_and_replay_metadata_are_bounded_without_forgetting_jobs(
         module.evict(ref)
     event = module.submit_transfer(transfer(job="over-budget", ref=replace(REF, slot_generation=10000)))
     assert event.status == TransferStatus.REJECTED
-    assert "receipt budget exhausted" in event.error
-    assert len(module._jobs) == module._receipt_limit
+    assert "unacknowledged delivery window full" in event.error
+    assert len(module.transfer_replay.records) == MAX_UNACKNOWLEDGED
     assert module.submit_transfer(first).status == TransferStatus.SUCCEEDED
-    assert len(backend.submissions) == module._receipt_limit
+    assert len(backend.submissions) == MAX_UNACKNOWLEDGED
 
     module, backend = worker()
     for number in range(2):
@@ -659,7 +668,8 @@ def close_coordinator_with_host_receipts(coord):
         assert not coord.jobs and not coord.steps
     while (cmd := coord.next_control()) is not None:
         coord.on_control_event(DdrControlEvent(cmd.command_id, cmd.worker_epoch, cmd.operation,
-                                              cmd.entry_ref, cmd.operation == "evict"))
+                                              cmd.entry_ref, cmd.operation == "evict",
+                                              delivery_sequence=cmd.delivery_sequence))
     assert not coord.controls and not coord.retiring
     coord.close()
 
@@ -898,7 +908,8 @@ def test_store_waits_for_worker_eviction_release_instead_of_overselling():
     assert coord.next_transfer() is None
     cmd = coord.next_control()
     assert cmd.operation == "evict"
-    coord.on_control_event(DdrControlEvent(cmd.command_id, cmd.worker_epoch, "evict", cmd.entry_ref, True))
+    coord.on_control_event(DdrControlEvent(cmd.command_id, cmd.worker_epoch, "evict", cmd.entry_ref, True,
+                                          delivery_sequence=cmd.delivery_sequence))
     job = coord.next_transfer()
     assert job.operation == Operation.STORE
     coord.on_transfer_event(event_for(job))
@@ -925,7 +936,8 @@ def test_eviction_with_pending_load_retains_reader_until_actual_completion():
     assert terminal.status == TransferStatus.SUCCEEDED and not backend.slots
     coord.on_transfer_event(terminal)
     assert coord.retiring  # worker terminal and physical-release receipt are distinct
-    coord.on_control_event(DdrControlEvent(cmd.command_id, cmd.worker_epoch, "evict", cmd.entry_ref, True))
+    coord.on_control_event(DdrControlEvent(cmd.command_id, cmd.worker_epoch, "evict", cmd.entry_ref, True,
+                                          delivery_sequence=cmd.delivery_sequence))
     coord.resume_request(req)
     blocks = manager.get_computed_blocks(req.prompt_token_ids)
     coord.after_lookup(req)
@@ -951,7 +963,7 @@ def test_stop_proof_follows_strict_owner_close_not_module_drain(owner_error):
         close=lambda: calls.append("module_close"), entries={})
     process._native_ddr_backend = SimpleNamespace(close=lambda: calls.append("backend_close"))
     process._native_ddr_controls = {}
-    process._native_ddr_control_receipts = {}
+    process._native_ddr_control_replay = None
     process._native_ddr_drain_commands = {}
     process._native_ddr_stop_sent = False
     process.native_ddr_output_queue = queue.Queue()
@@ -1038,3 +1050,211 @@ def test_receipt_filter_exception_keeps_real_handle_obligations_until_explicit_r
     backend.completion_filter = None  # explicit host-fixture repair, not production recovery
     assert handle.result() == NativeCompletion(LAYOUT.block_bytes, True, True)
     assert backend.pending is None and backend.slots.busy is None and handle._keepalive is None
+
+
+def test_same_owner_reuses_slots_for_256_cycles_and_retires_old_load_before_backend():
+    from pypto_serving.serving.native_ddr.replay import DeliverySender, REPLAY_WINDOW
+    module, backend = worker()
+    sender = DeliverySender()
+
+    def run(req):
+        req = sender.stamp(req)
+        assert module.submit_transfer(req).status == TransferStatus.ACCEPTED
+        done = complete(module, backend)
+        assert done.status == TransferStatus.SUCCEEDED
+        sender.consume(done.delivery_sequence)
+        assert len(module.transfer_replay.records) <= REPLAY_WINDOW + 1
+        return req, done
+
+    run(transfer(job="persistent-store"))
+    old_load, _ = run(transfer(Operation.LOAD, job="persistent-load", page=7))
+    # Keep the original exact DDR entry Ready: stale rejection must be due to
+    # retirement, not absence/generation validation masking another native write.
+    for number in range(256):
+        ref = DdrEntryRef("worker1", f"cycle{number}", number + 2)
+        run(transfer(job=f"store{number}", ref=ref))
+        recent, terminal = run(transfer(Operation.LOAD, job=f"load{number}", ref=ref, page=7))
+        module.evict(ref)
+    assert REF.entry_id in module.entries and module.entries[REF.entry_id].state == EntryState.READY
+    assert module.transfer_replay.retired_through > old_load.delivery_sequence
+    calls = len(backend.submissions)
+    assert module.submit_transfer(recent) == terminal
+    stale = module.submit_transfer(old_load)
+    assert stale.status == TransferStatus.REJECTED and stale.stopped and "retired" in stale.error
+    assert len(backend.submissions) == calls == 514
+    conflict = module.submit_transfer(replace(recent, page_ids=(8,)))
+    assert conflict.status == TransferStatus.FAILED and not conflict.stopped
+    assert len(backend.slots) == 1 and not module.poisoned
+    module.close()
+
+
+@pytest.mark.parametrize("state", ["pending", "unknown", "protected", "partial", "cancelled"])
+def test_acknowledgement_never_retires_unstopped_or_quarantined_native_obligations(state):
+    from pypto_serving.serving.native_ddr.replay import DeliverySender
+    module, backend = worker()
+    sender = DeliverySender()
+    req = sender.stamp(transfer())
+    if state == "unknown":
+        backend.error = RuntimeError("unknown native submission")
+    module.submit_transfer(req)
+    if state == "protected":
+        backend.handle.error = RuntimeError("unknown result cleanup")
+        complete(module, backend)
+    if state == "partial":
+        backend.handle.outcome = NativeCompletion(262144, True, True)
+        done = complete(module, backend)
+    if state == "cancelled":
+        module.cancel(req.job_id)
+        done = complete(module, backend)
+    fresh = replace(transfer(job="next", ref=replace(REF, entry_id="next", slot_generation=2)),
+                    delivery_sequence=2, retire_through=1)
+    if state in ("partial", "cancelled"):
+        assert done.stopped
+        sender.consume(done.delivery_sequence)
+        assert module.submit_transfer(fresh).status == TransferStatus.ACCEPTED
+        complete(module, backend)
+        module.close()
+    else:
+        event = module.submit_transfer(fresh)
+        assert not event.stopped and "retained" in event.error
+        assert module.transfer_replay.acknowledged == 0
+        assert module.transfer_replay.retired_through == 0
+        assert module.pending is not None and backend.slots
+        assert len(module.transfer_replay.records) == 1
+
+
+def _control_process(module, backend):
+    import queue
+    from pypto_serving.serving.server.serving_worker import WorkerProcess
+    process = WorkerProcess.__new__(WorkerProcess)
+    process._native_ddr_worker = module
+    process._native_ddr_backend = backend
+    process._native_ddr_control_replay = None
+    process._native_ddr_controls = {}
+    process._native_ddr_drain_commands = {}
+    process.native_ddr_output_queue = queue.Queue()
+    backend.close = lambda: None
+    return process
+
+
+def test_control_receipts_continue_after_4096_and_old_evict_cannot_release_new_generation():
+    from pypto_serving.serving.native_ddr.replay import DeliverySender, REPLAY_WINDOW
+    from pypto_serving.serving.native_ddr.types import DdrControlRequest
+    module, backend = worker()
+    data_sender, sender = DeliverySender(), DeliverySender()
+    store = data_sender.stamp(transfer())
+    module.submit_transfer(store)
+    data_sender.consume(complete(module, backend).delivery_sequence)
+    process = _control_process(module, backend)
+
+    def invoke(cmd):
+        process._handle_native_ddr_command(NativeDdrCommand(**asdict(cmd)))
+        return decode_native_ddr_message(process.native_ddr_output_queue.get_nowait()).control
+
+    evict = sender.stamp(DdrControlRequest("old-evict", "worker1", "evict", entry_ref=REF))
+    sender.consume(invoke(evict).delivery_sequence)
+    new_ref = replace(REF, slot_generation=2)
+    req = data_sender.stamp(transfer(job="replacement", ref=new_ref))
+    module.submit_transfer(req)
+    data_sender.consume(complete(module, backend).delivery_sequence)
+    for number in range(5000):
+        cmd = sender.stamp(DdrControlRequest(f"cancel{number}", "worker1", "cancel", job_id="already-finished"))
+        event = invoke(cmd)
+        assert event.error is None
+        sender.consume(event.delivery_sequence)
+        assert len(process._native_ddr_control_replay.records) <= REPLAY_WINDOW + 1
+    assert process._native_ddr_control_replay.retired_through > evict.delivery_sequence
+    assert invoke(evict).error.startswith("retired")
+    assert module.entries[REF.entry_id].ref == new_ref and len(backend.slots) == 1
+    assert invoke(cmd) == event
+    assert "conflict" in invoke(replace(cmd, job_id="different")).error
+    assert module.entries[REF.entry_id].state == EntryState.READY
+    drain = sender.stamp(DdrControlRequest("drain", "worker1", "drain"))
+    assert invoke(drain).released and not backend.slots and not module.entries
+    assert not module.poisoned
+
+
+def test_pending_control_eviction_blocks_ack_frontier_while_later_cancel_completes():
+    from pypto_serving.serving.native_ddr.replay import DeliverySender
+    from pypto_serving.serving.native_ddr.types import DdrControlRequest
+    module, backend = worker()
+    data_sender, sender = DeliverySender(), DeliverySender()
+    store = data_sender.stamp(transfer())
+    module.submit_transfer(store)
+    data_sender.consume(complete(module, backend).delivery_sequence)
+    load = data_sender.stamp(transfer(Operation.LOAD, job="pending-load", page=3))
+    module.submit_transfer(load)
+    process = _control_process(module, backend)
+    evict = sender.stamp(DdrControlRequest("pending-evict", "worker1", "evict", entry_ref=REF))
+    process._handle_native_ddr_command(NativeDdrCommand(**asdict(evict)))
+    process._handle_native_ddr_command(NativeDdrCommand(**asdict(evict)))
+    assert process.native_ddr_output_queue.empty() and len(backend.slots) == 1
+    cancel = sender.stamp(DdrControlRequest("cancel", "worker1", "cancel", job_id=load.job_id))
+    process._handle_native_ddr_command(NativeDdrCommand(**asdict(cancel)))
+    response = decode_native_ddr_message(process.native_ddr_output_queue.get_nowait()).control
+    sender.consume(response.delivery_sequence)
+    assert sender.acknowledged == 0  # completion 2 cannot cross pending command 1
+    forged = DdrControlRequest("forged", "worker1", "cancel", delivery_sequence=3, retire_through=2)
+    process._handle_native_ddr_command(NativeDdrCommand(**asdict(forged)))
+    error = decode_native_ddr_message(process.native_ddr_output_queue.get_nowait()).control
+    assert "retained" in error.error and module.pending is not None and backend.slots
+    backend.handle.ready = True
+    process._poll_native_ddr()
+    events = [decode_native_ddr_message(process.native_ddr_output_queue.get_nowait()) for _ in range(2)]
+    assert events[0].event.status == TransferStatus.CANCELLED and events[0].event.stopped
+    assert events[1].control.released
+    sender.consume(events[1].control.delivery_sequence)
+    assert sender.acknowledged == 2 and not backend.slots and not module.pending
+    module.close()
+
+
+def test_load_priority_stamps_actual_delivery_after_a_later_created_job_passes_store():
+    coord, manager = coordinator()
+    req = request("cold-store")
+    req.prompt_token_ids = [99] + req.prompt_token_ids[1:]
+    page = manager.allocate_blocks(1)[0]
+    hashes = manager.compute_block_hashes(req.prompt_token_ids)
+    manager.cache_block_ids([page.block_id], hashes, 0, 1)
+    snapshot = (ScheduledPrefix(req.request_id, (page.block_id,), tuple(hashes), 129, 0, 128),)
+    coord.retain_step(1, snapshot)
+    coord.on_confirmed_step(1, snapshot, {req.request_id: 128})
+    store_id = coord.outbound[0]
+    ready_request = request("later-load")
+    seed_ready(coord, manager, ready_request)
+    coord.lookup_after_hbm(ready_request, [], 128)
+    load = coord.next_transfer()
+    assert load.operation == Operation.LOAD and load.delivery_sequence == 1
+    assert int(load.job_id.rsplit(':', 1)[1]) > int(store_id.rsplit(':', 1)[1])
+    coord.on_transfer_event(event_for(load))
+    coord.cancel_request(*coord._request_key(ready_request))
+    store = coord.next_transfer()
+    assert store.job_id == store_id and store.delivery_sequence == 2 and store.retire_through == 1
+    coord.on_transfer_event(event_for(store))
+    manager.release_blocks_by_ids([page.block_id])
+    close_coordinator_with_host_receipts(coord)
+
+
+def test_sender_throttles_outstanding_commands_and_cannot_ack_through_gaps():
+    from pypto_serving.serving.native_ddr.replay import DeliverySender, MAX_UNACKNOWLEDGED
+    from pypto_serving.serving.native_ddr.types import DdrControlRequest
+    sender = DeliverySender()
+    for number in range(MAX_UNACKNOWLEDGED):
+        sender.stamp(DdrControlRequest(str(number), "worker1", "cancel"))
+    assert not sender.available
+    for number in range(2, MAX_UNACKNOWLEDGED + 1):
+        sender.consume(number)
+    assert sender.acknowledged == 0 and not sender.available
+    sender.consume(1)
+    assert sender.acknowledged == MAX_UNACKNOWLEDGED and sender.available
+    assert not sender._completed
+
+
+def test_conflicting_invalid_payload_on_pending_sequence_never_claims_stopped():
+    module, backend = worker()
+    req = transfer()
+    module.submit_transfer(req)
+    conflict = module.submit_transfer(replace(req, page_ids=(1000,)))
+    assert conflict.status == TransferStatus.FAILED and not conflict.stopped
+    assert module.pending is not None and len(backend.submissions) == 1
+    complete(module, backend)
+    module.close()

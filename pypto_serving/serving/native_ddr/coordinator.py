@@ -22,6 +22,7 @@ from .types import (
     DdrControlRequest, DdrEntryRef, DdrTransferEvent, DdrTransferRequest, KvPageLease, LoadState,
     Operation, PrefixKey, RestoreDecision, RestoreKind, TransferStatus,
 )
+from .replay import DeliverySender
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,8 @@ class DdrPrefixCoordinator:
         self.poisoned = False
         self.controls = {}
         self.control_outbound = deque()
+        self.transfer_delivery = DeliverySender()
+        self.control_delivery = DeliverySender()
         self.retiring = {}
         self.stopped = False
         self.drained = False
@@ -99,9 +102,13 @@ class DdrPrefixCoordinator:
         return command
 
     def next_control(self):
+        if not self.control_delivery.available:
+            return None
         while self.control_outbound:
             command = self.controls.get(self.control_outbound.popleft())
             if command is not None:
+                command = self.control_delivery.stamp(command)
+                self.controls[command.command_id] = command
                 return command
         return None
 
@@ -118,10 +125,14 @@ class DdrPrefixCoordinator:
         command = self.controls.get(event.command_id)
         if command is None:
             return
+        if event.delivery_sequence != command.delivery_sequence or command.delivery_sequence <= 0:
+            self.poisoned = True
+            raise RuntimeError("native DDR control delivery identity mismatch")
         if command.operation in ("diagnostic", "fault"):
             if event.worker_epoch != command.worker_epoch or event.operation != command.operation:
                 raise RuntimeError("diagnostic receipt identity mismatch")
             self.diagnostic_results[event.command_id] = (event.error, event.payload)
+            self.control_delivery.consume(event.delivery_sequence)
             del self.controls[event.command_id]
             return
         if ((event.worker_epoch, event.operation, event.entry_ref) !=
@@ -135,6 +146,7 @@ class DdrPrefixCoordinator:
         if command.operation == "drain":
             self.drained = True
             self.record("module_drained_before_executor_close")
+        self.control_delivery.consume(event.delivery_sequence)
         del self.controls[event.command_id]
 
     @staticmethod
@@ -214,7 +226,7 @@ class DdrPrefixCoordinator:
         return RestoreDecision(RestoreKind.WAIT, tuple(sorted(job_ids)))
 
     def next_transfer(self) -> DdrTransferRequest | None:
-        if self.active_job or self.poisoned or self.closed:
+        if self.active_job or self.poisoned or self.closed or not self.transfer_delivery.available:
             return None
         while self.outbound:
             job_id = self.outbound.popleft()
@@ -226,10 +238,13 @@ class DdrPrefixCoordinator:
                 self.outbound.append(job_id)
                 return None
             job.submitted = True
+            # LOAD priority can reorder creation IDs. Stamp only the actual
+            # outgoing command and retain this immutable stamp for any retry.
+            job.request = self.transfer_delivery.stamp(job.request)
             job.state = LoadState.LOADING
             self.active_job = job_id
             self.record("transfer_dispatched", job=job_id, operation=job.request.operation.value,
-                        pages=list(job.request.page_ids))
+                        pages=list(job.request.page_ids), delivery_sequence=job.request.delivery_sequence)
             return job.request
         return None
 
@@ -305,8 +320,8 @@ class DdrPrefixCoordinator:
             return
         if job.state in (LoadState.COMMITTED, LoadState.DISCARD_PENDING):
             return  # terminal replay while waiters still own the loader pin
-        if (event.worker_epoch, event.operation, event.entry_refs) != (
-                req.worker_epoch, req.operation, req.entry_refs):
+        if (event.worker_epoch, event.operation, event.entry_refs, event.delivery_sequence) != (
+                req.worker_epoch, req.operation, req.entry_refs, req.delivery_sequence):
             self.poisoned = True
             job.state = LoadState.QUARANTINED
             return
@@ -320,6 +335,7 @@ class DdrPrefixCoordinator:
             job.state = LoadState.QUARANTINED
             self.poisoned = True
             return
+        self.transfer_delivery.consume(event.delivery_sequence)
         success = (event.status == TransferStatus.SUCCEEDED and event.native_completed
                    and event.transferred_bytes == 20971520 and not job.discard)
         key = req.entry_keys[0]
@@ -478,7 +494,7 @@ class DdrPrefixCoordinator:
             if req.worker_epoch != worker_epoch:
                 continue
             self.on_transfer_event(DdrTransferEvent(req.job_id, req.worker_epoch, req.operation,
-                TransferStatus.CANCELLED, req.entry_refs, 0, False, True, "owner stopped"))
+                TransferStatus.CANCELLED, req.entry_refs, 0, False, True, "owner stopped", req.delivery_sequence))
         for step_id in tuple(self.steps):
             if self.steps[step_id][0].cache_epoch == worker_epoch:
                 self.discard_step(step_id, stopped=True)

@@ -1019,7 +1019,8 @@ class ReplicaEngineCore:
             self._input_queue.put(encode_command(NativeDdrCommand(
                 operation=command.operation, command_id=command.command_id, worker_epoch=command.worker_epoch,
                 job_id=command.job_id, entry_ref=command.entry_ref, page_ids=command.page_ids,
-                diagnostic_label=command.diagnostic_label, fault=command.fault)))
+                diagnostic_label=command.diagnostic_label, fault=command.fault,
+                delivery_sequence=command.delivery_sequence, retire_through=command.retire_through)))
         request = native_ddr.next_transfer()
         if request is not None:
             self._input_queue.put(encode_command(NativeDdrCommand(operation="submit", request=request)))

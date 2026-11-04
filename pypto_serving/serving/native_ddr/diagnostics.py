@@ -35,7 +35,8 @@ def inspect_idle_pages(backend, module, command):
             or backend.worker._active_dispatch_handles or module.poisoned):
         raise RuntimeError("diagnostics require an already idle native owner")
     layout = backend.layout
-    result = {"pages": [], "scope": "static public copy_from readback; no target writes"}
+    result = {"pages": [], "scope": "static public copy_from readback; no target writes",
+              "transfer_replay": module.transfer_replay.stats()}
     for page in command.page_ids:
         compact = torch.empty((40, 2, 128, 8, 128), dtype=torch.bfloat16)
         for layer in range(40):
