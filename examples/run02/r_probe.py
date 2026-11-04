@@ -472,8 +472,10 @@ async def matrix(engine, core, collect, collect_trace, args, report, cold, warm)
         await idle()
         claim_free()
         release(sorted(held)[:1])
+        headroom_sequence = coord._trace_sequence
         headroom_task = asyncio.create_task(collect("headroom-safe-cold-fallback", cancel_prompt))
         await wait_for(lambda: any(e["event"] == "restore_reservation_no_headroom" and e["free_pages"] == 1
+                                  and e["sequence"] > headroom_sequence
                                   for e in coord.trace))
         release(sorted(held)[:3])
         headroom_result = await headroom_task
