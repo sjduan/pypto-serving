@@ -10,6 +10,7 @@
 import hashlib
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -38,7 +39,7 @@ def record(phase, batch, logits, sampled):
             "top_ids": top_ids.tolist(), "top_values": top_values.tolist(),
             "top_margin": float(top_values[0] - top_values[1]),
             "input_ids": batch.token_ids.tolist(),
-            "page_ids": [a.page_ids for a in batch.kv_allocations]}
+            "page_ids": [a.page_ids for a in batch.kv_allocations] or batch.block_ids}
     root = Path(os.environ["UFLOW_M2_ATTEMPT_ROOT"]) / "results"
     with (root / "precision-trace.jsonl").open("a") as output:
         output.write(json.dumps(data) + "\n")
@@ -57,12 +58,23 @@ def traced_decode(self, model, batch):
             self._shared_l3_worker().copy_from(values.data_ptr(), device.data_ptr,
                                               values.numel() * values.element_size())
         record("decode", batch, values, result.sampled_token_ids)
+        if os.environ.get("UFLOW_M2_REPLAY_INPUTS") == "1" and int(batch.seq_lens[0]) == 15:
+            repeated = _ORIGINAL_DECODE(self, model, batch)
+            self._shared_l3_worker().copy_from(values.data_ptr(), device.data_ptr,
+                                              values.numel() * values.element_size())
+            record("decode-replay", batch, values, repeated.sampled_token_ids)
     return result
 
 
 def traced_prefill(self, model, batch):
     result = _ORIGINAL_PREFILL(self, model, batch)
     record("prefill", batch, result.logits, result.sampled_token_ids)
+    if (os.environ.get("UFLOW_M2_REPLAY_INPUTS") == "1" and len(batch.request_ids) == 1
+            and batch.request_ids[0] in _TRACE_IDS):
+        # Freeze the original observation before replay overwrites the host output slot.
+        result = replace(result, logits=result.logits.clone())
+        repeated = _ORIGINAL_PREFILL(self, model, batch)
+        record("prefill-replay", batch, repeated.logits, repeated.sampled_token_ids)
     return result
 
 
