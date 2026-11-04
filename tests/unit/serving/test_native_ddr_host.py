@@ -1081,9 +1081,19 @@ def test_same_owner_reuses_slots_for_256_cycles_and_retires_old_load_before_back
     assert module.submit_transfer(recent) == terminal
     stale = module.submit_transfer(old_load)
     assert stale.status == TransferStatus.REJECTED and stale.stopped and "retired" in stale.error
+    for old in (
+            replace(old_load, worker_epoch='previous-owner',
+                    entry_refs=(replace(REF, worker_epoch='previous-owner'),)),
+            replace(old_load, entry_refs=(replace(REF, slot_generation=9999),))):
+        event = module.submit_transfer(old)
+        assert event.status == TransferStatus.REJECTED and event.stopped
     assert len(backend.submissions) == calls == 514
     conflict = module.submit_transfer(replace(recent, page_ids=(8,)))
     assert conflict.status == TransferStatus.FAILED and not conflict.stopped
+    reused_identity = module.submit_transfer(replace(recent, delivery_sequence=sender.sent + 1,
+                                                     retire_through=sender.acknowledged))
+    assert not reused_identity.stopped and 'logical identity reused' in reused_identity.error
+    assert len(backend.submissions) == calls
     assert len(backend.slots) == 1 and not module.poisoned
     module.close()
 
@@ -1169,6 +1179,7 @@ def test_control_receipts_continue_after_4096_and_old_evict_cannot_release_new_g
         assert len(process._native_ddr_control_replay.records) <= REPLAY_WINDOW + 1
     assert process._native_ddr_control_replay.retired_through > evict.delivery_sequence
     assert invoke(evict).error.startswith("retired")
+    assert 'epoch' in invoke(replace(evict, worker_epoch='previous-owner')).error
     assert module.entries[REF.entry_id].ref == new_ref and len(backend.slots) == 1
     assert invoke(cmd) == event
     assert "conflict" in invoke(replace(cmd, job_id="different")).error
