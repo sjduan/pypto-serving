@@ -37,10 +37,13 @@ def record():
     }
 
 
-def test_independent_normal_outputs_can_differ(validate):
+@pytest.mark.parametrize("sequence_type", [list, tuple])
+def test_independent_normal_outputs_can_differ(validate, sequence_type):
     first = record()
     second = deepcopy(first)
     second["outputs"][1].update(token_id=12, text="AC", text_delta="C", token_ids=[10, 12])
+    first["outputs"][1]["token_ids"] = sequence_type(first["outputs"][1]["token_ids"])
+    second["outputs"][1]["token_ids"] = sequence_type(second["outputs"][1]["token_ids"])
     assert validate(first) == [10, 11]
     assert validate(second) == [10, 12]
 

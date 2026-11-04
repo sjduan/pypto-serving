@@ -90,13 +90,13 @@ def validate_output(record):
     if final["completion_tokens"] != len(final["token_ids"]):
         raise AssertionError(f"Output token count mismatch: {record['name']}")
     streamed_ids = [output["token_id"] for output in record["outputs"] if output["token_id"] is not None]
-    if streamed_ids != final["token_ids"]:
+    if streamed_ids != list(final["token_ids"]):
         raise AssertionError(f"Stream/final token data mismatch: {record['name']}")
     if "".join(output["text_delta"] for output in record["outputs"]) != final["text"]:
         raise AssertionError(f"Stream/final text data mismatch: {record['name']}")
     if any(output["prompt_tokens"] != len(record["prompt_token_ids"]) for output in record["outputs"]):
         raise AssertionError(f"Prompt token count changed: {record['name']}")
-    return final["token_ids"]
+    return list(final["token_ids"])
 
 
 async def exercise(args, root, result, sock):
