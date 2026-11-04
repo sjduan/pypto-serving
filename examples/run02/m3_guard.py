@@ -16,20 +16,54 @@ from pathlib import Path
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
 
-from m2_guard import children, descendants, snapshot
+from m2_guard import children, descendants, port_rows
+from worker_probe import selected_chip_status
+
+
+def snapshot(root, tag, device):
+    text = subprocess.check_output(["npu-smi", "info"], text=True, timeout=15)
+    (root / "logs" / f"m3-{tag}-npu.txt").write_text(text)
+    target = os.stat(f"/dev/davinci{device}").st_rdev
+    users, denied = [], []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdecimal():
+            continue
+        try:
+            fds = list((proc / "fd").iterdir())
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            denied.append(int(proc.name))
+            continue
+        for fd in fds:
+            try:
+                info = fd.stat()
+                if stat.S_ISCHR(info.st_mode) and info.st_rdev == target:
+                    users.append({"pid": int(proc.name), "stat": (proc / "stat").read_text()})
+                    break
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+            except PermissionError:
+                denied.append(int(proc.name))
+    return {"status": selected_chip_status(text, device), "npu": text,
+            "fds": {"users": users, "denied": sorted(set(denied))}, "port18892": port_rows()}
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", choices=["fixture", "production"], required=True)
     parser.add_argument("--attempt", required=True)
+    parser.add_argument("--device", type=int, default=0)
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.attempt):
         raise ValueError("invalid attempt")
+    if not 0 <= args.device < 16:
+        raise ValueError("invalid physical device")
     root = Path(os.environ["UFLOW_RUN02_ROOT"])
     attempt = root / "attempts" / args.attempt
     attempt.mkdir(parents=True, exist_ok=False)
@@ -42,10 +76,12 @@ def main():
               "scope": "parent owns advisory Run02 lock and reserved18892; no global allocator",
               "device_reset": False, "deadline_s": 1800, "signals": []}
     try:
-        lockpath = Path("/workspace/uflow/locks/run02-npu-0.lock")
+        lockpath = Path(f"/workspace/uflow/locks/run02-npu-{args.device}.lock")
         with lockpath.open("a+") as lock, socket.socket() as sock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            report["before"] = snapshot(attempt, "before")
+            report["before"] = snapshot(attempt, "before", args.device)
+            report["physical_device"] = args.device
+            report["lockpath"] = str(lockpath)
             before = report["before"]
             status = before["status"]
             headroom = 40000 if args.case == "production" else 4096
@@ -57,7 +93,7 @@ def main():
             sock.bind(("127.0.0.1", 18892))
             output = attempt / "results/transfer.json"
             command = [sys.executable, "-u", "examples/run02/m3_transfer.py",
-                       "--case", args.case, "--output", str(output)]
+                       "--case", args.case, "--output", str(output), "--device", str(args.device)]
             report["command"] = command
             logpath = attempt / "logs/transfer.log"
             with logpath.open("w") as log:
@@ -113,7 +149,7 @@ def main():
             report["task_sockets"] = [l for l in Path("/proc/net/unix").read_text().splitlines() if str(root) in l]
             result = json.loads(output.read_text()) if output.exists() else {}
             report["driver_passed"] = result.get("passed", False)
-        report["after"] = snapshot(attempt, "after")
+        report["after"] = snapshot(attempt, "after", args.device)
         after = report["after"]
         with lockpath.open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

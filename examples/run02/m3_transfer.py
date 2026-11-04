@@ -104,10 +104,10 @@ def settle(module, backend, trace):
     raise TimeoutError("M3 transfer did not settle")
 
 
-def fixture(output):
+def fixture(output, device=0):
     trace, report = [], {"case": "fixture", "passed": False, "pid": os.getpid()}
     compiler = KernelCompiler(run_config=build_pypto_run_config(
-        platform="a2a3", device_ids=(0,), pypto_build_dir=str(ROOT / "build/fixture")))
+        platform="a2a3", device_ids=(device,), pypto_build_dir=str(ROOT / "build/fixture")))
     kernel_dir = _find_pypto_lib_qwen14b_dir()
     qwen = [
         compiler.compile("prefill_fwd", _load_pypto_lib_qwen14b_module("prefill_fwd", kernel_dir).qwen3_prefill_host),
@@ -117,7 +117,7 @@ def fixture(output):
     copies = compile_programs(compiler)
     slots = PreforkDdrSlots(2)
     # Program-only fixture: real production Qwen compiled programs, same runner startup, no fake execution.
-    runner = Qwen314BModelRunner(compiled=None)
+    runner = Qwen314BModelRunner(compiled=None, device_id=device)
     runner._compiled = SimpleNamespace(prefill=qwen[0], decode=qwen[1], topk_select=qwen[2],
                                        native_ddr_programs=copies, native_ddr_slots=slots)
     try:
@@ -287,7 +287,7 @@ def fixture(output):
 
 
 
-def production(output):
+def production(output, device=0):
     """Complete one real40-layer prefix, then pack and restore one full block on that exact owner."""
     from pypto_serving.config.types import ModelRecord
     from pypto_serving.model.model_loader import ModelLoader
@@ -302,7 +302,7 @@ def production(output):
     model = loaded.runtime_model
     record = ModelRecord(config=loaded.config, runtime=runtime, tokenizer=loaded.tokenizer,
                          layer_specs=loaded.layer_specs, runtime_model=model)
-    executor = Qwen314BPyptoExecutor(platform="a2a3", device_ids=(0,), native_ddr_probe_slots=1,
+    executor = Qwen314BPyptoExecutor(platform="a2a3", device_ids=(device,), native_ddr_probe_slots=1,
                                     pypto_build_dir=str(ROOT / "build/production"))
     backend = module = None
     try:
@@ -380,6 +380,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", choices=["fixture", "production"], default="fixture")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--device", type=int, default=0)
     args = parser.parse_args()
     fn = fixture if args.case == "fixture" else production
-    print(json.dumps({"passed": fn(args.output)["passed"], "output": str(args.output)}))
+    print(json.dumps({"passed": fn(args.output, args.device)["passed"], "output": str(args.output)}))
