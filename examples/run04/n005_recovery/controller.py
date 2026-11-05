@@ -44,6 +44,8 @@ def run(root, shared, expected_manifest_sha, expected_driver_sha, action):
     from host_guard import inventory
     from pypto_serving.serving.native_ddr.managed_process import descendants
     from uflow.managed_pool import _exchange
+    host_terminal = action == 'finish-host-unmap'
+    expected_children = {1146315: CHILDREN[1146315]} if host_terminal else CHILDREN
     root.mkdir()
     for name in ('logs', 'inventories', 'catalog'):
         (root / name).mkdir()
@@ -59,9 +61,13 @@ def run(root, shared, expected_manifest_sha, expected_driver_sha, action):
         source_hashes[str(SOURCE / name)] = expected
     assert subprocess.check_output(['git', '-C', '/workspace/pypto', 'rev-parse', 'HEAD'], text=True).strip() == '8007f1146a800d679301c5ea14bb644b863da6bf'
     assert subprocess.check_output(['git', '-C', '/workspace/pypto/runtime', 'rev-parse', 'HEAD'], text=True).strip() == '508becb93e182a3035a14e3f9226929dbe994346'
-    assert driver.birth(PID) == BIRTH and driver.tracer(PID) == 0 and descendants(PID) == CHILDREN
+    assert driver.birth(PID) == BIRTH and driver.tracer(PID) == 0 and descendants(PID) == expected_children
+    if host_terminal:
+        assert driver.birth(1146316) != CHILDREN[1146316]
+        device_proof = json.loads((BASE / 'f-n005-recovery-r003/device-close-c001/device-result.json').read_text())
+        assert device_proof['normal_Worker_close'] and device_proof['existing_original_chip_gone']
     assert {p: driver.birth(p) for p in OWNERS} == OWNERS
-    for pid in (PID, *CHILDREN):
+    for pid in (PID, *expected_children):
         info = inventory(pid)
         assert info['exe_sha256'] == '1195c76f45c7cf16bf776a572cc85e074669c6f1a17d80d83fa8b7a7e3f80a87'
         driver.save(root / f'process-{pid}.json', info)
@@ -94,8 +100,11 @@ def run(root, shared, expected_manifest_sha, expected_driver_sha, action):
     assert (pool['canonical']['dev'], pool['canonical']['inode'], pool['canonical']['nbytes']) == (25, 842044, 134217728)
     assert len(pool['clients']) == 1 and pool['clients'][0]['state'] == 'Mapped'
     assert pool['clients'][0]['client_session'] == CLIENT
-    assert len(pool['clients'][0]['children']) == 1
-    assert pool['clients'][0]['children'][0]['birth']['pid'] == 1146316
+    if host_terminal:
+        assert not pool['clients'][0]['children']
+    else:
+        assert len(pool['clients'][0]['children']) == 1
+        assert pool['clients'][0]['children'][0]['birth']['pid'] == 1146316
     leases = pool['ranges']['leases']
     assert len(leases) == 1
     assert {k: leases[0][k] for k in ('lease_id', 'lease_generation', 'block_id', 'offset', 'nbytes', 'state', 'client_session')} == {
@@ -107,15 +116,47 @@ def run(root, shared, expected_manifest_sha, expected_driver_sha, action):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         driver.save(root / 'cleanup-mutex.json', {'pid': os.getpid(), 'new_card_reservation': False,
             'scope': 'single cleaner for existing original n005 only; no port or run02 card lock acquired'})
-        driver.save(root / 'config.json', {'pid': PID, 'birth': BIRTH, 'children': CHILDREN,
+        driver.save(root / 'config.json', {'pid': PID, 'birth': BIRTH, 'children': expected_children,
             'action': action, 'pool_id': POOL, 'client_id': CLIENT, 'lease_id': LEASE, 'source_hashes': source_hashes,
             'target_source': str(SOURCE / 'examples/run04/pool_native_probe.py'),
-            'previous_payload': str(BASE / 'f-n005-recovery-r002/shared/payload.py'),
-            'previous_root': str(BASE / 'f-n005-recovery-r002/diagnostic-c001'),
-            'previous_payload_sha256': '260ed754da25d02d70008cbc527ad941c296b6dfc1efd9daf4e932e97eec1518'})
+            'expected_writer': {k: leases[0][k] for k in ('lease_id', 'block_id', 'generation', 'lease_generation', 'offset', 'nbytes')},
+            'unregister_operation': 'n005-terminal-r001-unregister', 'unmap_operation': 'n005-terminal-r001-unmap',
+            'terminal_helper_sha256': sha(shared / 'terminal_unmap.py') if host_terminal else None,
+            'previous_payload': str(BASE / ('f-n005-recovery-r003/shared/payload.py' if host_terminal else 'f-n005-recovery-r002/shared/payload.py')),
+            'previous_root': str(BASE / ('f-n005-recovery-r003/device-close-c001' if host_terminal else 'f-n005-recovery-r002/diagnostic-c001')),
+            'previous_payload_sha256': 'ae311ba21e00c5b9fefb6659b6842d81fce20e5afe9b03b5a1fb348db0579266' if host_terminal
+                else '260ed754da25d02d70008cbc527ad941c296b6dfc1efd9daf4e932e97eec1518'})
         assert driver.install(root, shared), 'install failed; original objects/PID retained'
         assert driver.birth(PID) == BIRTH and driver.tracer(PID) == 0
         os.kill(PID, signal.SIGUSR1)  # The newly installed action is diagnostic only.
+        if host_terminal:
+            import time
+            deadline = time.monotonic() + 45
+            while not (root / 'host-unmap-success.json').exists():
+                assert driver.birth(PID) == BIRTH, 'original peer exited before its terminal receipt'
+                assert not (root / 'diagnostic-failed-1.json').exists(), 'terminal host cleanup failed; original context retained'
+                assert time.monotonic() < deadline
+                time.sleep(.1)
+            receipt = json.loads((root / 'host-unmap-success.json').read_text())
+            assert receipt['ACK']['unknown_content_invalid_not_committed'] is True
+            assert next(p for p in receipt['after_snapshot']['pools'] if p['pool_id'] == service.expected['pool_id']) == service.expected
+            deadline = time.monotonic() + 20
+            while driver.birth(PID) == BIRTH:
+                assert time.monotonic() < deadline, 'original parent not yet exited; retain pool until examined'
+                time.sleep(.1)
+            assert all(driver.birth(p) != b for p, b in CHILDREN.items())
+            # The existing capability is read only by this controller, after
+            # the original peer's real unmap/ACK/normal exit. Never return it.
+            service.state_root = state_root
+            service.normal = {k: pool[k] for k in manifest_descriptor_fields()}
+            service._admin = (state_root / 'admin.token').read_text()
+            released = service.destroy('after-n005-terminal-destroy')
+            driver.save(root / 'host-terminal-result.json', {'passed': True, 'original_parent_helper_chip_births_gone': True,
+                'Unknown_writer_Invalid_not_Committed': True, 'normal_original_client_unmap_ACK': True,
+                'real_new_pool_destroy': released, 'original_Unknown_charge_bytes_retained': 134217728,
+                'A_B_new_device_work_hold': True, 'new_Worker_init_native_submit_card_reservations': 0})
+            print('n005 original SDK terminal Invalid/unmap + actual UF destroy passed; old128MiB retained; A/B hold stays')
+            return
         if action == 'close-existing-device':
             import time
             deadline = time.monotonic() + 80
@@ -145,12 +186,17 @@ def run(root, shared, expected_manifest_sha, expected_driver_sha, action):
             'owner': value['owner'], 'active_handles': value['active_dispatch_handles'], 'accepted': value['accepted_native_handles']}))
 
 
+def manifest_descriptor_fields():
+    from uflow.managed_pool import POOL_FIELDS
+    return POOL_FIELDS
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--shared', type=Path, required=True)
     parser.add_argument('--manifest-sha', required=True)
     parser.add_argument('--driver-sha', required=True)
-    parser.add_argument('--action', choices=['diagnose', 'close-existing-device'], default='diagnose')
+    parser.add_argument('--action', choices=['diagnose', 'close-existing-device', 'finish-host-unmap'], default='diagnose')
     args = parser.parse_args()
     run(args.root, args.shared, args.manifest_sha, args.driver_sha, args.action)

@@ -205,3 +205,86 @@ def close_device(ctx, cfg, save):
     save('device-stage-complete.json', {'normal_Worker_close': True, 'original_mapping_child_detached': True,
         'original_writer_unknown_retained': True, 'unmap_ACK_done': False, 'pool_destroyed': False,
         'scope': 'existing device resource released; further host terminal-unmap still required'})
+
+
+def finish_host_unmap(ctx, cfg, save, previous_namespace):
+    """After actual device close, invalidate failed content via original SDK's existing terminal protocol."""
+    import importlib.util
+    import os
+    from types import SimpleNamespace
+    from pypto_serving.serving.native_ddr.cooperative_close import physical_holders
+    from pypto_serving.serving.native_ddr.managed_process import process_birth, descendants, stop_resource_trackers
+    assert ctx['worker']._close_complete and not ctx['worker']._service_tokens
+    assert process_birth(1146316) != 484537554
+    assert descendants(cfg['pid']) == {1146315: 484537553}
+    assert not ctx['slots'].child_registrations and not ctx['access'].children and not ctx['client']._children
+    helper = Path(__file__).with_name('terminal_unmap.py')
+    assert hashlib.sha256(helper.read_bytes()).hexdigest() == cfg['terminal_helper_sha256']
+    spec = importlib.util.spec_from_file_location('uflow_terminal_unmap_task', helper)
+    terminal = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(terminal)
+    failure = {'ambiguous': serial(ctx['backend'].ambiguous), 'pending_request': serial(ctx['module'].pending.request),
+        'entry_state': ctx['module'].pending.entry.state.value, 'module_poisoned': ctx['module'].poisoned,
+        'access_unknown': serial(ctx['access'].unknown), 'access_leases': serial(ctx['access'].leases),
+        'port_leases': serial(ctx['access'].port._leases), 'SDK_lease_states': dict(ctx['client']._leases)}
+    save('terminal-failure-preserved.json', failure)
+    ctx['terminal_state'] = {}
+
+    def release_exports():
+        # Remain explicitly failed/ambiguous. Retire only physical aliases
+        # after actual owner close, not a business lease or an Unknown flag.
+        ctx['backend'].ambiguous = {'terminal_stopped_failure': failure['ambiguous'], 'native_owner_closed': True}
+        for backing in ctx['slots'].leases.values():
+            backing.tensor = None
+        ctx['slots'].pool_tensor = ctx['slots'].page_ids = None
+        contexts, namespace, seen = [ctx], previous_namespace, set()
+        while namespace is not None:
+            assert id(namespace) not in seen and len(seen) < 8
+            seen.add(id(namespace))
+            prior = namespace['_ctx']
+            assert prior['original'] is ctx['original'] and not prior['busy']
+            contexts.append(prior)
+            namespace = namespace.get('_previous_namespace')
+        active = set()
+        for frame in sys._current_frames().values():
+            while frame is not None:
+                active.add(id(frame))
+                frame = frame.f_back
+        frames = {id(f): f for context in contexts for f in context['frames']}
+        frames.update({id(f): f for f in ctx['original'].frames})
+        for frame in frames.values():
+            assert id(frame) not in active and frame.f_code.co_filename == cfg['target_source']
+            frame.clear()
+            frame.f_locals.clear()  # Retained frame objects must not keep a materialized local dict's aliases.
+        for context in contexts:
+            context['frames'] = []
+        ctx['original'].frames = []
+        ctx['original'].error.__traceback__ = None
+        save('terminal-physical-exports-retired.json', {'cleared_inactive_frame_count': len(frames),
+            'access_unknown_retained': bool(ctx['access'].unknown), 'logical_slot_leases_retained': len(ctx['slots'].leases),
+            'logical_busy_retained': ctx['slots'].busy is not None, 'business_ambiguous_retained': ctx['backend'].ambiguous is not None,
+            'module_poisoned_retained': ctx['module'].poisoned})
+
+    def prove_unmapped():
+        proof = physical_holders(os.getpid(), ctx['access'].identity)
+        assert ctx['client'].view.closed and not proof['maps'] and not proof['fds']
+        assert process_birth(1146316) != 484537554
+        for pid in descendants(cfg['pid']):
+            child = physical_holders(pid, ctx['access'].identity)
+            assert not child['maps'] and not child['fds']
+        for dev, inode in ctx['slots'].control_resources:
+            control = physical_holders(os.getpid(), SimpleNamespace(device=dev, inode=inode))
+            assert not control['maps'] and not control['fds'], 'control tensor alias still exists before tracker stop'
+        return proof
+
+    def stop_helpers():
+        assert process_birth(1146315) == 484537553
+        stop_resource_trackers(ctx['slots'].child_helpers)
+        assert process_birth(1146315) != 484537553 and not descendants(cfg['pid'])
+        return {'helper_pid': 1146315, 'actual_normal_stop_wait': True, 'original_birth_gone': True}
+
+    terminal.terminal_unmap(ctx['client'], ctx['access'].buffer, ctx['worker'], cfg['expected_writer'],
+        release_exports=release_exports, prove_unmapped=prove_unmapped, stop_helpers=stop_helpers,
+        unregister_operation=cfg['unregister_operation'], unmap_operation=cfg['unmap_operation'], state=ctx['terminal_state'])
+    save('host-unmap-success.json', {'pid': cfg['pid'], 'birth': cfg['birth'], **ctx['terminal_state'],
+        'business_success_published': False, 'native_or_model_test': False})

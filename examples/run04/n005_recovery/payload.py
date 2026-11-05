@@ -33,22 +33,38 @@ try:
         if signum != signal.SIGUSR1 or _ctx['busy']:
             return
         _ctx['busy'], _ctx['attempt'] = True, _ctx['attempt'] + 1
+        _exit_after_host_unmap = False
         try:
             if _cfg.get('action') == 'close-existing-device':
                 assert _ctx['attempt'] == 1
                 _write('before-device-close-diagnostic.json', _actions.diagnose(_ctx, _cfg))
                 _actions.close_device(_ctx, _cfg, _write)
+            elif _cfg.get('action') == 'finish-host-unmap':
+                assert _ctx['attempt'] == 1
+                _actions.finish_host_unmap(_ctx, _cfg, _write, _previous_namespace)  # noqa: F821
+                _exit_after_host_unmap = True
             else:
                 _write(f"diagnostic-{_ctx['attempt']}.json", _actions.diagnose(_ctx, _cfg))
         except BaseException as error:
             try:
+                _operation = _ctx.get('terminal_state', {}).get('operation_id')
+                _query = None
+                if _operation is not None:
+                    try:
+                        _query = _ctx['client'].query_operation(_operation)
+                    except BaseException as _query_error:
+                        _query = {'error': repr(_query_error)}
                 _write(f"diagnostic-failed-{_ctx['attempt']}.json", {'pid': os.getpid(), 'error': repr(error),
                     'traceback': traceback.format_exc(), 'original_context_retained': True,
-                    'stage': _ctx.get('stage', 'diagnosis'), 'device_close_attempted': _cfg.get('action') == 'close-existing-device'})
+                    'stage': _ctx.get('terminal_state', {}).get('stage', _ctx.get('stage', 'diagnosis')),
+                    'operation_id': _operation, 'original_operation_query': _query,
+                    'device_close_attempted': _cfg.get('action') == 'close-existing-device'})
             except BaseException:
                 pass
         finally:
             _ctx['busy'] = False
+        if _exit_after_host_unmap:
+            raise SystemExit(0)  # Only after original SDK ACK + fresh Invalid/Unmapped proof.
 
     _prepared = _actions.prepare(_ctx, _cfg)
     _previous = signal.getsignal(signal.SIGUSR1)
