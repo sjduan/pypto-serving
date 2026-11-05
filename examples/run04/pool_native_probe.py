@@ -85,6 +85,18 @@ def consumer(args):
 
     root = args.root
     root.mkdir()
+    run_config = build_pypto_run_config(platform='a2a3', device_ids=(args.device,),
+                                        pypto_build_dir=str(root / 'build'))
+    compiler = KernelCompiler(run_config=run_config)
+    programs = compile_programs(compiler)
+    # Finish the fixed runtime's compile/assemble stage before registering a
+    # client. A missing compiler must not strand a mapped client on exit. The
+    # real Worker still registers the UF view before its subsequent fork/init.
+    from pypto.runtime.distributed_runner import _assemble_chip_callables
+    for program in programs:
+        _assemble_chip_callables(program.compiled)
+    save(root / 'compiled-before-client.json', {'programs': [p.name for p in programs],
+        'client_registered': False, 'native_owner_created': False, 'native_jobs_submitted': 0})
     config = SimpleNamespace(pool_endpoint=args.endpoint, pool_id=args.pool_id,
                              pool_epoch=args.epoch, sdk_sha256=SDK_SHA256)
     access = register_managed_pool(config)
@@ -108,10 +120,6 @@ def consumer(args):
               {'block': tail, 'offset': 0, 'nbytes': tail.nbytes}]
     capture(client, ranges, root / 'pool-before.bin')
     slots.release(backing)
-    run_config = build_pypto_run_config(platform='a2a3', device_ids=(args.device,),
-                                        pypto_build_dir=str(root / 'build'))
-    compiler = KernelCompiler(run_config=run_config)
-    programs = compile_programs(compiler)
     baseline = descendants()
     worker = DistributedWorker([p.compiled for p in programs],
         inherited_host_tensors=slots.inherited_host_tensors, startup_timeout_s=60)
@@ -272,6 +280,20 @@ def controller(args):
                 code = child.wait(timeout=120)
         save(root / 'native-exit.json', {'pid': child.pid, 'exit_code': code, 'command': command})
         if code:
+            failed = json.loads((state / 'state.json').read_text())
+            failed_pool = next(row for row in failed['pools'] if row['pool_id'] == descriptor['pool_id'])
+            if not failed_pool['clients'] and not failed_pool['ranges']['leases']:
+                # This is a genuine no-access-granted case. The real UFlow
+                # destroy checks and provider close/unlink remain authoritative.
+                released = destroy_pool(endpoint, descriptor, admin_token=token)
+                stopped = shutdown_pool_service(endpoint, admin_token=token)
+                assert daemon.wait(timeout=20) == 0
+                daemon_log.close()
+                save(root / 'pre-client-failure-cleanup.json', {'native_exit': code,
+                    'basis': 'UFlow has no registered clients or range grants, not child death',
+                    'provider_release': released, 'shutdown': stopped,
+                    'clean': json.loads((state / 'clean.json').read_text())})
+                raise RuntimeError('probe failed before client registration; real UF pool destroy completed')
             save(root / 'retained-failure.json', {'reason': 'native child failed; no process-death cleanup claim',
                 'daemon_pid': daemon.pid, 'provider_pid': loaded['pid'], 'endpoint': endpoint,
                 'state_retained': True, 'device_resources': snapshot(root, 'failure', args.device)})
