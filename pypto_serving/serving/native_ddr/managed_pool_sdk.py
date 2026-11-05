@@ -258,6 +258,11 @@ class SdkManagedPoolPort:
                        provider_session=self.identity.provider_session, access_generation=self.identity.access_generation)
         if self.sdk.PoolLease.from_dict(current) != raw:
             raise ValueError('snapshot no longer holds the exact registered range lease')
+        # P1 acquisition records a live writer without changing old content
+        # segments. That exact Writing lease authorizes overwrite; only readers
+        # depend on the previous Committed coverage/version/content identity.
+        if value.mode == 'w':
+            return
         end, cursor = value.byte_offset + value.nbytes, value.byte_offset
         for segment in allocation['segments']:
             exact(segment, ('offset', 'nbytes', 'state', 'content_version', 'content_id'))
@@ -267,7 +272,7 @@ class SdkManagedPoolPort:
             start, stop = segment['offset'], segment['offset'] + segment['nbytes']
             if stop <= cursor or start >= end:
                 continue
-            if (start > cursor or segment['state'] != ('Writing' if value.mode == 'w' else 'Committed')
+            if (start > cursor or segment['state'] != 'Committed'
                     or (segment['content_version'], segment['content_id']) != (value.content_version, value.content_id)):
                 raise ValueError('current range content no longer covers the retained version')
             cursor = min(end, stop)

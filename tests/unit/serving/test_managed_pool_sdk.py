@@ -48,10 +48,10 @@ def fixture():
         pool.update(frozen=False, clients=[{'client_session': 'client', 'access_generation': 1,
             'state': 'Mapped', 'closing': False, 'access': 'rw'}], ranges={'allocations': [{
                 'block_id': 1, 'generation': 1, 'offset': 0, 'nbytes': block.nbytes,
-                'segments': [{'offset': 0, 'nbytes': GUARD_BYTES, 'state': 'Writing',
+                'segments': [{'offset': 0, 'nbytes': GUARD_BYTES, 'state': 'Uncommitted',
                               'content_version': 0, 'content_id': ''},
                     {'offset': GUARD_BYTES, 'nbytes': BLOCK_BYTES,
-                     'state': 'Writing' if live['mode'] == 'w' else 'Committed',
+                     'state': 'Uncommitted' if live['mode'] == 'w' else 'Committed',
                      'content_version': 0 if live['mode'] == 'w' else live['version'],
                      'content_id': '' if live['mode'] == 'w' else live['content']}]}], 'leases': [raw]})
         return {'schema': 1, 'pools': [pool]}
@@ -98,8 +98,8 @@ def test_actual_sdk_write_zero_version_then_commit_assigned_version_and_read_rel
     assert content.content_version == 7 and content.operation_id == 'commit-operation'
     reader = c.access.acquire(block, 'r', committed=content)
     assert reader.content_version == 7
-    # A disjoint Writing guard in the SAME allocation is deliberately present;
-    # revalidation must inspect this range, not widen to the block/pool.
+    # Disjoint Uncommitted guard content in the SAME allocation must not cause
+    # read coverage validation to widen to the whole block/pool.
     ack = c.access.complete_read(reader, 'release-operation')
     assert ack.lease_generation == 17 and ack.operation_id == 'release-operation'
     assert not c.access.leases and not c.port._leases and not c.port._operations
@@ -189,7 +189,7 @@ def test_boolean_snapshot_identity_or_version_cannot_discharge_the_held_writer(f
             elif fault == 'allocation-generation':
                 pool['ranges']['allocations'][0]['generation'] = True
             else:
-                pool['ranges']['allocations'][0]['segments'][1]['content_version'] = False
+                pool['ranges']['leases'][0]['content_version'] = False
         return result
     c.client._call = corrupt
     with pytest.raises(ValueError):
