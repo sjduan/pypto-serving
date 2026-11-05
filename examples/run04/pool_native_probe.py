@@ -24,6 +24,9 @@ from types import SimpleNamespace
 
 from pool_host_probe import capture, inventory, save
 
+_ACCESS_ATTEMPTED = False
+_ACTIVE_ACCESS = None
+
 
 def role_environments(parent, daemon_root, inventory_root):
     """Host test fence belongs only to the daemon/provider and RO host reader."""
@@ -62,6 +65,7 @@ def runtime_view_report(worker, slots, backing):
 
 
 def consumer(args):
+    global _ACCESS_ATTEMPTED, _ACTIVE_ACCESS
     assert not os.environ.get('LD_PRELOAD'), 'host fence must not reach native roles'
     assert not any(k.startswith('UFLOW_POOL_TEST_') for k in os.environ)
     import numpy as np
@@ -99,7 +103,9 @@ def consumer(args):
         'client_registered': False, 'native_owner_created': False, 'native_jobs_submitted': 0})
     config = SimpleNamespace(pool_endpoint=args.endpoint, pool_id=args.pool_id,
                              pool_epoch=args.epoch, sdk_sha256=SDK_SHA256)
+    _ACCESS_ATTEMPTED = True
     access = register_managed_pool(config)
+    _ACTIVE_ACCESS = access
     slots = ManagedDdrSlots(1, access)
     client = access.port.client
     backing = slots.reserve(0, BLOCK_BYTES)
@@ -124,6 +130,7 @@ def consumer(args):
     worker = DistributedWorker([p.compiled for p in programs],
         inherited_host_tensors=slots.inherited_host_tensors, startup_timeout_s=60)
     registered = attach_new_children(access, baseline)
+    registered_pids = tuple(registered)
     save(root / 'children.json', {'baseline': baseline, 'registered': registered,
                                   'identity': asdict(access.identity), 'native_role_fence': None})
     from host_guard import inventory as process_inventory
@@ -216,11 +223,14 @@ def consumer(args):
               'expected_payload_sha256': hashlib.sha256(expected_bytes).hexdigest(),
               'whole_four_page_arenas_equal': True, 'source_page': 1, 'target_page': 2,
               'guard_bytes_compared': guards['guard_bytes_compared'], 'native_trace': trace,
+              'original_native_children': registered_pids, 'consumer_child_baseline': baseline,
               'native_owner_closed': True, 'children_detached': True, 'client_unmapped': True}
     save(root / 'result.json', result)
 
 
 def controller(args):
+    if args.existing_state is not None:
+        return shared_controller(args)
     import fcntl
     from uflow.managed_pool import create_pool, destroy_pool, shutdown_pool_service
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'run02'))
@@ -343,21 +353,134 @@ def controller(args):
         'lock_reacquired_and_released': True, 'port_rebindable': True, 'shm_name_absent': shm_name})
 
 
+def shared_controller(args):
+    """Create/destroy only one new pool in the retained Catalog; never stop its service."""
+    import ctypes
+    import fcntl
+    from existing_pool import ExistingPoolService, OWNER_PIDS, SERVICE_ROOT
+    from pypto_serving.serving.native_ddr.managed_process import descendants
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'run02'))
+    from r_guard import snapshot
+    assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+    root = args.root
+    root.mkdir()
+    for name in ('logs', 'inventories', 'catalog'):
+        (root / name).mkdir()
+    host_env, native_env = role_environments(os.environ, SERVICE_ROOT, root / 'inventories')
+    for name in ('UFLOW_POOL_TEST_FENCE', 'UFLOW_POOL_TEST_SYMBOLS', 'UFLOW_POOL_TEST_INVENTORY_ROOT'):
+        os.environ[name] = host_env[name]
+    service = ExistingPoolService(args.existing_state, args.retained_baseline, root / 'catalog')
+    lock_path = Path(f'/workspace/uflow/locks/run02-npu-{args.device}.lock')
+    with lock_path.open('a+') as lock, socket.socket() as sock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        before = snapshot(root, 'before', args.device)
+        save(root / 'resource-before.json', before)
+        status = before['status']
+        assert status['health'] == 'OK' and status['hbm_total_mib'] - status['hbm_used_mib'] >= 40000
+        assert not before['fds']['users'] and not before['fds']['denied']
+        assert f"No running processes found in NPU {status['board']}" in before['npu']
+        assert not os.environ.get('ASCEND_RT_VISIBLE_DEVICES') and not os.environ.get('ASCEND_VISIBLE_DEVICES')
+        sock.bind(('127.0.0.1', 18892))
+        save(root / 'reservation.json', {'physical_device': args.device, 'owner_pid': os.getpid(),
+            'lock_path': str(lock_path), 'scope': 'advisory with fresh health/full FD visibility'})
+        descriptor = service.create()
+        command = [sys.executable, '-u', str(Path(__file__).resolve()), '--role', 'native',
+            '--root', str(root / 'native'), '--endpoint', service.endpoint,
+            '--pool-id', descriptor['pool_id'], '--epoch', descriptor['pool_epoch'], '--device', str(args.device)]
+        with (root / 'native.log').open('xb') as log:
+            child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=native_env)
+            deadline = time.monotonic() + 1800
+            while child.poll() is None:
+                if (root / 'native/retained-live-failure.json').exists() or time.monotonic() > deadline:
+                    current = service.snapshot('retained-live-child')
+                    save(root / 'retained-new-case.json', {'child_pid': child.pid, 'command': command,
+                        'reason': 'live native access retained for diagnosis; no unmap/death cleanup inference',
+                        'snapshot': current, 'retained_existing_owners': list(OWNER_PIDS)})
+                    raise RuntimeError('new normal case failed; native process remains alive, no third pool')
+                time.sleep(.2)
+            code = child.wait()
+        save(root / 'native-exit.json', {'pid': child.pid, 'exit_code': code, 'command': command})
+        if code:
+            _, pool = service.current('failed-child')
+            if (any(c['state'] != 'Unmapped' or c['children'] for c in pool['clients'])
+                    or pool['ranges']['leases']):
+                raise RuntimeError('new case retained access/Unknown; stop without another pool')
+            cleanup = service.destroy('failed-case-pool-released')
+            save(root / 'failed-case-cleanup.json', cleanup)
+            raise RuntimeError('case failed but UF really released its new unreferenced pool; service retained')
+        native = json.loads((root / 'native/result.json').read_text())
+        assert native['passed'] and native['native_owner_closed'] and native['client_unmapped']
+        _, pool = service.current('after-native-client')
+        assert all(c['state'] == 'Unmapped' and not c['children'] for c in pool['clients'])
+        assert not pool['ranges']['leases']
+        reader_command = [sys.executable, '-u', str(Path(__file__).with_name('pool_host_probe.py')),
+            '--role', 'reader', '--root', str(root / 'reader'), '--endpoint', service.endpoint,
+            '--pool-id', descriptor['pool_id'], '--epoch', descriptor['pool_epoch'],
+            '--expected', str(root / 'native/result.json')]
+        with (root / 'reader.log').open('xb') as log:
+            reader = subprocess.Popen(reader_command, stdout=log, stderr=subprocess.STDOUT, env=host_env)
+            assert reader.wait(timeout=60) == 0
+        cleanup = service.destroy()
+        owned = {child.pid, reader.pid, *native['original_native_children'],
+                 *map(int, native['consumer_child_baseline']), *descendants()}
+        assert not owned.intersection(OWNER_PIDS)
+        limit = time.monotonic() + 20
+        while any(Path('/proc', str(pid)).exists() for pid in owned):
+            for pid in owned:
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+            assert time.monotonic() < limit, 'normal case PID still alive; old owners are excluded'
+            time.sleep(.05)
+    after = snapshot(root, 'after', args.device)
+    assert after['status']['health'] == 'OK' and not after['fds']['users'] and not after['fds']['denied']
+    with lock_path.open('a+') as lock, socket.socket() as sock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        sock.bind(('127.0.0.1', 18892))
+    save(root / 'result.json', {'passed': True, 'scope': 'same-Catalog normal UF native fixture, not full Qwen',
+        'normal_descriptor': descriptor, 'normal_cleanup': cleanup, 'normal_owned_pids_absent': sorted(owned),
+        'retained_existing_owner_pids': list(OWNER_PIDS), 'service_shutdown': False,
+        'resource_after': after, 'lock_reacquired_and_released': True, 'port_rebindable': True})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--role', choices=['controller', 'native'], default='controller')
     parser.add_argument('--root', required=True, type=Path)
     parser.add_argument('--daemon', type=Path)
+    parser.add_argument('--existing-state', type=Path)
+    parser.add_argument('--retained-baseline', type=Path)
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--endpoint')
     parser.add_argument('--pool-id')
     parser.add_argument('--epoch')
     args = parser.parse_args()
     if args.role == 'controller':
-        assert args.daemon is not None and 0 <= args.device < 16
+        assert (args.daemon is not None or args.existing_state is not None) and 0 <= args.device < 16
+        if args.existing_state is not None:
+            assert args.daemon is None and args.retained_baseline is not None
         controller(args)
     else:
-        consumer(args)
+        try:
+            consumer(args)
+        except BaseException as error:
+            if not _ACCESS_ATTEMPTED or _ACTIVE_ACCESS is not None and _ACTIVE_ACCESS.closed:
+                raise
+            # Keep the original client PID, exception frames and all native
+            # references alive on a failed probe. Parent stops the case; it
+            # cannot substitute process death for a cooperative unmap receipt.
+            import traceback
+            traceback.print_exc()
+            args.root.mkdir(exist_ok=True)
+            save(args.root / 'retained-live-failure.json', {'pid': os.getpid(), 'error': repr(error),
+                'scope': 'failed live client retained; no unmap ACK, release, retry or cleanup claim'})
+            while True:
+                try:
+                    signal.pause()
+                except KeyboardInterrupt:
+                    continue
 
 
 if __name__ == '__main__':
