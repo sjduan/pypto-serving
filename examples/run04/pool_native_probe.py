@@ -167,7 +167,10 @@ def consumer(args):
 
     def transfer(transfer_module, operation, page):
         request = probe_request(sender, operation, key, ref, page)
-        assert transfer_module.submit_transfer(request).status == TransferStatus.ACCEPTED
+        submitted = transfer_module.submit_transfer(request)
+        save(root / f'{operation.value.lower()}-submit-event.json', asdict(submitted))
+        save(root / f'{operation.value.lower()}-submit-trace.json', trace)
+        assert submitted.status == TransferStatus.ACCEPTED, submitted.error
         save(root / f'{operation.value.lower()}-accepted.json', {
             'entry_state': transfer_module.pending.entry.state.value,
             'native_pending': not transfer_module.pending.handle.native.done,

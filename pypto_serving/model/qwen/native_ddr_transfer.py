@@ -94,6 +94,23 @@ class ManagedDdrSlots:
         import torch
         return self.pool_tensor.narrow(0, offset, BLOCK_BYTES).view(torch.bfloat16).reshape(81920, 128)
 
+    def native_argument(self, worker, backing):
+        """Address-free view of the existing inherited Buffer, without Torch SHM reallocation."""
+        from simpler.buffer import BackendKind
+        from simpler.task_interface import DataType
+        self.validate(backing)
+        named = worker._named_host_buffer(backing.tensor.data_ptr(), BLOCK_BYTES)
+        whole = worker._named_host_buffer(self.pool_tensor.data_ptr(), self.access.identity.nbytes)
+        if named is None or whole is None:
+            raise ValueError('native DDR backing is not an explicitly inherited whole-pool span')
+        buffer, offset, readonly = named
+        if (buffer is not whole[0] or whole[1] != 0 or whole[2] or readonly
+                or buffer.backend_kind != BackendKind.FORK_SHM
+                or buffer.nbytes != self.access.identity.nbytes or offset != backing.byte_offset):
+            raise ValueError('native DDR view differs from the existing whole shared Buffer')
+        buffer.to_descriptor()
+        return buffer.tensor(tuple(backing.tensor.shape), DataType.BFLOAT16, byte_offset=offset)
+
     def reserve(self, slot, size):
         if type(slot) is not int or not 0 <= slot < self.capacity or size != BLOCK_BYTES:
             raise ValueError("invalid whole-block DDR slot")
@@ -323,12 +340,13 @@ class QwenNativeTransferBackend:
             if self.closed or self.pending is not None or self.ambiguous is not None or self.slots.busy is not None:
                 raise ValueError("transfer owner closed or busy")
             self.slots.page_ids[0] = request.page_ids[0]
+            compact = self.slots.native_argument(self.worker, backing)
             if request.operation == Operation.STORE:
                 program = self.programs[0].compiled
-                args = (self.keys, self.values, self.slots.page_ids, backing.tensor)
+                args = (self.keys, self.values, self.slots.page_ids, compact)
             else:
                 program = self.programs[1].compiled
-                args = (backing.tensor, self.slots.page_ids, self.keys, self.values)
+                args = (compact, self.slots.page_ids, self.keys, self.values)
             self.slots.begin_native(request, backing)
         except Exception as exc:
             if self.slots.access.unknown:
@@ -339,9 +357,14 @@ class QwenNativeTransferBackend:
             self.record("submit_begin", job=request.job_id, operation=request.operation.value,
                         page=request.page_ids[0], slot=backing.slot)
             native = self.worker.submit(program, *args, config=self.run_config)
-        except BaseException:
+        except BaseException as error:
             # The native boundary may already have side effects. Preserve all references.
             self.ambiguous = (request, backing, args)
+            try:
+                import traceback
+                self.record('submit_failed', job=request.job_id, error=repr(error), traceback=traceback.format_exc())
+            except BaseException:
+                pass
             self.slots.access.report_unknown(backing.active_lease, 'native submit outcome unknown')
             raise
         self.pending = NativeDdrRun(self, request, backing, native)
