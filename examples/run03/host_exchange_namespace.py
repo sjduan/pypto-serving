@@ -111,7 +111,8 @@ def prior_domains():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(lock, fcntl.LOCK_UN)
         proofs.append({'root': str(root), 'state': state, 'pids_absent': pids, 'sockets_absent': not (fixture/'u.sock').exists() and not (fixture/'u.sock.external-ddr').exists(),
-                       'lock_reacquired_released': True, 'snapshot': domain_snapshot(root)})
+                       'lock_reacquired_released': True, 'snapshot': domain_snapshot(root),
+                       'case': result.get('declaration', {}).get('case'), 'passed': result['passed']})
     return proofs
 
 
@@ -343,8 +344,8 @@ def outer(token):
                 raise RuntimeError('task root is not canonical')
             result['prior_domain_proofs'] = prior_domains()
             if case == 'owner-exit-negative':
-                normal = json.loads((TASK/'results/attempt3-normal-clean/namespace.json').read_text())
-                assert normal['passed'] and normal['inner_report']['clean_log']
+                assert any(item['case'] == 'normal-clean' and item['passed'] and item['state']['mode'] == 'clean'
+                           for item in result['prior_domain_proofs'])
             (resultdir/'declared-case.json').write_text(json.dumps(result, indent=2)+'\n')
             source, nsroot = Path(__file__).resolve(), TASK/'sandbox'/token/'nsroot'
             assert sha(TASK/'build/bin/uf-daemon') == DAEMON_SHA

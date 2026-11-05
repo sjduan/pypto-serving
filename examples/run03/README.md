@@ -110,7 +110,7 @@ not a general deployment utility. Its task root is fixed to
 sources and CPU-built daemon/shim there first. Run only its **outer** mode:
 
 ```console
-python src/serving/examples/run03/host_exchange_namespace.py --attempt attempt3-normal-clean
+python src/serving/examples/run03/host_exchange_namespace.py --attempt attempt5-normal-clean
 python src/serving/examples/run03/host_exchange_namespace.py --attempt attempt4-owner-exit-negative
 ```
 

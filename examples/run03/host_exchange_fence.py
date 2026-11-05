@@ -31,7 +31,9 @@ class Status(ctypes.Structure):
 
 def probe(shim, fence, symbols, positive):
     before = inventory('self')
-    ctypes.CDLL(str(shim), mode=os.RTLD_NOW | os.RTLD_LOCAL)
+    # Match daemon DT_NEEDED global visibility so the unique real cleanup is
+    # discoverable in the same symbol scope as the preloaded blockers.
+    shim_handle = ctypes.CDLL(str(shim), mode=os.RTLD_NOW | os.RTLD_GLOBAL)
     handle = ctypes.CDLL(None)
     handle.dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(DlInfo)]
     bindings = {}
@@ -40,7 +42,8 @@ def probe(shim, fence, symbols, positive):
         assert handle.dladdr(ctypes.cast(getattr(handle, name), ctypes.c_void_p), ctypes.byref(info))
         bindings[name] = str(Path(os.fsdecode(info.filename)).resolve())
     report = {'pid': os.getpid(), 'before_fds': before, 'after_fds': inventory('self'),
-              'loaded': deployment('self', shim, fence), 'bindings': bindings}
+              'loaded': deployment('self', shim, fence), 'bindings': bindings,
+              'real_shim_handle_held': shim_handle is not None}
     print(json.dumps(report), flush=True)  # Evidence survives even failed policy checks or exit86.
     exported = [name for name in symbols if name.startswith('uf_acl_')]+[REAL_CLEANUP]
     check_pristine_bindings(symbols, bindings, fence, shim, exported)
