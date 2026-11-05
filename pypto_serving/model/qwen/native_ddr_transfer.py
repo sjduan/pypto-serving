@@ -46,13 +46,19 @@ class ManagedDdrSlots:
     def __init__(self, count: int, access: ManagedPoolAccess):
         if type(count) is not int or count <= 0:
             raise ValueError("native DDR requires an explicit finite positive prefork slot count")
+        import numpy as np
         import torch
 
         if not isinstance(access, ManagedPoolAccess) or count * (BLOCK_BYTES + GUARD_BYTES) > access.identity.nbytes:
             raise ValueError('finite prefix access budget does not fit the actual UFlow pool')
         self.capacity = count
         self.access = access
-        self.pool_tensor = torch.frombuffer(access.buffer, dtype=torch.uint8, count=access.identity.nbytes)
+        # NumPy's owner keeps a real buffer export for the storage's entire
+        # lifetime, including detached/dtype/slice aliases after logical release.
+        # torch.frombuffer alone retains an object but permits mmap.close while
+        # such aliases still live. Both conversions below are zero-copy views.
+        self.pool_tensor = torch.from_numpy(np.frombuffer(access.buffer, dtype=np.uint8,
+                                                        count=access.identity.nbytes))
         if self.pool_tensor.untyped_storage().nbytes() != access.identity.nbytes:
             raise ValueError('whole pool must have one exact non-copying storage span')
         self.page_ids = torch.empty((1,), dtype=torch.int32).share_memory_()

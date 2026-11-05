@@ -8,7 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """Real CPU tensors over a fake port: alias/layout proof, NOT UF/native proof."""
 import ctypes
-import gc
 import os
 import unittest
 
@@ -53,6 +52,43 @@ class ManagedTensorTests(unittest.TestCase):
         for backing in backings:
             slots.release(backing)
         del selected, backing, backings
-        gc.collect()
         slots.close_after_owner()
         self.assertTrue(access.closed and port.buffer.closed)
+
+    def test_derived_tensor_alias_retains_real_buffer_export_until_retry_can_unmap_once(self):
+        import torch
+        aliases = (
+            ('flat', lambda tensor: tensor.view(-1)),
+            ('dtype-slice', lambda tensor: tensor.view(torch.uint8).flatten()[64:192].view(torch.int16)),
+            ('detached', lambda tensor: tensor.detach()),
+        )
+        for name, make_alias in aliases:
+            with self.subTest(alias=name):
+                port = FakePort()
+                access = ManagedPoolAccess(port)
+                slots = ManagedDdrSlots(1, access)
+                backing = slots.reserve(0, BLOCK_BYTES)
+                held = make_alias(backing.tensor)
+                self.assertEqual(held.untyped_storage().data_ptr(), slots.pool_tensor.data_ptr())
+                slots.release(backing)
+                self.assertIsNone(backing.tensor)
+                self.assertFalse(slots.leases)
+                try:
+                    # The CPU tensor alias owns a real mmap buffer export. No
+                    # GC, refcount guess or fake control response establishes it.
+                    with self.assertRaises(BufferError):
+                        slots.close_after_owner()
+                    self.assertFalse(port.buffer.closed or access.closed)
+                    self.assertTrue(access.unregistering)
+                    self.assertFalse(any(call[0] == 'unmapped' for call in port.calls))
+                    self.assertIsNone(slots.pool_tensor)
+                    self.assertGreater(held.numel(), 0)  # metadata only, no unsafe read if regression fails
+                finally:
+                    # Drop the last storage alias explicitly before retry. Never
+                    # dereference its data following an unexpectedly early unmap.
+                    del held
+                    slots.close_after_owner()
+                self.assertTrue(port.buffer.closed and access.closed)
+                self.assertEqual(sum(call[0] == 'unmapped' for call in port.calls), 1)
+                slots.close_after_owner()
+                self.assertEqual(sum(call[0] == 'unmapped' for call in port.calls), 1)
