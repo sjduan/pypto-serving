@@ -15,6 +15,7 @@ from typing import Literal
 import torch
 
 from pypto_serving.model.tokenizer import TokenizerAdapter
+from pypto_serving.serving.native_ddr.types import NativeDdrPrefixConfig
 
 
 PREFILL_CHUNK_SIZE_CHOICES = (1024, 2048, 4096, 8192)
@@ -131,6 +132,9 @@ class KVCacheGroupSpec:
     # states, including the final pending row. Earlier rows in a large chunk
     # must not be published as complete prefix-cache pages.
     prefill_tail_tokens: int | None = None
+    # Some kernels have request state for fewer sequences than their KV pages
+    # could fit. Limit active owners per partition before assigning pages.
+    max_requests_per_partition: int | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -141,6 +145,8 @@ class KVCacheGroupSpec:
             raise ValueError("KV cache num_blocks must be positive when specified")
         if self.num_partitions <= 0:
             raise ValueError("KV cache num_partitions must be positive")
+        if self.max_requests_per_partition is not None and self.max_requests_per_partition <= 0:
+            raise ValueError("KV cache max_requests_per_partition must be positive")
         if self.prefill_tail_tokens is not None:
             if self.prefill_tail_tokens <= 0 or not self.is_eagle_group:
                 raise ValueError("KV cache prefill_tail_tokens requires a positive EAGLE tail extent")
@@ -206,6 +212,7 @@ class RuntimeConfig:
     ring_dep_pool: int | list[int] | None = None
     ring_task_window: int | list[int] | None = None
     ring_heap: int | list[int] | None = None
+    native_ddr: NativeDdrPrefixConfig = field(default_factory=NativeDdrPrefixConfig)
 
 
 @dataclass(frozen=True)
@@ -369,6 +376,9 @@ class DecodeBatch:
     cache_partitions: list[int | None] = field(default_factory=list)
     constraint_states: dict[str, object] = field(default_factory=dict)
     stop_token_masks: dict[str, StopTokenMask] = field(default_factory=dict)
+    # Requests with preinitialized target cache that still require local model
+    # state initialization. Ordinary batches carry no additional request list.
+    initial_request_ids: tuple[str, ...] = ()
     # Optional MTP context for models (e.g. DeepSeek V4) that decode two real
     # trailing tokens per step. ``prev_token_ids`` holds the token id at absolute
     # position ``seq_len-2`` per request (shape ``[B]``) and ``prev_hidden_states``

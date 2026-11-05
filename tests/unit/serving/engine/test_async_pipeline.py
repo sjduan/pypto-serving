@@ -189,7 +189,8 @@ def test_constrained_abort_drops_inflight_output_and_frees_worker_before_reuse()
     request.constraint_spec = _tool_constraint()
     core.scheduler.running.append(request)
     core.scheduler.requests[request.request_id] = request
-    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True)
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True,
+                          worker_release_done=asyncio.Event())
     core._request_contexts[request.request_id] = ctx
 
     assert core._try_dispatch_step()
@@ -200,8 +201,9 @@ def test_constrained_abort_drops_inflight_output_and_frees_worker_before_reuse()
     asyncio.run(core._flush_pending_frees())
     assert dispatched[-1].finished_request_ids == [request.request_id]
     assert request.request_id not in core._worker_known_req_ids
+    output = asyncio.run(anext(core._iterate_request_output(ctx)))
+    assert output.finish_reason == "FINISHED_ABORTED"
     assert not core._pending_free_ids and not core._request_contexts
-    assert ctx.queue.get_nowait().finish_reason == "FINISHED_ABORTED"
 
     next_request = Request("next", [3], max_new_tokens=1)
     core.scheduler.add_request(next_request)
@@ -215,7 +217,8 @@ def test_constrained_step_error_cleans_up_before_next_request():
     request.constraint_spec = _tool_constraint()
     core.scheduler.running.append(request)
     core.scheduler.requests[request.request_id] = request
-    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True)
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True,
+                          worker_release_done=asyncio.Event())
     core._request_contexts[request.request_id] = ctx
     assert core._try_dispatch_step()
 
@@ -234,6 +237,7 @@ def test_constrained_step_error_cleans_up_before_next_request():
 
     core._input_queue = SimpleNamespace(put=put)
     asyncio.run(core._flush_pending_frees())
+    assert ctx.worker_release_done.is_set()
     assert dispatched[-1].finished_request_ids == [request.request_id]
     assert not core._pending_free_ids and not core._worker_known_req_ids
 
@@ -298,7 +302,7 @@ def test_min_tokens_reaches_worker_registration(executor_cls, speculative_tokens
     assert registration.initial_output_tokens == 0
 
 
-def test_restarted_request_registers_committed_output_length():
+def test_restarted_request_registers_committed_output_length(monkeypatch):
     core, _ = _async_pipeline_core()
     request = Request(
         request_id="restarted", prompt_token_ids=[1, 2], max_new_tokens=6,
@@ -306,6 +310,10 @@ def test_restarted_request_registers_committed_output_length():
         status=RequestStatus.PREEMPTED,
     )
     core._worker_known_req_ids.add(request.request_id)
+    context = SimpleNamespace(worker_release_done=asyncio.Event(), worker_release_ack=asyncio.Event())
+    context.worker_release_done.set()
+    context.worker_release_ack.set()
+    core._request_contexts[request.request_id] = context
     scheduled = SchedulerOutput(scheduled_requests=[
         ScheduledRequest(request=request, num_new_tokens=1, is_prefill=True),
     ])
@@ -316,6 +324,15 @@ def test_restarted_request_registers_committed_output_length():
     assert len(command.new_requests) == 1
     assert command.new_requests[0].initial_output_tokens == 2
     assert command.new_requests[0].min_tokens == 3
+    assert not context.worker_release_done.is_set() and not context.worker_release_ack.is_set()
+    # A release followed by re-registration in one FIFO command only retires
+    # the old incarnation; its reply must not acknowledge the new live state.
+    monkeypatch.setattr(core.scheduler, "schedule", lambda **kwargs: scheduled)
+    core._pending_free_ids = [request.request_id]
+    assert core._try_dispatch_step()
+    assert not getattr(core, "_worker_free_ids_by_step", {})
+    assert asyncio.run(core._await_and_apply_oldest())
+    assert not context.worker_release_done.is_set() and not context.worker_release_ack.is_set()
 
 
 def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):
@@ -484,7 +501,8 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     req = _running_decode_request(prompt=(1, 2), first_output=50)
     core.scheduler.running.append(req)
     core.scheduler.requests[req.request_id] = req
-    ctx = SimpleNamespace(queue=asyncio.Queue(), request=req, stream=True)
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=req, stream=True,
+                          worker_release_done=asyncio.Event())
     core._request_contexts = {"r": ctx}
 
     # Two steps dispatched: both commands reached the FIFO worker, so both
@@ -511,7 +529,8 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     assert not core._batch_queue
     assert second_step_id in core._discard_result_step_ids
     tok = ctx.queue.get_nowait()
-    assert not core._request_contexts
+    assert core._request_contexts == {"r": ctx}
+    assert not ctx.worker_release_done.is_set()
     assert tok.finished is True and tok.finish_reason == "error"
 
     # Next live fetch must SKIP the stale second-step result and return step 99,

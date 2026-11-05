@@ -31,6 +31,7 @@ class RequestStatus(Enum):
     FINISHED_LENGTH = auto()
     FINISHED_STOP = auto()
     FINISHED_ABORTED = auto()
+    FINISHED_PREFILL = auto()
 
     @property
     def is_finished(self) -> bool:
@@ -39,6 +40,7 @@ class RequestStatus(Enum):
             RequestStatus.FINISHED_LENGTH,
             RequestStatus.FINISHED_STOP,
             RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_PREFILL,
         )
 
 
@@ -60,6 +62,8 @@ class SchedulerConfig:
     # Async (pipelined) scheduling: schedule step N+1 before step N's sampled
     # token returns, advancing request state optimistically via placeholders.
     async_scheduling: bool = False
+    # Prefill-only execution retains cache until explicitly finished.
+    stop_after_prefill: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -133,10 +137,13 @@ class Request:
     allocated_block_ids: list[int] = field(default_factory=list)
     allocated_group_block_ids: dict[str, list[int]] = field(default_factory=dict)
     cache_partition: int | None = None
-    block_hashes: list[int] = field(default_factory=list)
-    group_block_hashes: dict[str, list[int]] = field(default_factory=dict)
+    block_hashes: list[bytes] = field(default_factory=list)
+    group_block_hashes: dict[str, list[bytes]] = field(default_factory=dict)
     num_blocks_cached: int = 0  # Track how many blocks have been published to prefix cache
     num_group_blocks_cached: dict[str, int] = field(default_factory=dict)
+    # Fixed from the complete prompt, not the latest confirmed/in-flight chunk.
+    # Externally populated requests keep their allocator-owned checkpoint policy.
+    group_checkpoint_boundary: int | None = None
     # Earliest valid KV position after a model skips the beginning of a
     # prefill chunk. Keep this across decode so partial pages stay unpublished.
     group_cache_valid_from: dict[str, int] = field(default_factory=dict)
@@ -150,6 +157,10 @@ class Request:
     # prefill result.  This is a per-request barrier, so unrelated ready requests
     # can continue to use the depth-2 pipeline.
     terminal_prefill_in_flight: bool = False
+    prefill_complete: bool = False
+    scheduling_held: bool = False
+    cache_reservation_id: str = ""
+    requires_initial_step: bool = False
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -211,6 +222,7 @@ class RequestOutput:
     finished: bool = False
     finish_reason: str = ""
     num_output_tokens: int | None = None
+    prefill_finished: bool = False
 
 
 class Scheduler:
@@ -219,6 +231,7 @@ class Scheduler:
     def __init__(self, config: SchedulerConfig, kv_cache_manager: KvCacheManager) -> None:
         self.config = config
         self.kv_cache_manager = kv_cache_manager
+        self._native_ddr = None
         self.config.validate_cache_groups(self.kv_cache_manager.group_specs)
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
@@ -270,6 +283,10 @@ class Scheduler:
                 raise ValueError(rejection)
         if self.config.enable_prefix_cache:
             if self.kv_cache_manager.has_groups:
+                request.group_checkpoint_boundary = self.kv_cache_manager.group_prefix_cache_boundary(
+                    request.num_prompt_tokens,
+                    replay_tokens=self.config.speculative_prefix_cache_replay_tokens,
+                )
                 request.group_block_hashes = self.kv_cache_manager.compute_group_block_hashes(
                     request.prompt_token_ids
                 )
@@ -281,10 +298,111 @@ class Scheduler:
         self.waiting.append(request)
         self.requests[request.request_id] = request
 
+    def admit_prefilled(
+        self,
+        *,
+        reservation_id: str,
+        request_id: str,
+        prompt_token_ids: list[int],
+        first_token: int,
+        max_new_tokens: int,
+        min_tokens: int = 0,
+        ignore_eos: bool = False,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int | None = None,
+        seed: int | None = None,
+        stop_strings: tuple[str, ...] = (),
+        eos_token_id: int | None = None,
+        constraint_spec: ConstraintSpec | None = None,
+    ) -> tuple[Request, RequestOutput]:
+        """Admit an externally populated cache lease without replaying Prefill."""
+        if request_id in self.requests:
+            raise ValueError(f"request {request_id!r} already exists in the scheduler")
+        reservation = self.kv_cache_manager.group_cache_reservation(reservation_id)
+        if reservation is None or reservation.request_id != request_id:
+            raise ValueError("Decode adoption does not match the cache reservation")
+        if len(prompt_token_ids) + max_new_tokens > reservation.token_capacity:
+            raise ValueError("Decode request exceeds its cache reservation capacity")
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
+        if not 0 <= min_tokens <= max_new_tokens:
+            raise ValueError("min_tokens must be within the generation limit")
+        reservation = self.kv_cache_manager.adopt_group_cache(reservation_id)
+        request = Request(
+            request_id=request_id,
+            prompt_token_ids=list(prompt_token_ids),
+            max_new_tokens=max_new_tokens,
+            min_tokens=min_tokens,
+            ignore_eos=ignore_eos,
+            status=RequestStatus.RUNNING,
+            num_computed_tokens=len(prompt_token_ids),
+            output_token_ids=[int(first_token)],
+            stop_strings=tuple(stop_strings),
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            constraint_spec=constraint_spec,
+            allocated_group_block_ids={
+                name: list(block_ids)
+                for name, block_ids in reservation.block_ids_by_group.items()
+            },
+            cache_partition=reservation.partition,
+            cache_reservation_id=reservation_id,
+            requires_initial_step=True,
+            group_block_hashes={
+                name: list(reservation.prefix_block_hashes.get(name, ()))
+                for name in self.kv_cache_manager.group_names
+            },
+            num_group_blocks_cached=dict(reservation.published_block_counts),
+        )
+        self.requests[request_id] = request
+        self.running.append(request)
+        output = RequestOutput(request_id=request_id, new_token_id=int(first_token), num_output_tokens=1)
+        finish = self._check_finish(request)
+        if finish is not None:
+            request.status = finish
+            output.finished = True
+            output.finish_reason = finish.name
+            self._free_request_blocks(request)
+            self.running.remove(request)
+        return request, output
+
+    def finish_prefilled_request(self, request_id: str) -> None:
+        """Finish a Prefill-only request and release its retained resources."""
+        request = self.requests.get(request_id)
+        if request is None or not request.prefill_complete:
+            raise ValueError("request has not completed Prefill")
+        request.prefill_complete = False
+        request.scheduling_held = False
+        request.status = RequestStatus.FINISHED_PREFILL
+        self._free_request_blocks(request)
+        self.running = [item for item in self.running if item.request_id != request_id]
+
+    def hold_request(self, request_id: str) -> None:
+        request = self.requests.get(request_id)
+        if request is None or request.status.is_finished:
+            raise ValueError("cannot hold an absent or finished request")
+        if request.scheduling_held:
+            raise RuntimeError("request is already held")
+        request.scheduling_held = True
+
+    def resume_request(self, request_id: str) -> None:
+        request = self.requests.get(request_id)
+        if request is None or not request.scheduling_held:
+            raise ValueError("request is not held")
+        if request.prefill_complete:
+            raise RuntimeError("completed Prefill must be explicitly finished")
+        request.scheduling_held = False
+
     def abort_request(self, request_id: str) -> None:
         request = self.requests.get(request_id)
         if request is None:
             return
+        if self._native_ddr is not None:
+            self._native_ddr.cancel_request(*self._native_ddr._request_key(request))
         request.status = RequestStatus.FINISHED_ABORTED
         self._free_request_blocks(request)
         self.running = [r for r in self.running if r.request_id != request_id]
@@ -315,7 +433,7 @@ class Scheduler:
         scheduled_req_ids: set[str] = set()
         num_scheduled_tokens: dict[str, int] = {}
         running_to_keep: list[Request] = []
-        stalled_constrained: list[Request] = []
+        stalled_non_recomputable: list[Request] = []
         for request in self.running:
             # A request later in this snapshot may have been preempted while
             # scheduling an earlier request. Do not schedule it again from the
@@ -323,6 +441,12 @@ class Scheduler:
             if request.status is RequestStatus.PREEMPTED:
                 continue
             if request.terminal_prefill_in_flight:
+                running_to_keep.append(request)
+                continue
+            if request.prefill_complete:
+                running_to_keep.append(request)
+                continue
+            if request.scheduling_held:
                 running_to_keep.append(request)
                 continue
             if grouped_phase is not None and request.is_prefill != (grouped_phase == "prefill"):
@@ -360,8 +484,8 @@ class Scheduler:
                     request, scheduled_req_ids, num_scheduled_tokens, output
                 )
                 if preempted is None:
-                    if request.constraint_spec is not None:
-                        stalled_constrained.append(request)
+                    if request.constraint_spec is not None or request.cache_reservation_id:
+                        stalled_non_recomputable.append(request)
                     running_to_keep.append(request)
                     continue
                 token_budget += preempted.get("returned_tokens", 0)
@@ -404,7 +528,7 @@ class Scheduler:
         ]
         if (
             allow_reject_stalled
-            and stalled_constrained
+            and stalled_non_recomputable
             and not output.scheduled_requests
             and not any(
                 request.num_output_placeholders or request.terminal_prefill_in_flight
@@ -412,13 +536,14 @@ class Scheduler:
             )
         ):
             # No running request can free a block or produce an in-flight result.
-            # Recompute preemption cannot reconstruct a constrained matcher, so
-            # fail one stalled request explicitly instead of spinning forever.
-            victim = stalled_constrained[-1]
+            # Neither a constrained matcher nor an external Prefill can be
+            # reconstructed by local recompute. Reject rather than spin forever.
+            victim = stalled_non_recomputable[-1]
+            reason = ("external Prefill cannot be recomputed locally" if victim.cache_reservation_id
+                      else "constrained recompute preemption is not supported")
             self.abort_request(victim.request_id)
             output.rejected_requests[victim.request_id] = (
-                f"Request {victim.request_id} cannot allocate KV blocks; "
-                "constrained recompute preemption is not supported"
+                f"Request {victim.request_id} cannot allocate KV blocks; {reason}"
             )
 
         # Keep grouped-cache commands single-phase. Prefill may run in the next
@@ -445,6 +570,12 @@ class Scheduler:
                 continue
 
             # Prefix cache lookup
+            native_ddr = self._native_ddr
+            if native_ddr is not None and request.scheduling_held:
+                remaining_waiting.append(request)
+                continue
+            if native_ddr is not None:
+                native_ddr.resume_request(request)
             if self.config.enable_prefix_cache:
                 if self.kv_cache_manager.has_groups:
                     (
@@ -454,11 +585,7 @@ class Scheduler:
                     ) = self.kv_cache_manager.acquire_group_prefix_blocks(
                         request.request_id,
                         request.group_block_hashes,
-                        max_cache_hit_tokens=max(
-                            0,
-                            request.num_prompt_tokens
-                            - max(1, self.config.speculative_prefix_cache_replay_tokens),
-                        ),
+                        max_cache_hit_tokens=request.group_checkpoint_boundary,
                     )
                     request.num_group_blocks_cached = (
                         self.kv_cache_manager.published_group_block_counts(
@@ -478,6 +605,13 @@ class Scheduler:
                     cached_blocks = self.kv_cache_manager.get_computed_blocks(
                         request.prompt_token_ids
                     )
+                    if native_ddr is not None:
+                        native_ddr.after_lookup(request)
+                        decision = native_ddr.lookup_after_hbm(
+                            request, cached_blocks, max(0, request.num_prompt_tokens - 1))
+                        if decision.kind == "WAIT":
+                            remaining_waiting.append(request)
+                            continue
                     if cached_blocks:
                         request.cached_block_ids = [b.block_id for b in cached_blocks]
                         request.num_computed_tokens = (
@@ -515,6 +649,23 @@ class Scheduler:
                     continue
 
             allocated = self._try_allocate_request_blocks(request, num_new)
+            if not allocated and native_ddr is not None:
+                # Reserve-time minimum headroom is not a guarantee for this
+                # actual suffix chunk. Do not let other completed loader pins
+                # permanently block the FCFS head; native-owned pins stay put.
+                if native_ddr.release_completed_restores():
+                    allocated = self._try_allocate_request_blocks(request, num_new)
+                if not allocated and cached_blocks:
+                    # Capacity may have changed while LOAD was pending, or a
+                    # long suffix chunk may need more pages than cold prefill.
+                    # Drop only this lookup's request refs and retry the normal
+                    # cold allocation once, without repeating prefix lookup.
+                    self._release_waiting_prefix_blocks(request)
+                    cold_num_new = self._limit_scheduled_tokens(request, token_budget)
+                    if cold_num_new > 0:
+                        allocated = self._try_allocate_request_blocks(request, cold_num_new)
+                        if allocated:
+                            num_new = cold_num_new
             if not allocated and grouped_prefix_hit:
                 # A grouped hit is rank-local. If its partition cannot hold the
                 # uncached suffix, release the hit and retry cold so an idle
@@ -657,6 +808,8 @@ class Scheduler:
         has_running_prefill = any(
             request.status is not RequestStatus.PREEMPTED
             and not request.terminal_prefill_in_flight
+            and not request.prefill_complete
+            and not request.scheduling_held
             and request.is_prefill
             and request.num_new_tokens_needed > 0
             for request in self.running
@@ -668,6 +821,8 @@ class Scheduler:
         has_decode = any(
             request.status is not RequestStatus.PREEMPTED
             and not request.terminal_prefill_in_flight
+            and not request.prefill_complete
+            and not request.scheduling_held
             and not request.is_prefill
             and request.num_new_tokens_needed > 0
             for request in self.running
@@ -825,10 +980,16 @@ class Scheduler:
                     continue
                 for token_id in token_ids:
                     request.output_token_ids.append(token_id)
-                    outputs.append(RequestOutput(
-                        request_id=request.request_id, new_token_id=token_id,
+                    output = RequestOutput(
+                        request_id=request.request_id,
+                        new_token_id=token_id,
                         num_output_tokens=len(request.output_token_ids),
-                    ))
+                        prefill_finished=self.config.stop_after_prefill,
+                    )
+                    outputs.append(output)
+                    if self.config.stop_after_prefill:
+                        request.prefill_complete = True
+                        break
                     if self._check_finish(request) is not None:
                         break
             else:
@@ -848,6 +1009,8 @@ class Scheduler:
         finished_ids: list[str] = []
         for request in self.running:
             if request.status.is_finished:
+                continue
+            if request.prefill_complete:
                 continue
             finish_reason = self._check_finish(request)
             if finish_reason is not None:
@@ -929,7 +1092,9 @@ class Scheduler:
                         request.num_group_blocks_cached,
                         scheduled.block_ids_by_group,
                         scheduled.cache_partition,
+                        request_id=request.request_id,
                         valid_from=request.group_cache_valid_from,
+                        checkpoint_boundary=request.group_checkpoint_boundary,
                     )
                 )
             else:
@@ -1040,17 +1205,22 @@ class Scheduler:
         # previously generated tokens into a fresh prefill, so never silently
         # restart a constrained request at the wrong grammar position.
         candidates = [
-            r for r in self.running
+            r
+            for r in self.running
             if r.request_id != exclude.request_id and r.constraint_spec is None
+            and not r.cache_reservation_id
+            and not r.prefill_complete and not r.scheduling_held
         ]
-        if self.kv_cache_manager.has_groups and exclude.cache_partition is not None:
-            same_partition = [
+        if self.kv_cache_manager.has_groups:
+            # Grouped pools cannot borrow another partition's physical pages.
+            # Preserve FCFS progress: a younger blocked request must not evict
+            # the older request whose completion can free its required capacity.
+            candidates = [
                 request
                 for request in candidates
-                if request.cache_partition == exclude.cache_partition
+                if request.arrival_time >= exclude.arrival_time
+                and (exclude.cache_partition is None or request.cache_partition == exclude.cache_partition)
             ]
-            if same_partition:
-                candidates = same_partition
         if not candidates:
             return None
         victim = max(candidates, key=lambda r: r.arrival_time)
@@ -1093,7 +1263,11 @@ class Scheduler:
         request.cached_block_ids = []
         request.allocated_block_ids = []
         if request.allocated_group_block_ids:
-            self.kv_cache_manager.release_all_group_requests(request.request_id)
+            if request.cache_reservation_id:
+                self.kv_cache_manager.release_group_cache(request.cache_reservation_id)
+                request.cache_reservation_id = ""
+            else:
+                self.kv_cache_manager.release_all_group_requests(request.request_id)
             request.allocated_group_block_ids = {}
         request.cache_partition = None
         request.num_group_blocks_cached = {}
@@ -1119,6 +1293,7 @@ class Scheduler:
                 confirmed_tokens,
                 request.num_group_blocks_cached,
                 valid_from=request.group_cache_valid_from,
+                checkpoint_boundary=request.group_checkpoint_boundary,
             )
             return
         total_blocks_computed = min(
