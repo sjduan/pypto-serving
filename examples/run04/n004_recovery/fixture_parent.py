@@ -114,6 +114,11 @@ def abort_fixture(signum, frame):
                 target.tb_frame.clear()
             target = target.tb_next
         _FIXTURE_ERROR.__traceback__ = None
+        # An install failure intentionally keeps the original frame context.
+        # Drop those now-cleared fixture frame objects too: CPython 3.11 can
+        # retain a materialized f_locals dictionary until the frame dies.
+        recovery = globals().get('_UFLOW_N004_RECOVERY_NS', {})
+        recovery.get('_ctx', {}).update(frames=[])
         _FIXTURE_ACCESS.buffer.release()
         _FIXTURE_ACCESS.port.client.view.close()
         _FIXTURE_CONTROL.close()

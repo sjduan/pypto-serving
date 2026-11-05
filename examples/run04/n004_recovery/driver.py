@@ -67,6 +67,7 @@ def install(root, shared):
     loader += ' for _ufload_name,_ufload_digest in _ufload_checks.items():\n  assert _ufload_hashlib.sha256(_ufload_Path(_ufload_name).read_bytes()).hexdigest()==_ufload_digest\n'
     loader += ' _ufload_ns={"__name__":"uflow_task_recovery","__file__":' + repr(str(shared / 'payload.py'))
     loader += ',"_UFLOW_RECOVERY_ROOT":' + repr(str(root)) + '}\n'
+    loader += ' _ufload_ns["_previous_namespace"]=globals().get("_UFLOW_N004_RECOVERY_NS")\n'
     loader += ' globals()["_UFLOW_N004_RECOVERY_NS"]=_ufload_ns\n'
     loader += ' exec(compile(_ufload_Path(' + repr(str(shared / 'payload.py')) + ').read_bytes(),'
     loader += repr(str(shared / 'payload.py')) + ',"exec"),_ufload_ns)\n'
