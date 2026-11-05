@@ -45,7 +45,15 @@ try:
             _ctx['busy'] = False
 
     _prepared = _actions.prepare(_ctx, _cfg)
-    assert signal.getsignal(signal.SIGUSR1) == _ctx['original']._request
+    _previous = signal.getsignal(signal.SIGUSR1)
+    if _previous != _ctx['original']._request:
+        assert _previous.__name__ == '_diagnostic_signal'
+        assert _previous.__globals__['__file__'] == _cfg['previous_payload']
+        assert _previous.__globals__['_root'] == Path(_cfg['previous_root'])
+        assert _previous.__globals__['_cfg']['pid'] == _cfg['pid']
+        assert _previous.__globals__['_ctx']['original'] is _ctx['original']
+        import hashlib
+        assert hashlib.sha256(Path(_cfg['previous_payload']).read_bytes()).hexdigest() == _cfg['previous_payload_sha256']
     signal.signal(signal.SIGUSR1, _diagnostic_signal)
     _write('handler-installed.json', _prepared)
 except BaseException as _install_error:

@@ -120,7 +120,10 @@ def run(root, shared, expected_manifest_sha, expected_driver_sha):
             'scope': 'advisory held for diagnostic only; original own context is still alive'})
         driver.save(root / 'config.json', {'pid': PID, 'birth': BIRTH, 'children': CHILDREN,
             'pool_id': POOL, 'client_id': CLIENT, 'lease_id': LEASE, 'source_hashes': source_hashes,
-            'target_source': str(SOURCE / 'examples/run04/pool_native_probe.py')})
+            'target_source': str(SOURCE / 'examples/run04/pool_native_probe.py'),
+            'previous_payload': str(BASE / 'f-n005-recovery-r001/shared/payload.py'),
+            'previous_root': str(BASE / 'f-n005-recovery-r001/diagnostic-c001'),
+            'previous_payload_sha256': '9fa7eb239b643cd6c67d74a7dc84f57e1fd60d8b66bd17f66c8d35fde857449c'})
         assert driver.install(root, shared), 'install failed; original objects/PID retained'
         assert driver.birth(PID) == BIRTH and driver.tracer(PID) == 0
         os.kill(PID, signal.SIGUSR1)  # The newly installed action is diagnostic only.

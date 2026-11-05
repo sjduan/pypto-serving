@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """Read-only original n005 object diagnosis; preserve every tensor, frame, pin and obligation."""
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields, is_dataclass
 import hashlib
 import inspect
 from pathlib import Path
@@ -16,7 +16,9 @@ import sys
 
 def serial(value):
     if is_dataclass(value):
-        return serial(asdict(value))
+        # Do not deepcopy native descriptor fields: nanobind canonical
+        # identities are deliberately non-pickleable and must stay untouched.
+        return {field.name: serial(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, bytes):
         return {'hex': value.hex()}
     if isinstance(value, dict):
