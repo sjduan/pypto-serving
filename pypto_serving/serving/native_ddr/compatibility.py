@@ -126,7 +126,8 @@ def build_compatibility(loaded, assets, worker_epoch, layout):
                    for p in sorted(root.rglob("*.py")) if "__pycache__" not in p.parts}
         components[name] = {"source_manifest_sha256": hashlib.sha256(canonical_json(entries)).hexdigest(),
                             "source_files": len(entries)}
-    for name in ("pypto", "pypto.pypto_core", "pypto.runtime", "simpler", "_task_interface", 'uflow.managed_pool'):
+    for name in ("pypto", "pypto.pypto_core", "pypto.runtime", "simpler", "_task_interface",
+                 'uflow', 'uflow.managed_pool', 'uflow._managed_pool_wire'):
         module = importlib.import_module(name)
         path = Path(module.__file__).resolve()
         components[name] = {"sha256": digest_file(path),

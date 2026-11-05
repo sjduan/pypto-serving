@@ -6,216 +6,353 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""One SDK normalization seam; no SDK/provider protocol leaks into scheduling.
-
-The public v1 method surface is frozen by the D1 contract. Concrete SDK record
-bindings are checked here against the manager-accepted P1 pin before real use.
-Unrecognized records fail closed rather than inventing allocation/stop proofs.
-"""
+"""Normalize accepted P1 6c885833 control records; UFlow remains sole authority."""
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import asdict, fields, is_dataclass
 import hashlib
 import importlib
 from pathlib import Path
+import uuid
 
 from .managed_pool import (
     CommittedRange, ManagedPoolAccess, PoolAck, PoolBlock, PoolIdentity, PoolLease, PoolOutcomeUnknown,
+    interval, positive,
 )
 
-
-def record(value):
-    if is_dataclass(value) and not isinstance(value, type):
-        return asdict(value)
-    if isinstance(value, Mapping):
-        return dict(value)
-    raise ValueError('accepted managed SDK must expose a typed record or mapping')
+SDK_SHA256 = '366f3ea883cec08efd62f23f9ebf2afa8546c02a777ff25fdf753fee1debff0e'
+SDK_FILES = {'managed_pool.py': SDK_SHA256,
+             '_managed_pool_wire.py': 'c61fdf8f9c19261b9386ae5c64e1ac8e2b81cf41238ee9c8f3c24c7cab59015e',
+             '__init__.py': 'bb529fe27ed36eb0a4e5ced2e739411e270bcf13383001b601ca517064f6f328'}
+_STARTUP_OBLIGATIONS = {}
 
 
-def construct(cls, value, **nested):
-    data = record(value)
-    allowed = {item.name for item in fields(cls)}
-    if data.keys() - allowed:
-        raise ValueError(f'unsupported {cls.__name__} record fields: {sorted(data.keys() - allowed)}')
-    for name, convert in nested.items():
-        if name in data:
-            data[name] = convert(data[name])
-    return cls(**data)
+class _QueriedRejection(ValueError):
+    pass
+
+
+def accepted_sdk():
+    module = importlib.import_module('uflow.managed_pool')
+    directory = Path(module.__file__).resolve(strict=True).parent
+    for name, expected in SDK_FILES.items():
+        if hashlib.sha256((directory / name).read_bytes()).hexdigest() != expected:
+            raise ValueError(f'managed control SDK differs from accepted P1: {name}')
+    return module
+
+
+def exact(value, names):
+    if type(value) is not dict or set(value) != set(names):
+        raise ValueError('unexpected accepted SDK response fields')
+    return value
 
 
 def identity(value):
-    return construct(PoolIdentity, value)
-
-
-def block(value):
-    return construct(PoolBlock, value)
-
-
-def lease(value):
-    return construct(PoolLease, value, pool=identity, block=block)
-
-
-def committed(value):
-    return construct(CommittedRange, value, block=block)
-
-
-def acknowledgement(value):
-    return construct(PoolAck, value, pool=identity)
+    # The accepted SDK validates all canonical fields before FD mapping. Repeat
+    # its pinned schema check here, before converting numeric resource IDs.
+    accepted_sdk()._pool_descriptor(value, registered=True)
+    canonical = value['canonical']
+    return PoolIdentity(value['pool_id'], value['pool_epoch'], value['provider_session'], value['client_session'],
+        value['nbytes'], canonical['dev'], canonical['inode'], str(value['resource_id']), str(value['placement_id']),
+        str(value['binding_id']), value['access_generation'], canonical['owner_instance_id'], canonical['buffer_id'],
+        canonical['generation'], value['resource_generation'])
 
 
 class SdkManagedPoolPort:
-    """Retain SDK-issued objects; Rust/UFlow alone decides grants and versions."""
+    """Retain original SDK objects, pending requests and full child identities."""
     def __init__(self, client):
+        self.sdk = accepted_sdk()
         self.client = client
         self.identity = identity(client.view.descriptor)
         self.buffer = client.view.buffer
-        self._blocks = {}
-        self._leases = {}
-        self._operations = {}
-        self._unparsed_grants = []
-        self._unresolved_acquires = []
+        self._blocks, self._leases, self._operations, self._children = {}, {}, {}, {}
+        self._unregister_operation = uuid.uuid4().hex
 
-    def allocate_range(self, nbytes, alignment):
-        raw = self.client.allocate_range(nbytes, alignment)
-        value = block(raw)
-        value.validate(self.identity)
-        self._blocks[(value.block_id, value.generation)] = raw
+    def _block(self, raw):
+        pool = self.identity
+        if type(raw) is not self.sdk.PoolBlock or (raw.pool_id, raw.pool_epoch, raw.provider_session) != (
+                pool.pool_id, pool.pool_epoch, pool.provider_session):
+            raise ValueError('SDK allocation changed pool/provider incarnation')
+        value = PoolBlock(raw.pool_id, raw.pool_epoch, raw.block_id, raw.generation, raw.offset, raw.nbytes)
+        value.validate(pool)
         return value
 
-    def acquire_range(self, allocation, mode, expected_generation, byte_offset, nbytes):
-        if self._unparsed_grants or self._unresolved_acquires:
-            raise PoolOutcomeUnknown('an undecodable grant still retains the pool access')
-        allocation.validate(self.identity)
-        raw_block = self._blocks.get((allocation.block_id, allocation.generation), asdict(allocation))
-        pending = (raw_block, mode, expected_generation, byte_offset, nbytes)
-        self._unresolved_acquires.append(pending)
-        try:
-            raw = self.client.acquire_range(raw_block, mode, expected_generation,
-                                            byte_offset=byte_offset, nbytes=nbytes)
-        except Exception as error:
-            # The accepted SDK's explicit rejection types will be bound at P1
-            # integration. Until then an exception cannot prove no remote grant.
-            raise PoolOutcomeUnknown('SDK range acquisition has no terminal grant/rejection record') from error
-        try:
-            value = lease(raw)
-            if value.lease_id in self._leases:
-                raise ValueError('SDK reused a live range lease identity')
-        except Exception as error:
-            self._unparsed_grants.append(raw)
-            raise PoolOutcomeUnknown('SDK range grant cannot be normalized safely') from error
-        self._leases[value.lease_id] = (value, raw)
-        self._unresolved_acquires.remove(pending)
+    def _raw_block(self, value):
+        value.validate(self.identity)
+        return self._blocks.get((value.block_id, value.generation)) or self.sdk.PoolBlock(
+            value.pool_id, value.pool_epoch, self.identity.provider_session, value.block_id,
+            value.generation, value.byte_offset, value.nbytes)
+
+    def _lease(self, raw, allocation):
+        pool = self.identity
+        if type(raw) is not self.sdk.PoolLease or (
+                raw.pool_id, raw.pool_epoch, raw.provider_session, raw.client_session, raw.access_generation) != (
+                pool.pool_id, pool.pool_epoch, pool.provider_session, pool.client_session, pool.access_generation):
+            raise ValueError('SDK range lease changed registered access identity')
+        value = PoolLease(pool, allocation, raw.lease_id, raw.lease_generation, raw.offset, raw.nbytes,
+            raw.mode, 'Writing' if raw.mode == 'w' else 'Committed', raw.content_version,
+            raw.client_session, raw.lease_id, raw.content_id)
+        value.validate(pool, allocation, raw.mode, raw.offset, raw.nbytes)
         return value
 
     def _retained(self, value):
         retained = self._leases.get(value.lease_id)
         if retained is None or retained[0] != value:
-            raise ValueError('SDK operation has no exact retained lease record')
+            raise ValueError('SDK operation has no exact retained lease')
         return retained[1]
 
+    def _queried_value(self, operation_id):
+        result = self.client.query_operation(operation_id)
+        exact(result, ('state', 'response'))
+        if result['state'] == 'Rejected':
+            response = exact(result['response'], ('schema', 'status', 'operation_id', 'code', 'detail'))
+            if (type(response['schema']) is not int or response['schema'] != 1
+                    or response['status'] != 'error' or response['code'] != 'Rejected'
+                    or response['operation_id'] != operation_id):
+                raise ValueError('queried rejection changed the original operation')
+            raise _QueriedRejection(response['detail'])
+        if result['state'] != 'Completed':
+            return None
+        response = exact(result['response'], ('schema', 'status', 'operation_id', 'result'))
+        if (type(response['schema']) is not int or response['schema'] != 1 or response['status'] != 'ok'
+                or response['operation_id'] != operation_id):
+            raise ValueError('query returned a different or unconfirmed original operation')
+        return response['result']
+
+    def _invoke(self, kind, operation_id, arguments, call):
+        pending = self._operations.get(operation_id)
+        if pending is None:
+            pending = self._operations[operation_id] = {'kind': kind, 'arguments': arguments}
+        elif (pending['kind'], pending['arguments']) != (kind, arguments):
+            raise ValueError('operation ID reused with a different local request')
+        try:
+            try:
+                raw = call()
+            except self.sdk.ManagedPoolUnknown as error:
+                pending['error'] = error  # includes the actual SDK client and original operation ID
+                if error.client is not self.client or error.operation_id != operation_id:
+                    raise ValueError('unknown SDK outcome lost its original client/operation identity') from error
+                raw = self._queried_value(operation_id)
+                if raw is None:
+                    raise PoolOutcomeUnknown('same-operation query has no confirmed terminal result') from error
+            except self.sdk.ManagedPoolError as error:
+                if (error.client is not self.client or error.operation_id != operation_id or not error.response
+                        or error.response.get('code') != 'Rejected' or error.response.get('status') != 'error'):
+                    raise PoolOutcomeUnknown('SDK rejection has no exact request identity') from error
+                del self._operations[operation_id]
+                raise ValueError(str(error)) from error  # confirmed rejection; no grant/native action
+            pending['raw'] = raw
+            result = self._decode(kind, operation_id, arguments, raw)
+        except _QueriedRejection as error:
+            del self._operations[operation_id]
+            raise ValueError(str(error)) from error
+        except ValueError:
+            if operation_id not in self._operations:
+                raise  # only the confirmed SDK rejection above discharges this request
+            raise PoolOutcomeUnknown('SDK result cannot be bound to the retained request') from None
+        except PoolOutcomeUnknown:
+            raise
+        except Exception as error:
+            pending['error'] = error
+            raise PoolOutcomeUnknown('SDK operation outcome remains retained') from error
+        del self._operations[operation_id]
+        return result
+
+    def _decode(self, kind, operation_id, arguments, raw):
+        if kind == 'allocate':
+            original = self.sdk.PoolBlock.from_dict(raw) if type(raw) is dict else raw
+            value = self._block(original)
+            if value.nbytes != arguments[0] or value.byte_offset % arguments[1]:
+                raise ValueError('allocation changed requested size/alignment')
+            self._blocks[value.block_id, value.generation] = original
+            return value
+        if kind == 'acquire':
+            original = self.sdk.PoolLease.from_dict(raw) if type(raw) is dict else raw
+            allocation, mode, generation, offset, nbytes = arguments
+            value = self._lease(original, allocation)
+            value.validate(self.identity, allocation, mode, allocation.byte_offset + offset, nbytes)
+            if value.lease_id in self._leases or value.block.generation != generation:
+                raise ValueError('SDK reused a live lease or allocation generation')
+            self._leases[value.lease_id] = value, original
+            return value
+        if kind == 'commit':
+            value, content_id, nbytes = arguments
+            exact(raw, ('committed', 'content_version', 'content_id', 'lease_id'))
+            positive(raw['content_version'], 'committed content version')
+            if raw['committed'] is not True or (raw['lease_id'], raw['content_id']) != (value.lease_id, content_id):
+                raise ValueError('commit ACK changed completed writer/content')
+            result = CommittedRange(self.identity.pool_id, self.identity.pool_epoch, self.identity.provider_session,
+                value.block, value.byte_offset, nbytes, raw['content_version'], content_id, operation_id, value.lease_id)
+            result.validate(self.identity, content_id=content_id)
+            del self._leases[value.lease_id]
+            return result
+        if kind == 'release':
+            value = arguments[0]
+            exact(raw, ('released', 'lease_id'))
+            if raw['released'] is not True or raw['lease_id'] != value.lease_id:
+                raise ValueError('release ACK changed held lease')
+            del self._leases[value.lease_id]
+            return PoolAck(operation_id, 'release', self.identity, value.lease_id, value.lease_generation, True)
+        expected = {'attach': {'attached': True}, 'detach': {'detached': True, 'native_drain_attested': True},
+                    'unregister': {'stopping': True}}
+        if kind in expected:
+            exact(raw, expected[kind])
+            if any(raw[key] is not flag for key, flag in expected[kind].items()):
+                raise ValueError('child/unregister ACK unconfirmed')
+            pid, birth = arguments if kind != 'unregister' else (0, 0)
+            return PoolAck(operation_id, kind + '_child' if kind != 'unregister' else kind,
+                           self.identity, applied=True, child_pid=pid, child_birth=birth)
+        if kind == 'unmapped':
+            exact(raw, ('unmapped', 'unknown_content_invalid_not_committed'))
+            if raw['unmapped'] is not True or type(raw['unknown_content_invalid_not_committed']) is not bool:
+                raise ValueError('unmap ACK unconfirmed')
+            return PoolAck(operation_id, 'unmapped', self.identity, applied=True)
+        raise ValueError('unsupported local control operation')
+
+    def _admit(self):
+        if self._operations:
+            raise PoolOutcomeUnknown('a retained SDK operation prevents new admission')
+
+    def allocate_range(self, nbytes, alignment):
+        self._admit()
+        operation = uuid.uuid4().hex
+        return self._invoke('allocate', operation, (nbytes, alignment),
+            lambda: self.client.allocate_range(nbytes, alignment, operation_id=operation))
+
+    def acquire_range(self, allocation, mode, generation, byte_offset, nbytes):
+        self._admit()
+        raw_block = self._raw_block(allocation)
+        operation = uuid.uuid4().hex
+        return self._invoke('acquire', operation, (allocation, mode, generation, byte_offset, nbytes),
+            lambda: self.client.acquire_range(raw_block, mode, generation, byte_offset=byte_offset,
+                                              nbytes=nbytes, operation_id=operation))
+
     def revalidate(self, value):
-        self._retained(value)
-        snapshot = record(self.client.snapshot())
-        current = [lease(item) for item in snapshot['leases']
-                   if record(item).get('lease_id') == value.lease_id]
-        if len(current) != 1 or current[0] != value:
-            raise ValueError('current UFlow snapshot no longer holds the exact range lease')
+        raw = self._retained(value)
+        snapshot = self.client.snapshot()
+        pools = [row for row in snapshot['pools'] if row['pool_id'] == self.identity.pool_id]
+        if len(pools) != 1 or pools[0]['state'] != 'Allocated' or pools[0]['frozen'] is not False:
+            raise ValueError('managed pool no longer allocated/admitting')
+        pool = pools[0]
+        descriptor = {key: pool[key] for key in self.sdk.POOL_FIELDS}
+        descriptor.update(client_session=self.identity.client_session, access_generation=self.identity.access_generation,
+                          access='rw')
+        if identity(descriptor) != self.identity:
+            raise ValueError('pool snapshot changed canonical resource identity')
+        clients = [row for row in pool['clients'] if row['client_session'] == self.identity.client_session]
+        if (len(clients) != 1 or clients[0]['access_generation'] != self.identity.access_generation
+                or type(clients[0]['access_generation']) is not int
+                or clients[0]['state'] != 'Mapped' or clients[0]['closing'] is not False or clients[0]['access'] != 'rw'):
+            raise ValueError('client incarnation no longer mapped/admitting')
+        allocations = [row for row in pool['ranges']['allocations'] if row['block_id'] == value.block.block_id]
+        leases = [row for row in pool['ranges']['leases'] if row['lease_id'] == value.lease_id]
+        if len(allocations) != 1 or len(leases) != 1:
+            raise ValueError('current snapshot has no unique retained allocation/lease')
+        allocation, current = allocations[0], dict(leases[0])
+        exact(allocation, ('block_id', 'generation', 'offset', 'nbytes', 'segments'))
+        actual_block = self.sdk.PoolBlock(self.identity.pool_id, self.identity.pool_epoch, self.identity.provider_session,
+            allocation['block_id'], allocation['generation'], allocation['offset'], allocation['nbytes'])
+        if actual_block != self._raw_block(value.block):
+            raise ValueError('allocation incarnation changed while native was pending')
+        if current.pop('state') != ('Writing' if value.mode == 'w' else 'Reading'):
+            raise ValueError('range lease is no longer active')
+        current.update(pool_id=self.identity.pool_id, pool_epoch=self.identity.pool_epoch,
+                       provider_session=self.identity.provider_session, access_generation=self.identity.access_generation)
+        if self.sdk.PoolLease.from_dict(current) != raw:
+            raise ValueError('snapshot no longer holds the exact registered range lease')
+        end, cursor = value.byte_offset + value.nbytes, value.byte_offset
+        for segment in allocation['segments']:
+            exact(segment, ('offset', 'nbytes', 'state', 'content_version', 'content_id'))
+            interval(segment['offset'], segment['nbytes'], self.identity.nbytes)
+            if type(segment['content_version']) is not int or segment['content_version'] < 0:
+                raise ValueError('range snapshot has an invalid content version')
+            start, stop = segment['offset'], segment['offset'] + segment['nbytes']
+            if stop <= cursor or start >= end:
+                continue
+            if (start > cursor or segment['state'] != ('Writing' if value.mode == 'w' else 'Committed')
+                    or (segment['content_version'], segment['content_id']) != (value.content_version, value.content_id)):
+                raise ValueError('current range content no longer covers the retained version')
+            cursor = min(end, stop)
+        if cursor != end:
+            raise ValueError('range snapshot has a content gap')
 
     def commit_write(self, value, content_id, nbytes, operation_id):
-        self._operations[operation_id] = ('commit', value, content_id)
-        raw = self.client.commit_write(self._retained(value), content_id, nbytes,
-                                       operation_id=operation_id)
-        result = committed(raw)
-        self._validate_commit(value, result, content_id, operation_id)
-        del self._leases[value.lease_id]
-        del self._operations[operation_id]
-        return result
-
-    def _validate_commit(self, value, result, content_id, operation_id):
-        result.validate(self.identity, content_id=content_id)
-        if (result.operation_id, result.writer_lease_id, result.block, result.byte_offset,
-                result.content_version) != (operation_id, value.lease_id, value.block,
-                                            value.byte_offset, value.content_version):
-            raise ValueError('SDK commit acknowledgement identity mismatch')
+        original = self._retained(value)
+        return self._invoke('commit', operation_id, (value, content_id, nbytes),
+            lambda: self.client.commit_write(original, content_id, nbytes, operation_id=operation_id))
 
     def release(self, value, operation_id):
-        self._operations[operation_id] = ('release', value, None)
-        raw = self.client.release(self._retained(value), operation_id=operation_id)
-        result = acknowledgement(raw)
-        result.validate(self.identity, 'release', operation_id, value)
-        del self._leases[value.lease_id]
-        del self._operations[operation_id]
-        return result
+        original = self._retained(value)
+        return self._invoke('release', operation_id, (value,),
+            lambda: self.client.release(original, operation_id=operation_id))
 
     def query_operation(self, operation_id):
-        raw = self.client.query_operation(operation_id)
+        pending = self._operations[operation_id]
+        raw = self._queried_value(operation_id)
         if raw is None:
             return None
-        data = record(raw)
-        operation = self._operations.get(operation_id)
-        if operation is None:
-            raise ValueError('queried operation has no retained local request identity')
-        kind, value, expected_content = operation
-        if kind == 'commit' and 'content_id' in data:
-            result = committed(raw)
-            saved = self._leases.get(result.writer_lease_id)
-            if saved is None:
-                raise ValueError('queried commit has no retained original writer')
-            self._validate_commit(saved[0], result, expected_content, operation_id)
-            del self._leases[result.writer_lease_id]
-            del self._operations[operation_id]
-            return result
-        result = acknowledgement(raw)
-        result.validate(self.identity, 'unmapped' if kind == 'unmapped' else 'release', operation_id, value)
-        if value is not None:
-            del self._leases[result.lease_id]
+        result = self._decode(pending['kind'], operation_id, pending['arguments'], raw)
         del self._operations[operation_id]
         return result
 
     def report_unknown(self, value, reason):
-        retained = self._leases.get(getattr(value, 'lease_id', ''))
-        self.client.report_unknown(retained[1] if retained else None, reason)
+        raw = self._leases.get(getattr(value, 'lease_id', ''), (None, None))[1]
+        bounded = str(reason).encode('utf-8')[:220].decode('utf-8', errors='ignore') or 'unknown serving obligation'
+        self.client.report_unknown(raw, reason=bounded, operation_id=uuid.uuid4().hex)
 
     def attach_child(self, pid, birth):
-        return acknowledgement(self.client.attach_child(pid, birth))
+        raw = self.sdk.process_birth(pid)
+        if raw['pid'] != pid or raw['starttime_ticks'] != birth:
+            raise ValueError('native child birth identity changed')
+        self._children[pid, birth] = raw
+        operation = uuid.uuid4().hex
+        return self._invoke('attach', operation, (pid, birth),
+            lambda: self.client.attach_child(pid, raw, operation_id=operation))
 
     def detach_child(self, pid, birth):
-        return acknowledgement(self.client.detach_child(pid, birth))
+        raw = self._children[pid, birth]
+        operation = uuid.uuid4().hex
+        ack = self._invoke('detach', operation, (pid, birth),
+            lambda: self.client.detach_child(pid, raw, native_drained=True, operation_id=operation))
+        del self._children[pid, birth]
+        return ack
 
     def begin_unregister(self):
-        self.client.begin_unregister()
+        return self._invoke('unregister', self._unregister_operation, (),
+            lambda: self.client.begin_unregister(operation_id=self._unregister_operation))
 
     def close_view(self):
-        if self._leases or self._unparsed_grants or self._unresolved_acquires:
-            raise RuntimeError('retained SDK leases prevent access-view close')
+        if self._leases or self._children or any(item['kind'] != 'unmapped' for item in self._operations.values()):
+            raise RuntimeError('retained SDK obligations prevent access-view close')
         self.client.view.close()
 
     def ack_unmapped(self, operation_id):
-        self._operations[operation_id] = ('unmapped', None, None)
-        ack = acknowledgement(self.client.ack_unmapped(operation_id=operation_id))
-        ack.validate(self.identity, 'unmapped', operation_id)
-        del self._operations[operation_id]
-        return ack
+        # ManagedPoolAccess calls this only with no range/child/unknown refs,
+        # after caller-owned native drain and a successful real view/FD close.
+        return self._invoke('unmapped', operation_id, (),
+            lambda: self.client.ack_unmapped(native_drained=True, operation_id=operation_id))
 
 
 def register_managed_pool(config):
-    """Register access only. No create/destroy/provider allocator API is used."""
-    module = importlib.import_module('uflow.managed_pool')
-    path = Path(module.__file__).resolve(strict=True)
-    if hashlib.sha256(path.read_bytes()).hexdigest() != config.sdk_sha256:
-        raise ValueError('managed pool SDK differs from the accepted pinned module')
-    client = module.ManagedPoolClient.register(endpoint=config.pool_endpoint, pool_id=config.pool_id,
-                                              expected_epoch=config.pool_epoch, access='rw')
+    """Only register access. Retain uncertain startup clients; never create/destroy."""
+    if config.sdk_sha256 != SDK_SHA256:
+        raise ValueError('configured SDK is not the manager-accepted P1 module')
+    module, operation = accepted_sdk(), uuid.uuid4().hex
+    try:
+        client = module.ManagedPoolClient.register(config.pool_endpoint, config.pool_id, config.pool_epoch,
+                                                   access='rw', operation_id=operation)
+    except module.ManagedPoolError as error:
+        if error.client is not None:
+            _STARTUP_OBLIGATIONS[operation] = error.client, error
+        raise
     try:
         port = SdkManagedPoolPort(client)
         if (port.identity.pool_id, port.identity.pool_epoch) != (config.pool_id, config.pool_epoch):
-            raise ValueError('registered access belongs to an unexpected managed pool')
+            raise ValueError('registered pool differs from configuration')
         return ManagedPoolAccess(port)
-    except BaseException:
-        # No tensor, child, range grant or native job exists at this boundary.
-        # Use the SDK's explicit close path; any failure remains a startup error.
-        client.begin_unregister()
-        client.view.close()
-        client.ack_unmapped()
+    except BaseException as error:
+        try:
+            client.begin_unregister()
+            client.view.close()
+            client.ack_unmapped(native_drained=True)
+        except BaseException as close_error:
+            _STARTUP_OBLIGATIONS[operation] = client, error, close_error
         raise

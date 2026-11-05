@@ -109,7 +109,10 @@ class PoolLease:
         block.validate(pool)
         opaque(self.lease_id, 'range lease ID')
         positive(self.lease_generation, 'lease generation')
-        positive(self.content_version, 'content version')
+        if mode == 'r':
+            positive(self.content_version, 'committed content version')
+        elif type(self.content_version) is not int or self.content_version != 0 or self.content_id:
+            raise ValueError('write lease cannot claim a committed content version')
         opaque(self.token, 'range capability token')
         if self.holder_session != pool.client_session:
             raise ValueError('range lease holder is not the registered client session')
@@ -322,9 +325,9 @@ class ManagedPoolAccess:
             if not isinstance(committed, CommittedRange):
                 raise ValueError('commit has no typed committed range receipt')
             committed.validate(self.identity, content_id=content_id)
-            if (committed.block, committed.byte_offset, committed.content_version,
+            if (committed.block, committed.byte_offset,
                     committed.operation_id, committed.writer_lease_id) != (
-                    lease.block, lease.byte_offset, lease.content_version, operation_id, lease.lease_id):
+                    lease.block, lease.byte_offset, operation_id, lease.lease_id):
                 raise ValueError('commit receipt does not match the exact completed write')
         except Exception as error:
             self.report_unknown(lease, str(error))

@@ -49,7 +49,7 @@ class FakePort:
         previous = self.committed_ranges.get(block.block_id)
         if mode == 'r' and previous is None:
             raise ValueError('fake range has no committed content')
-        version = (previous.content_version if mode == 'r' else previous.content_version + 1) if previous else 1
+        version = previous.content_version if mode == 'r' else 0
         lease = PoolLease(self.identity, block, f'lease{self.serial}', 1,
                           block.byte_offset + byte_offset, nbytes, mode,
                           'Writing' if mode == 'w' else 'Committed', version,
@@ -64,8 +64,10 @@ class FakePort:
 
     def commit_write(self, lease, content_id, nbytes, operation_id):
         self.calls.append(('commit', operation_id))
+        previous = self.committed_ranges.get(lease.block.block_id)
         result = CommittedRange('pool', 'epoch', 'provider', lease.block, lease.byte_offset,
-                                nbytes, lease.content_version, content_id, operation_id, lease.lease_id)
+                                nbytes, previous.content_version + 1 if previous else 1,
+                                content_id, operation_id, lease.lease_id)
         self.results[operation_id] = result
         self.committed_ranges[lease.block.block_id] = result
         if self.lose_commit:
@@ -98,6 +100,28 @@ class FakePort:
     def ack_unmapped(self, operation_id):
         self.calls.append(('unmapped', operation_id))
         return PoolAck(operation_id, 'unmapped', self.identity, applied=True)
+
+
+def sdk_descriptor():
+    """Concrete accepted P1 schema fixture, never a real provider descriptor."""
+    return {'schema': 1, 'pool_id': 'pool', 'pool_epoch': 'epoch', 'provider_session': 'provider',
+        'provider_kind': 'posix_shm_simpler', 'nbytes': 134217728, 'resource_id': 100,
+        'placement_id': 10000, 'binding_id': 40000, 'resource_generation': 1, 'state': 'Allocated',
+        'client_session': 'client', 'access_generation': 1, 'access': 'rw', 'canonical': {
+            'kind': 'posix_shm_simpler', 'owner_instance_id': '0102030405060708', 'buffer_id': 100,
+            'generation': 1, 'address_space': 0, 'access': 2, 'backend_kind': 1,
+            'nbytes': 134217728, 'body_hex': '746573742d6f6e6c79', 'owner_worker_path_id': 0,
+            'dev': 1, 'inode': 2, 'native_descriptor': 'fixture-only'}}
+
+
+def require_sdk(test):
+    import importlib
+    try:
+        importlib.import_module('uflow.managed_pool')
+    except ModuleNotFoundError as error:
+        if error.name in ('uflow', 'uflow.managed_pool'):
+            test.skipTest('optional accepted UFlow SDK is not installed')
+        raise
 
 
 class ManagedPoolProtocolTests(unittest.TestCase):
@@ -411,26 +435,24 @@ class ManagedCompatibilityTests(unittest.TestCase):
             data_compatibility_digest(descriptor)
 
     def test_sdk_normalization_rejects_unknown_record_fields_and_bool_generations(self):
+        require_sdk(self)
         from pypto_serving.serving.native_ddr.managed_pool_sdk import identity
-        from dataclasses import asdict
-        port = FakePort()
-        try:
-            data = asdict(port.identity)
-            self.assertEqual(identity(data), port.identity)
-            with self.assertRaises(ValueError):
-                identity({**data, 'private_address': 12345})
-            with self.assertRaises(ValueError):
-                identity({**data, 'simpler_generation': True})
-        finally:
-            port.buffer.close()
+        data = sdk_descriptor()
+        self.assertEqual(identity(data).resource_id, '100')
+        self.assertEqual(identity(data).simpler_owner, '0102030405060708')
+        with self.assertRaises(ValueError):
+            identity({**data, 'private_address': 12345})
+        data['canonical']['generation'] = True
+        with self.assertRaises(ValueError):
+            identity(data)
 
     def test_unparseable_sdk_grant_is_retained_and_blocks_close_and_new_native_admission(self):
-        from dataclasses import asdict
+        require_sdk(self)
         from types import SimpleNamespace
         from pypto_serving.serving.native_ddr.managed_pool_sdk import SdkManagedPoolPort
         fake = FakePort()
         raw = {'unexpected-grant-format': 'must-retain'}
-        client = SimpleNamespace(view=SimpleNamespace(descriptor=asdict(fake.identity), buffer=fake.buffer),
+        client = SimpleNamespace(view=SimpleNamespace(descriptor=sdk_descriptor(), buffer=fake.buffer),
             acquire_range=lambda *args, **kwargs: raw, report_unknown=lambda *_: None)
         port = SdkManagedPoolPort(client)
         access = ManagedPoolAccess(port)
@@ -438,7 +460,7 @@ class ManagedCompatibilityTests(unittest.TestCase):
         try:
             with self.assertRaises(PoolOutcomeUnknown):
                 access.acquire(block, 'w')
-            self.assertIs(port._unparsed_grants[0], raw)
+            self.assertIs(next(iter(port._operations.values()))['raw'], raw)
             self.assertTrue(access.unknown)
             with self.assertRaisesRegex(RuntimeError, 'obligations'):
                 access.acquire(block, 'w')
@@ -451,13 +473,13 @@ class ManagedCompatibilityTests(unittest.TestCase):
             fake.buffer.close()
 
     def test_acquire_timeout_keeps_the_exact_unresolved_sdk_request_and_blocks_unmap(self):
-        from dataclasses import asdict
+        require_sdk(self)
         from types import SimpleNamespace
         from pypto_serving.serving.native_ddr.managed_pool_sdk import SdkManagedPoolPort
         fake = FakePort()
         def lose_reply(*_, **__):
             raise TimeoutError('grant reply lost')
-        client = SimpleNamespace(view=SimpleNamespace(descriptor=asdict(fake.identity), buffer=fake.buffer),
+        client = SimpleNamespace(view=SimpleNamespace(descriptor=sdk_descriptor(), buffer=fake.buffer),
                                   acquire_range=lose_reply, report_unknown=lambda *_: None)
         port = SdkManagedPoolPort(client)
         access = ManagedPoolAccess(port)
@@ -465,7 +487,9 @@ class ManagedCompatibilityTests(unittest.TestCase):
         try:
             with self.assertRaises(PoolOutcomeUnknown):
                 access.acquire(block, 'w')
-            self.assertEqual(port._unresolved_acquires, [(asdict(block), 'w', 1, GUARD_BYTES, BLOCK_BYTES)])
+            pending = next(iter(port._operations.values()))
+            self.assertEqual(pending['kind'], 'acquire')
+            self.assertEqual(pending['arguments'], (block, 'w', 1, GUARD_BYTES, BLOCK_BYTES))
             self.assertTrue(access.unknown)
             with self.assertRaisesRegex(RuntimeError, 'retained SDK'):
                 port.close_view()
