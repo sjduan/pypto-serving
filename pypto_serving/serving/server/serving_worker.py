@@ -234,7 +234,11 @@ class WorkerProcess:
             if native_config.enabled:
                 from pypto_serving.serving.native_ddr.compatibility import capture_full_assets
                 from pypto_serving.serving.native_ddr.managed_pool_sdk import register_managed_pool
+                from pypto_serving.serving.native_ddr.cooperative_close import CooperativePoolClose
+                recovery_root = Path(pypto_build_dir or '.pypto_build') / f'managed-close-{os.getpid()}'
+                self._native_ddr_recovery = CooperativePoolClose(recovery_root)
                 self._native_ddr_pool_access = register_managed_pool(native_config)
+                self._native_ddr_recovery.bind_access(self._native_ddr_pool_access)
                 assets = capture_full_assets(self.config.model_dir)
                 if any(key in executor_kwargs for key in (
                         'native_ddr_config', 'native_ddr_probe_slots', 'native_ddr_pool_access')):
@@ -1496,6 +1500,9 @@ class WorkerProcess:
             access = getattr(self, '_native_ddr_pool_access', None)
             if access is not None and not access.closed:
                 access.close()
+            recovery = getattr(self, '_native_ddr_recovery', None)
+            if recovery is not None and access is not None and access.closed:
+                recovery.restore_after_normal_close()
             return
 
         close = getattr(executor, "close", None)
@@ -1510,6 +1517,9 @@ class WorkerProcess:
         access = getattr(self, '_native_ddr_pool_access', None)
         if access is not None and not access.closed:
             access.close()
+        recovery = getattr(self, '_native_ddr_recovery', None)
+        if recovery is not None and access is not None and access.closed:
+            recovery.restore_after_normal_close()
         if getattr(self, "_native_ddr_worker", None) is not None and not self._native_ddr_stop_sent:
             from pypto_serving.serving.native_ddr.worker import NativeStopProof
             proof = NativeStopProof(self._native_ddr_worker.worker_epoch, True, True)
@@ -1800,6 +1810,7 @@ def _worker_entry(
     configure_runtime_logging()
 
     worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue, services_factory)
+    retained_error = None
     if native_ddr_output_queue is not None:
         worker.native_ddr_output_queue = native_ddr_output_queue
     try:
@@ -1824,6 +1835,7 @@ def _worker_entry(
         ready_event.set()
         worker.busy_loop()
     except Exception as e:
+        retained_error = e
         logger.error(f"Worker process failed: {e}", exc_info=True)
         if startup_status is not None:
             error = f"{type(e).__name__}: {e}".encode("utf-8")[:4095]
@@ -1833,9 +1845,15 @@ def _worker_entry(
     finally:
         try:
             worker.close()
-        except Exception:
+        except Exception as close_error:
+            if retained_error is None:
+                retained_error = close_error
             logger.exception("Worker process cleanup failed")
         get_profiler(initially_active=False).stop()
+        recovery = getattr(worker, '_native_ddr_recovery', None)
+        access = getattr(worker, '_native_ddr_pool_access', None)
+        if recovery is not None and (access is None or not access.closed):
+            recovery.retain_failure(retained_error or RuntimeError('managed client remains after normal close'))
 
 
 def spawn_worker(config: EngineConfig, *, services_factory=None):

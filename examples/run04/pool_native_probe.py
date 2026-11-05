@@ -26,6 +26,7 @@ from pool_host_probe import capture, inventory, save
 
 _ACCESS_ATTEMPTED = False
 _ACTIVE_ACCESS = None
+_RECOVERY = None
 
 
 def role_environments(parent, daemon_root, inventory_root):
@@ -65,7 +66,7 @@ def runtime_view_report(worker, slots, backing):
 
 
 def consumer(args):
-    global _ACCESS_ATTEMPTED, _ACTIVE_ACCESS
+    global _ACCESS_ATTEMPTED, _ACTIVE_ACCESS, _RECOVERY
     assert not os.environ.get('LD_PRELOAD'), 'host fence must not reach native roles'
     assert not any(k.startswith('UFLOW_POOL_TEST_') for k in os.environ)
     import numpy as np
@@ -103,10 +104,14 @@ def consumer(args):
         'client_registered': False, 'native_owner_created': False, 'native_jobs_submitted': 0})
     config = SimpleNamespace(pool_endpoint=args.endpoint, pool_id=args.pool_id,
                              pool_epoch=args.epoch, sdk_sha256=SDK_SHA256)
+    from pypto_serving.serving.native_ddr.cooperative_close import CooperativePoolClose
+    _RECOVERY = CooperativePoolClose(root / 'cooperative-close')
     _ACCESS_ATTEMPTED = True
     access = register_managed_pool(config)
     _ACTIVE_ACCESS = access
+    _RECOVERY.bind_access(access)
     slots = ManagedDdrSlots(1, access)
+    _RECOVERY.slots = slots
     client = access.port.client
     backing = slots.reserve(0, BLOCK_BYTES)
     raw_block = access.port._raw_block(backing.block)
@@ -129,10 +134,13 @@ def consumer(args):
     baseline = descendants()
     worker = DistributedWorker([p.compiled for p in programs],
         inherited_host_tensors=slots.inherited_host_tensors, startup_timeout_s=60)
-    registered = attach_new_children(access, baseline)
+    _RECOVERY.worker = worker
+    registered = attach_new_children(access, baseline, helpers=slots.child_helpers,
+                                     control_resources=slots.control_resources)
     registered_pids = tuple(registered)
+    helper_evidence = dict(slots.child_helpers)
     save(root / 'children.json', {'baseline': baseline, 'registered': registered,
-                                  'identity': asdict(access.identity), 'native_role_fence': None})
+        'helpers': helper_evidence, 'identity': asdict(access.identity), 'native_role_fence': None})
     from host_guard import inventory as process_inventory
     save(root / 'native-process-inventories.json', {
         'scope': 'native roles may own the selected device; host zero-Ascend-FD judge is not applied',
@@ -213,9 +221,10 @@ def consumer(args):
     for tensor in tensors:
         worker.free_tensor(tensor)
     worker.close()
-    detach_closed_children(access, registered, baseline)
+    detach_closed_children(access, registered, baseline, helpers=slots.child_helpers)
     del module, backend, worker
     slots.close_after_owner()
+    _RECOVERY.restore_after_normal_close()
     assert access.closed and not access.children and not access.leases and not access.unknown
     result = {'passed': True, 'scope': 'real pack/unpack fixture, not full Qwen or actual-compute overwrite',
               'registered': asdict(access.identity), 'ranges': [{**r, 'block': asdict(r['block'])} for r in ranges],
@@ -224,6 +233,7 @@ def consumer(args):
               'whole_four_page_arenas_equal': True, 'source_page': 1, 'target_page': 2,
               'guard_bytes_compared': guards['guard_bytes_compared'], 'native_trace': trace,
               'original_native_children': registered_pids, 'consumer_child_baseline': baseline,
+              'stdlib_helpers_recorded_and_normally_reaped': helper_evidence,
               'native_owner_closed': True, 'children_detached': True, 'client_unmapped': True}
     save(root / 'result.json', result)
 
@@ -476,11 +486,9 @@ def main():
             args.root.mkdir(exist_ok=True)
             save(args.root / 'retained-live-failure.json', {'pid': os.getpid(), 'error': repr(error),
                 'scope': 'failed live client retained; no unmap ACK, release, retry or cleanup claim'})
-            while True:
-                try:
-                    signal.pause()
-                except KeyboardInterrupt:
-                    continue
+            if _RECOVERY is None:
+                raise RuntimeError('client registration attempted without preinstalled close channel') from error
+            _RECOVERY.retain_failure(error)
 
 
 if __name__ == '__main__':

@@ -844,7 +844,11 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
                 # Retain the actual owner even if UFlow child registration
                 # fails. A construction/registration error is not an exit proof.
                 self._l3_worker = worker
-                slots.child_registrations = attach_new_children(slots.access, slots.child_baseline)
+                recovery = getattr(slots.access, 'cooperative_close', None)
+                if recovery is not None:
+                    recovery.worker = worker
+                slots.child_registrations = attach_new_children(slots.access, slots.child_baseline,
+                    helpers=slots.child_helpers, control_resources=slots.control_resources)
             self._l3_worker = worker
         return worker
 
@@ -943,7 +947,8 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         self.close_kv_cache()
         if self._l3_worker is not None:
             self._l3_worker.close()
-            detach_closed_children(slots.access, slots.child_registrations, slots.child_baseline)
+            detach_closed_children(slots.access, slots.child_registrations, slots.child_baseline,
+                                   helpers=slots.child_helpers)
             self._l3_worker = None
         self._reset_l3_dispatch()
 

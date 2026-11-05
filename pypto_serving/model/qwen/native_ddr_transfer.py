@@ -70,11 +70,17 @@ class ManagedDdrSlots:
         self._offsets = {}
         self.control_metadata_bytes = 4
         self.control_metadata_mapped_bytes = None
+        self.control_resources = ()
         if os.name == 'posix':
-            from pypto_serving.serving.native_ddr.managed_process import shared_mapping_size
+            from pypto_serving.serving.native_ddr.managed_process import shared_mapping_size, shared_mapping_resource
             self.control_metadata_mapped_bytes = shared_mapping_size(self.page_ids.data_ptr(), 4)
+            self.control_resources = (shared_mapping_resource(self.page_ids.data_ptr(), 4),)
         self.child_baseline = {}
         self.child_registrations = {}
+        self.child_helpers = {}
+        recovery = getattr(access, 'cooperative_close', None)
+        if recovery is not None:
+            recovery.slots = self
 
     @property
     def tensors(self):
@@ -182,6 +188,8 @@ class ManagedDdrSlots:
             raise RuntimeError('native/client mapping obligations must drain before unregister')
         self.pool_tensor = None
         self.page_ids = None
+        from pypto_serving.serving.native_ddr.managed_process import stop_resource_trackers
+        stop_resource_trackers(self.child_helpers)
         self.access.close()
 
 
