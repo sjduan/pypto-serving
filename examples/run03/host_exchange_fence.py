@@ -15,12 +15,18 @@ from pathlib import Path
 import subprocess
 import sys
 
-from examples.run03.host_exchange_guard import check_bindings, deployment, inventory, judge, sha
+from examples.run03.host_exchange_guard import (
+    REAL_CLEANUP, check_pristine_bindings, deployment, inventory, judge, sha,
+)
 
 
 class DlInfo(ctypes.Structure):
     _fields_ = [('filename', ctypes.c_char_p), ('base', ctypes.c_void_p),
                 ('symbol', ctypes.c_char_p), ('address', ctypes.c_void_p)]
+
+
+class Status(ctypes.Structure):
+    _fields_ = [('code', ctypes.c_int32), ('message', ctypes.c_char * 256)]
 
 
 def probe(shim, fence, symbols, positive):
@@ -29,19 +35,34 @@ def probe(shim, fence, symbols, positive):
     handle = ctypes.CDLL(None)
     handle.dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(DlInfo)]
     bindings = {}
-    for name in symbols:
+    for name in [*symbols, REAL_CLEANUP]:
         info = DlInfo()
         assert handle.dladdr(ctypes.cast(getattr(handle, name), ctypes.c_void_p), ctypes.byref(info))
         bindings[name] = str(Path(os.fsdecode(info.filename)).resolve())
     report = {'pid': os.getpid(), 'before_fds': before, 'after_fds': inventory('self'),
               'loaded': deployment('self', shim, fence), 'bindings': bindings}
     print(json.dumps(report), flush=True)  # Evidence survives even failed policy checks or exit86.
-    check_bindings(bindings, fence)
+    exported = [name for name in symbols if name.startswith('uf_acl_')]+[REAL_CLEANUP]
+    check_pristine_bindings(symbols, bindings, fence, shim, exported)
     judge(report['after_fds'], 'daemon', report['loaded'], report['loaded'])
     if positive:
         # Only call after dladdr proves the exact test fence owns this symbol.
         handle.uf_acl_backend_init(None, None)
         raise AssertionError('fence returned')
+    before_cleanup = inventory('self')
+    finalizer = getattr(handle, REAL_CLEANUP)
+    finalizer.argtypes, finalizer.restype = [ctypes.POINTER(Status)], ctypes.c_int
+    report['allowed_real_cleanup'] = {REAL_CLEANUP: bindings[REAL_CLEANUP]}
+    report['pristine_real_results'] = []
+    for _ in range(3):
+        status = Status()
+        result = finalizer(ctypes.byref(status))
+        row = {'return': result, 'status': status.code, 'message': bytes(status.message).decode()}
+        report['pristine_real_results'].append(row)
+        assert row == {'return': 0, 'status': 0, 'message': 'ok'}, row
+    report['after_real_cleanup_fds'] = inventory('self')
+    assert report['after_real_cleanup_fds'] == before_cleanup
+    print(json.dumps(report), flush=True)
 
 
 def prepare(output, shim):
@@ -50,7 +71,8 @@ def prepare(output, shim):
     exports = subprocess.check_output(['nm', '-D', '--defined-only', str(shim)], text=True)
     uf = {line.split()[-1] for line in exports.splitlines() if line.split()[-1].startswith('uf_acl_')}
     symbols = json.loads(Path(__file__).with_name('host_exchange_blocked_symbols.json').read_text())
-    assert uf and uf == {name for name in symbols if name.startswith('uf_acl_')}
+    assert uf and uf == {name for name in symbols if name.startswith('uf_acl_')}|{REAL_CLEANUP}
+    assert REAL_CLEANUP not in symbols
     text = source.read_text()
     assert all('void '+name+'(void)' in text for name in symbols)
     fence = output/'api_fence.so'
@@ -75,11 +97,14 @@ def prepare(output, shim):
         (output/(mode+'.stderr')).write_bytes(run.stderr)
         assert run.returncode == (86 if mode == 'positive' else 0), (mode, run.returncode, run.stderr)
         assert run.stderr == (b'H2_FORBIDDEN_API:uf_acl_backend_init\n' if mode == 'positive' else b'')
-        reports[mode] = json.loads(run.stdout)
+        reports[mode] = json.loads(run.stdout.splitlines()[-1])
     result = {'loaded': reports['loader']['loaded'], 'fence_sha256': sha(fence),
               'source_sha256': sha(source), 'exported_uf_symbols': sorted(uf),
               'blocked_symbols': symbols, 'compile_command': compile_command,
-              'all_bindings_verified': True, 'positive_exit': 86, 'passed': True}
+              'all_bindings_verified': True, 'positive_exit': 86, 'passed': True,
+              'allowed_real_cleanup': reports['loader']['allowed_real_cleanup'],
+              'pristine_real_results': reports['loader']['pristine_real_results'],
+              'pristine_whole_lifetime_condition': 'new process; every other UF entry and device-init/alloc/reset/cleanup API fenced'}
     (output/'baseline.json').write_text(json.dumps(result, indent=2)+'\n')
     return result
 

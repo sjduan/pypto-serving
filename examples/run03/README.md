@@ -110,7 +110,8 @@ not a general deployment utility. Its task root is fixed to
 sources and CPU-built daemon/shim there first. Run only its **outer** mode:
 
 ```console
-python src/serving/examples/run03/host_exchange_namespace.py
+python src/serving/examples/run03/host_exchange_namespace.py --attempt attempt3-normal-clean
+python src/serving/examples/run03/host_exchange_namespace.py --attempt attempt4-owner-exit-negative
 ```
 
 It pins the outer mount namespace and new task directory FDs, uses private
@@ -127,9 +128,15 @@ consumer uses the ordinary `uflow` SDK, acquires the middle block read-only,
 retains it and releases the root view, then makes a real bounded CPU copy.
 Examples verify complete bytes/guards, response-only placement/binding/lease
 mismatches, stale metadata/destination, a bad digest, busy slot and host cancel.
-After producer revoke and exit, the old legal view remains readable while new
-acquisition fails. All references and budget must drain before normal daemon
-shutdown; final socket/PID/FD/lock and unchanged outer-mount evidence are kept.
+In the normal case, revoke rejects new acquisition while the retained view
+remains readable. The owner stays alive until explicit stage/view release and
+real broker exposure counts are zero, then both peers exit. The control caller
+checks all final counts, including session pidfds, before normal daemon shutdown.
+The independent owner-exit negative case instead exits the revoked owner while
+a view remains live. It checks old bytes plus actual broker unknown-exposure
+responses and preserves the resulting dirty/quarantine state. It cannot claim
+zero obligations or clean shutdown. Final socket/PID/FD/lock and unchanged
+outer-mount evidence are kept for both declared outcomes.
 Broker mapped-byte telemetry is not relabeled as our local CPU copied bytes.
 
 This driver uses `--execution-mode simulated --startup-probe-bytes 0` to disable
@@ -167,8 +174,9 @@ The revised harness saves every FD before applying policy. Only the daemon may
 hold those exact controls, in those counts, bound to fresh actual loaded shim,
 CANN and fence hashes. Numbered devices, devmm, unknown nodes, wrong counts or
 rdev, and all Ascend FDs in producer/consumer remain forbidden. A test-only
-libc API fence intercepts every exported fixed-shim `uf_acl_*` entry plus the
-listed ACL device APIs. Each entry emits its name and exits86 without calling
+libc API fence intercepts every exported fixed-shim `uf_acl_*` entry except the
+single explicitly allowed real pristine `uf_acl_backend_finalize`, plus the
+listed ACL device APIs. Each blocked entry emits its name and exits86 without calling
 the original implementation or returning fake success. The loader verifies all
 bindings using dladdr; the safe positive UF call must hit this fence first.
 
@@ -178,8 +186,20 @@ small shared library and bounded loader probes to testing only; production
 libraries and the fixed data-service sources are unchanged. It does not prove
 arbitrary vendor internal behavior, model execution, native Ready or performance.
 
-An explicit strict `--attempt attempt2-api-fenced` token creates a fresh task
-fixture and separate logs/results only after all earlier task fixtures are
-confirmed normally clean with no owned live process, socket or locked authority.
+The real pristine finalizer binds to the original fixed shim, never a success
+stub. Fresh loader probes call it three times and require real return0/status0/ok
+with unchanged FD controls. Every other UF entry and initialization, device
+selection, allocation, reset, aclFinalize, destroy/free/unmap/release-address
+API stays fenced for the whole process lifetime. The daemon executes its original
+cleanup path. Loader probe return values are explicit evidence; daemon finalizer
+status is not separately instrumented in the frozen executable.
+
+Each strict attempt token declares either normal-clean or owner-exit-negative
+before creating a fixture. Old attempt2 remains a failed dirty fixture; it is
+neither restored nor used to claim clean. New cases require old owned processes
+absent and locks free, preserve old authority/socket hashes and inodes before
+and after, and use independent task fixtures for the two approved protocol cases.
+All raw peer events are appended and flushed before parsing or the next action,
+so source sentinel hashes and earlier state remain available after later failure.
 Existing failed fixtures and markers are preserved. Namespace FD/inode/parent
 and private propagation checks precede every private bind/bootstrap.

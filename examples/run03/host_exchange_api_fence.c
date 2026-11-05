@@ -16,7 +16,6 @@ __attribute__((noreturn,visibility("default"))) void aclrtSetDevice(void) { cons
 __attribute__((noreturn,visibility("default"))) void aclrtSynchronizeDevice(void) { const char msg[]="H2_FORBIDDEN_API:aclrtSynchronizeDevice\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
 __attribute__((noreturn,visibility("default"))) void aclrtSynchronizeStream(void) { const char msg[]="H2_FORBIDDEN_API:aclrtSynchronizeStream\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
 __attribute__((noreturn,visibility("default"))) void uf_acl_alloc_physical(void) { const char msg[]="H2_FORBIDDEN_API:uf_acl_alloc_physical\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
-__attribute__((noreturn,visibility("default"))) void uf_acl_backend_finalize(void) { const char msg[]="H2_FORBIDDEN_API:uf_acl_backend_finalize\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
 __attribute__((noreturn,visibility("default"))) void uf_acl_backend_init(void) { const char msg[]="H2_FORBIDDEN_API:uf_acl_backend_init\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
 __attribute__((noreturn,visibility("default"))) void uf_acl_client_finalize(void) { const char msg[]="H2_FORBIDDEN_API:uf_acl_client_finalize\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
 __attribute__((noreturn,visibility("default"))) void uf_acl_client_get_bare_tgid(void) { const char msg[]="H2_FORBIDDEN_API:uf_acl_client_get_bare_tgid\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
@@ -57,3 +56,14 @@ __attribute__((noreturn,visibility("default"))) void uf_acl_stream_wait_event(vo
 __attribute__((noreturn,visibility("default"))) void uf_acl_synchronize_event(void) { const char msg[]="H2_FORBIDDEN_API:uf_acl_synchronize_event\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
 __attribute__((noreturn,visibility("default"))) void uf_acl_synchronize_stream(void) { const char msg[]="H2_FORBIDDEN_API:uf_acl_synchronize_stream\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
 __attribute__((noreturn,visibility("default"))) void uf_acl_unmap_and_release(void) { const char msg[]="H2_FORBIDDEN_API:uf_acl_unmap_and_release\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
+__attribute__((noreturn,visibility("default"))) void aclrtDestroyContext(void) { const char msg[]="H2_FORBIDDEN_API:aclrtDestroyContext\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
+__attribute__((noreturn,visibility("default"))) void aclrtDestroyEvent(void) { const char msg[]="H2_FORBIDDEN_API:aclrtDestroyEvent\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
+__attribute__((noreturn,visibility("default"))) void aclrtDestroyStream(void) { const char msg[]="H2_FORBIDDEN_API:aclrtDestroyStream\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
+__attribute__((noreturn,visibility("default"))) void aclrtFree(void) { const char msg[]="H2_FORBIDDEN_API:aclrtFree\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
+__attribute__((noreturn,visibility("default"))) void aclrtFreeHost(void) { const char msg[]="H2_FORBIDDEN_API:aclrtFreeHost\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
+__attribute__((noreturn,visibility("default"))) void aclrtFreePhysical(void) { const char msg[]="H2_FORBIDDEN_API:aclrtFreePhysical\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
+__attribute__((noreturn,visibility("default"))) void aclrtMapMem(void) { const char msg[]="H2_FORBIDDEN_API:aclrtMapMem\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
+__attribute__((noreturn,visibility("default"))) void aclrtMemSetAccess(void) { const char msg[]="H2_FORBIDDEN_API:aclrtMemSetAccess\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
+__attribute__((noreturn,visibility("default"))) void aclrtReleaseMemAddress(void) { const char msg[]="H2_FORBIDDEN_API:aclrtReleaseMemAddress\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
+__attribute__((noreturn,visibility("default"))) void aclrtReserveMemAddress(void) { const char msg[]="H2_FORBIDDEN_API:aclrtReserveMemAddress\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }
+__attribute__((noreturn,visibility("default"))) void aclrtUnmapMem(void) { const char msg[]="H2_FORBIDDEN_API:aclrtUnmapMem\n"; (void)write(2,msg,sizeof(msg)-1); _exit(86); }

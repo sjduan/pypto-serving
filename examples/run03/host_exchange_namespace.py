@@ -25,6 +25,9 @@ import sys
 import time
 import traceback
 
+from examples.run03.host_exchange_cases import (
+    ALL_FIELDS, case_for_token, declaration, domain_snapshot, permit_owner_exit, persist_event, require_zero,
+)
 from examples.run03.host_exchange_fence import prepare
 from examples.run03.host_exchange_guard import DAEMON_SHA, SHIM_SHA, attempt_token, record_and_check
 from examples.run03.host_exchange_lifecycle import OuterProtection, StopReader, owned_tree, supervise_owned
@@ -77,7 +80,7 @@ def control(endpoint, command):
         return data.decode()
 
 
-def prior_clean():
+def prior_domains():
     previous = json.loads((TASK/'results/namespace.json').read_text())
     assert previous['outer_protection']['unchanged'] and previous['child_supervision']['reaped']
     assert identity(Path('/workspace/uflow')) == tuple(previous['outer_protection']['after_inode'])
@@ -91,22 +94,30 @@ def prior_clean():
         assert not any(key.startswith('unresolved') for key in result)
         assert all(item['exit_code'] is not None and item['pid_absent'] for item in result.get('owned_process_exit', []))
         pids = [result.get('daemon_pid')] + [result.get('peers', {}).get(key) for key in ('producer_pid', 'consumer_pid')]
+        pids += [item['pid'] for item in result.get('owned_process_exit', [])]
+        receipt_path = TASK/'results/namespace.json' if root == TASK/'sandbox/nsroot' else TASK/'results'/root.parent.name/'namespace.json'
+        receipt = json.loads(receipt_path.read_text())
+        pids += [receipt['outer_pid'], receipt['child_supervision']['pid']]
         assert all(not Path(f'/proc/{pid}').exists() for pid in pids if pid)
-        assert not (fixture/'u.sock').exists() and not (fixture/'u.sock.external-ddr').exists()
         authority = root/'authority/external-ddr-v0'
         state = json.loads((authority/'state').read_text())
-        assert state['mode'] == 'clean' and state['closure'] == 'normal' and state['pending'] is None
+        expected_dirty = root == TASK/'sandbox/attempt2-api-fenced/nsroot'
+        if expected_dirty:
+            assert state['mode'] == 'dirty'
+        else:
+            assert state['mode'] == 'clean' and state['closure'] == 'normal' and state['pending'] is None
+            assert not (fixture/'u.sock').exists() and not (fixture/'u.sock.external-ddr').exists()
         with (authority/'authority.lock').open('r+') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(lock, fcntl.LOCK_UN)
-        proofs.append({'root': str(root), 'state': state, 'pids_absent': pids, 'sockets_absent': True,
-                       'lock_reacquired_released': True})
+        proofs.append({'root': str(root), 'state': state, 'pids_absent': pids, 'sockets_absent': not (fixture/'u.sock').exists() and not (fixture/'u.sock.external-ddr').exists(),
+                       'lock_reacquired_released': True, 'snapshot': domain_snapshot(root)})
     return proofs
 
 
 class Peer:
-    def __init__(self, role, endpoint, env, fds, stop):
-        self.stop = stop
+    def __init__(self, role, endpoint, env, fds, stop, report):
+        self.stop, self.role, self.report, self.buffer = stop, role, report, bytearray()
         self.log = (RUN / f'{role}.log').open('x')
         command = [str(RUN/'venv/bin/python'), '-u', '-m', 'examples.run03.host_exchange_peer', role, endpoint]
         if role == 'consumer':
@@ -115,6 +126,8 @@ class Peer:
             self.proc = subprocess.Popen(command, env=dict(env, UFLOW_H2_PEER_ROLE=role), cwd=RUN/'serving', pass_fds=fds,
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                                          text=True, bufsize=1)
+            report['peers'][role+'_pid'] = self.proc.pid
+            (RUN/'result.json').write_text(json.dumps(report, indent=2)+'\n')
         except BaseException:
             self.log.close()
             raise
@@ -126,21 +139,30 @@ class Peer:
 
     def receive(self, expected):
         deadline = time.monotonic()+30
-        while True:
+        while b'\n' not in self.buffer:
             self.stop.check()
             if time.monotonic() >= deadline:
                 raise TimeoutError(f'{self.proc.pid} did not emit {expected}')
             if self.proc.stdout in select.select([self.proc.stdout, self.stop.fd], [], [], .1)[0]:
-                break
-        row = self.proc.stdout.readline()
-        if not row:
-            raise RuntimeError(f'peer exited before {expected}: {self.proc.poll()}')
+                part = os.read(self.proc.stdout.fileno(), 65536)
+                if not part:
+                    persist_event(RUN/'result.json', RUN/'peer-events.jsonl', self.report,
+                                  self.role, expected, self.buffer.decode(errors='replace'))
+                    raise RuntimeError(f'peer exited before {expected}: {self.proc.poll()}')
+                self.buffer.extend(part)
+                if len(self.buffer) > 1048576:
+                    raise RuntimeError('bounded peer event exceeded')
+        row, _, remaining = self.buffer.partition(b'\n')
+        self.buffer = bytearray(remaining)
+        row = row.decode()
+        persist_event(RUN/'result.json', RUN/'peer-events.jsonl', self.report, self.role, expected, row)
         result = json.loads(row)
         assert result['event'] == expected, result
         return result
 
 
 def inner(args):
+    case = case_for_token(args.attempt)
     stop = StopReader(args.control_fd)
     stop.check()
     # Exact E10 T3 order: namespace/parent first, then canonical inode, then mount.
@@ -164,13 +186,13 @@ def inner(args):
                PYTHONPATH=f'{RUN}/serving:{RUN}/sdk', TMPDIR=str(RUN/'tmp'),
                LD_LIBRARY_PATH=f'{RUN}/shim:/usr/local/Ascend/cann-9.0.0/lib64',
                LD_PRELOAD=str(RUN/'api_fence.so'),
-               UFLOW_H2_OUTER_FD=str(args.outer_fd), UFLOW_H2_ROOT_FD=str(args.root_fd),
+               UFLOW_H2_CASE=case, UFLOW_H2_OUTER_FD=str(args.outer_fd), UFLOW_H2_ROOT_FD=str(args.root_fd),
                UFLOW_H2_OUTER_PID=str(args.outer_pid), UFLOW_H2_INNER_PID=str(os.getpid()))
     env['UFLOW_H2_SDK_SHA256'] = sha(RUN/'sdk/uflow/external_ddr.py')
     endpoint, binary = str(RUN/'u.sock'), str(RUN/'uf-daemon')
     baseline = json.loads((RUN/'fence-baseline.json').read_text())
     assert sha(RUN/'api_fence.so') == baseline['fence_sha256']
-    report = {'passed': False, 'attempt': args.attempt, 'namespace_isolated': True, 'authority_absent_before_bootstrap': True,
+    report = {'passed': False, 'attempt': args.attempt, 'declaration': declaration(case), 'namespace_isolated': True, 'authority_absent_before_bootstrap': True,
               'outer_namespace_inode': os.fstat(args.outer_fd).st_ino,
               'inner_namespace_inode': os.stat('/proc/self/ns/mnt').st_ino,
               'mounted_inode': identity(Path('/workspace/uflow')), 'peers': {}, 'owned_fds': {}}
@@ -178,6 +200,7 @@ def inner(args):
         return record_and_check(report, label, pid, role, RUN/'result.json',
                                 RUN/'shim/libuf_acl_shim.so', RUN/'api_fence.so', baseline['loaded'])
 
+    (RUN/'result.json').write_text(json.dumps(report, indent=2)+'\n')
     bootstrap = subprocess.run([binary, '--socket', endpoint, '--initialize-external-ddr-authority'],
                                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
     (RUN/'bootstrap.log').write_bytes(bootstrap.stdout)
@@ -208,10 +231,10 @@ def inner(args):
             assert any(str(RUN/'shim/libuf_acl_shim.so') in line for line in report['loaded_shim_and_cann'])
             report['loaded_shim_sha256'] = sha(RUN/'shim/libuf_acl_shim.so')
             assert report['loaded_shim_sha256'] == args.shim_sha
-            producer = Peer('producer', endpoint, env, (args.outer_fd, args.root_fd), stop)
+            producer = Peer('producer', endpoint, env, (args.outer_fd, args.root_fd), stop, report)
             peers.append(producer)
             registered = producer.receive('registered')
-            consumer = Peer('consumer', endpoint, env, (args.outer_fd, args.root_fd), stop)
+            consumer = Peer('consumer', endpoint, env, (args.outer_fd, args.root_fd), stop, report)
             peers.append(consumer)
             consumer.send(op='begin', record=registered['record'], authority_source=registered['authority_source'])
             held = consumer.receive('held')
@@ -223,28 +246,51 @@ def inner(args):
             revoked = producer.receive('revoked')
             consumer.send(op='revoked')
             consumer.receive('old-view-live-after-revoke')
+            if case == 'normal-clean':
+                exposed = consumer.receive('exposure-closed')
+                assert exposed['local_slot_free'] and exposed['views_released']
+                permit_owner_exit(case, revoked=True, exposure_snapshot=exposed['snapshot'])
+            else:
+                permit_owner_exit(case, revoked=True)
             producer.send(op='exit')
             producer.receive('exiting')
             assert producer.proc.wait(timeout=15) == 0
             consumer.send(op='owner-exited')
             done = consumer.receive('consumer-done')
             assert consumer.proc.wait(timeout=15) == 0
-            report['peers'] = {'registered': registered, 'held': held, 'revoked': revoked, 'done': done,
-                               'producer_pid': producer.proc.pid, 'consumer_pid': consumer.proc.pid}
+            report['peers'].update(registered=registered, held=held, revoked=revoked, done=done)
+            if case == 'normal-clean':
+                sys.path.insert(0, str(RUN/'sdk'))
+                from uflow import ExternalDdrClient
+                report['final_zero_snapshot'] = ExternalDdrClient(endpoint).snapshot()
+                require_zero(report['final_zero_snapshot'], ALL_FIELDS)
+            else:
+                report['final_zero_snapshot'] = 'not claimed for predeclared unknown exposure'
             report['stats_before_shutdown'] = control(endpoint, 'op=GetStats')
             fields = dict(part.split('=', 1) for part in report['stats_before_shutdown'].strip().split(';') if '=' in part)
             assert int(fields['external_mapped_bytes']) > 0 and int(fields['external_copied_bytes']) == 0
             report['mapped_is_not_copied'] = True
             report['owned_fds']['daemon-final'] = process_fds(daemon.pid, 'daemon-final')
             assert 'status=ok' in control(endpoint, 'op=ShutdownDaemon')
-            assert daemon.wait(timeout=30) == 0
+            report['daemon_exit_code'] = daemon.wait(timeout=30)
+            assert report['daemon_exit_code'] == (0 if case == 'normal-clean' else 1)
         assert 'H2_FORBIDDEN_API' not in (RUN/'daemon.log').read_text()
         assert 'H2_FORBIDDEN_API' not in (RUN/'bootstrap.log').read_text()
-        assert 'external DDR authority drained and clean' in (RUN/'daemon.log').read_text()
-        assert not Path(endpoint).exists() and not Path(endpoint+'.external-ddr').exists()
+        if case == 'normal-clean':
+            assert 'external DDR authority drained and clean' in (RUN/'daemon.log').read_text()
+            assert not Path(endpoint).exists() and not Path(endpoint+'.external-ddr').exists()
+        else:
+            assert 'authority quarantined: unresolved exposure; authority must remain dirty' in (RUN/'daemon.log').read_text()
+            report['expected_dirty_quarantine'] = True
+        state = json.loads((AUTHORITY/'state').read_text())
+        assert state['mode'] == declaration(case)['expected_authority_mode']
+        report['persistent_state'] = state
+        report['socket_present'] = Path(endpoint).exists()
+        report['external_socket_present'] = Path(endpoint+'.external-ddr').exists()
         assert all(not Path(f'/proc/{peer.proc.pid}').exists() for peer in peers)
         assert not Path(f'/proc/{daemon.pid}').exists()
-        report.update(passed=True, clean_log=True, owned_processes_exited=True, sockets_removed=True)
+        report.update(passed=True, clean_log=case == 'normal-clean', owned_processes_exited=True,
+                      sockets_removed=not Path(endpoint).exists() and not Path(endpoint+'.external-ddr').exists())
     except BaseException:
         report['primary_error'] = traceback.format_exc()
         raise
@@ -283,10 +329,11 @@ def inner(args):
 
 def outer(token):
     token = attempt_token(token)
+    case = case_for_token(token)
     logdir, resultdir = TASK/'logs'/token, TASK/'results'/token
     logdir.mkdir(exist_ok=False)
     resultdir.mkdir(exist_ok=False)
-    result = {'passed': False, 'outer_pid': os.getpid()}
+    result = {'passed': False, 'outer_pid': os.getpid(), 'attempt': token, 'declaration': declaration(case)}
     protection = OuterProtection(result, Path('/workspace/uflow'), Path('/proc/self/mountinfo'),
                                   Path('/proc/self/ns/mnt'))
     fd = nsfd = proc = None
@@ -294,7 +341,11 @@ def outer(token):
         with protection:
             if TASK.resolve(strict=True) != TASK:
                 raise RuntimeError('task root is not canonical')
-            result['prior_clean_proofs'] = prior_clean()
+            result['prior_domain_proofs'] = prior_domains()
+            if case == 'owner-exit-negative':
+                normal = json.loads((TASK/'results/attempt3-normal-clean/namespace.json').read_text())
+                assert normal['passed'] and normal['inner_report']['clean_log']
+            (resultdir/'declared-case.json').write_text(json.dumps(result, indent=2)+'\n')
             source, nsroot = Path(__file__).resolve(), TASK/'sandbox'/token/'nsroot'
             assert sha(TASK/'build/bin/uf-daemon') == DAEMON_SHA
             assert sha(TASK/'build/shim/lib/libuf_acl_shim.so') == SHIM_SHA
@@ -344,6 +395,11 @@ def outer(token):
                 result['inner_report'] = json.loads(fixture_report.read_text())
             except BaseException as error:
                 result['inner_report_read_error'] = repr(error)
+        if 'prior_domain_proofs' in result:
+            result['prior_domains_unchanged'] = all(
+                domain_snapshot(Path(item['root'])) == item['snapshot'] for item in result['prior_domain_proofs'])
+            if not result['prior_domains_unchanged']:
+                result['passed'] = False
         if protection.before_mounts is not None:
             protection.capture_after()  # Also after any exception-path child cleanup.
             if not protection.report.get('unchanged'):

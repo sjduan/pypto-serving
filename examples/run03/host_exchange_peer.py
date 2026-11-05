@@ -34,6 +34,7 @@ from pypto_serving.serving.native_ddr.shared_exchange import E10Adapter, Exchang
 from pypto_serving.serving.native_ddr.shared_prefix_record import (
     ExternalBackingIdentity, SharedPrefixRecord, SourceBinding,
 )
+from examples.run03.host_exchange_cases import explicit_unknown, require_zero
 from examples.run03.host_exchange_lifecycle import close_stage_on_exit, require_revoked_acquire
 
 CHUNK = bytes(range(256)) * 256
@@ -109,7 +110,7 @@ def producer(endpoint):
 
     client = ExternalDdrClient(endpoint)
     fd = os.memfd_create('run03-immutable-source', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
-    handle = None
+    handle, revoked = None, False
     try:
         os.ftruncate(fd, 3 * BLOCK_BYTES)
         for base, chunk in ((0, b'L' * len(CHUNK)), (BLOCK_BYTES, CHUNK), (2 * BLOCK_BYTES, b'R' * len(CHUNK))):
@@ -124,7 +125,6 @@ def producer(endpoint):
         emit(event='registered', pid=os.getpid(), record=record.to_dict(), authority_source=asdict(source),
              seals=fcntl.fcntl(fd, fcntl.F_GET_SEALS), fds=own_fds(), snapshot=client.snapshot(), sdk=sdk_identity(),
              evidence='real E10 registration; compatibility/entry/worker identities remain host fixtures')
-        revoked = False
         while True:
             request = receive()
             if request['op'] == 'verify-and-revoke':
@@ -149,7 +149,7 @@ def producer(endpoint):
     finally:
         # The normal scenario explicitly revokes first. On failure, preserve a
         # best-effort revoke result rather than declaring an unknown domain clean.
-        if handle is not None:
+        if handle is not None and not revoked:
             client.revoke(handle)
         os.close(fd)
 
@@ -157,6 +157,7 @@ def producer(endpoint):
 def consumer(endpoint, output):
     from uflow import ExternalDdrError
 
+    case = os.environ['UFLOW_H2_CASE']
     request = receive()
     record = SharedPrefixRecord.from_dict(request['record'])
     # Separate parent-authenticated producer context, never copied out of record.
@@ -166,7 +167,7 @@ def consumer(endpoint, output):
     adapter, staging = E10Adapter(endpoint), HostStagingOwner()
     report = {'pid': os.getpid(), 'passed': False, 'cases': {}, 'snapshots': {},
               'compatibility': 'H1 historical-assets/synthetic-deployment host fixture only',
-              'native_ready': False, 'npu_run': False, 'initial_fds': own_fds(), 'sdk': sdk_identity()}
+              'native_ready': False, 'npu_run': False, 'declared_case': case, 'initial_fds': own_fds(), 'sdk': sdk_identity()}
     stage, unexpected_views, failed_resources = None, [], []
     report.update(source_record=record.to_dict(), authority_source=asdict(source), destination=asdict(destination))
 
@@ -258,12 +259,45 @@ def consumer(endpoint, output):
                                 error_type=ExternalDdrError, report=report, unexpected_views=unexpected_views)
         assert refs('after-revoke-old-view-readable')['active_views'] == 1
         emit(event='old-view-live-after-revoke')
-        assert receive()['op'] == 'owner-exited'
-        raw = retained.read()
-        exact_pattern(raw)
-        del raw
-        report['old_view_live_after_owner_exit'] = True
         report['staging_sha256'] = hashlib.sha256(stage.read()).hexdigest()
+        if case == 'normal-clean':
+            stage.close()
+            require_zero(refs('exposure-closed-owner-still-alive'))
+            assert not staging.busy and not stage.resources.views
+            emit(event='exposure-closed', snapshot=report['snapshots']['exposure-closed-owner-still-alive'],
+                 local_slot_free=True, views_released=True)
+        assert receive()['op'] == 'owner-exited'
+        if case == 'owner-exit-negative':
+            raw = retained.read()
+            exact_pattern(raw)
+            del raw
+            report['old_view_live_after_owner_exit'] = True
+            exact_pattern(stage.read())
+            report['stage_live_after_owner_exit'] = True
+            try:
+                view = adapter.acquire(source)
+            except Exception as error:
+                proof = explicit_unknown(error, adapter.client._exchange.__func__.__code__,
+                                         ExternalDdrError, 'AcquireExternalRead')
+                if proof is None:
+                    raise
+                report['expected_unknown_admission'] = proof
+            else:
+                unexpected_views.append(view)
+                raise AssertionError('owner-exit negative accepted new view')
+            raw = retained.read()
+            exact_pattern(raw)
+            del raw
+            try:
+                adapter.client.snapshot()
+            except Exception as error:
+                proof = explicit_unknown(error, adapter.client._exchange.__func__.__code__,
+                                         ExternalDdrError, 'GetExternalDdrSnapshot')
+                if proof is None:
+                    raise
+                report['expected_unknown_snapshot'] = proof
+            else:
+                raise AssertionError('owner-exit negative falsely reported known snapshot')
         stage.close()
         assert not staging.busy
         try:
@@ -276,10 +310,14 @@ def consumer(endpoint, output):
         assert lease.generation != stage.lease.generation
         report['next_generation'] = lease.generation
         staging._release(lease)
-        final = refs('final')
-        for field in ('committed_bytes', 'backing_fds', 'session_pidfds', 'owner_leases',
-                      'active_views', 'pending_handoffs', 'in_flight'):
-            assert final[field] == 0, (field, final[field])
+        if case == 'normal-clean':
+            final = refs('consumer-before-normal-exit')
+            require_zero(final)
+            report['normal_exposure_zero'] = True
+        else:
+            final = None
+            report['expected_dirty_quarantine'] = True
+            report['final_zero_snapshot'] = 'not claimed: persistent exposure is unknown'
         report.update(passed=True, final_fds=own_fds(), target_guards_exact=staging.guards_ok(),
                       whole_block_bytes=BLOCK_BYTES, real_nonzero_source_offset=BLOCK_BYTES,
                       verified_cpu_copied_bytes=staging.verified_copied_bytes,

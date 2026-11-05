@@ -19,6 +19,10 @@ SHIM_SHA = '7f1d647e5fdbbba97b79c21271445383a207ac369fe44bc1025af4041fce420e'
 DAEMON_SHA = 'be1f0c9d6fc28c5f7b83242836a021a6be584bb8958c1cce8b1a9d00fc5a9404'
 CONTROLS = {'/dev/davinci_manager': ([235, 0], 3), '/dev/hisi_hdc': ([509, 0], 1)}
 KEY_APIS = ('uf_acl_backend_init', 'aclInit', 'aclrtSetDevice', 'aclrtMalloc')
+REAL_CLEANUP = 'uf_acl_backend_finalize'
+PRISTINE_BLOCKED = {'aclInit', 'aclrtSetDevice', 'aclrtResetDevice', 'aclFinalize',
+                    'aclrtDestroyEvent', 'aclrtDestroyStream', 'aclrtFreeHost', 'aclrtFreePhysical',
+                    'aclrtUnmapMem', 'aclrtReleaseMemAddress', 'aclrtFree'}
 
 
 def sha(path):
@@ -64,6 +68,16 @@ def deployment(pid, shim, fence):
 def check_bindings(bindings, fence):
     if not set(KEY_APIS) <= set(bindings) or any(value != str(Path(fence).resolve()) for value in bindings.values()):
         raise RuntimeError('fence symbol binding mismatch')
+
+
+def check_pristine_bindings(blocked, bindings, fence, shim, exported_uf):
+    if (set(name for name in blocked if name.startswith('uf_acl_')) != set(exported_uf)-{REAL_CLEANUP}
+            or REAL_CLEANUP in blocked or not PRISTINE_BLOCKED <= set(blocked)
+            or set(bindings) != set(blocked)|{REAL_CLEANUP}):
+        raise RuntimeError('only the named real pristine cleanup may be excluded')
+    check_bindings({name: bindings[name] for name in blocked}, fence)
+    if bindings[REAL_CLEANUP] != str(Path(shim).resolve()):
+        raise RuntimeError('pristine finalizer must bind to the original actual shim')
 
 
 def judge(fds, role, loaded=None, baseline=None):
