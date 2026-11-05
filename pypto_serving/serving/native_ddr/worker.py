@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import traceback
 from typing import Protocol
 
 from .replay import ReplayError, ReplayLedger
@@ -80,6 +81,9 @@ class _Pending:
     handle: NativeTransferHandle | None = None
     cancelled: bool = False
     quarantined: bool = False
+    # Observation only. It is deliberately NOT a ReplayLedger terminal response.
+    first_failure: DdrTransferEvent | None = None
+    first_failure_detail: dict | None = None
 
 
 class DdrPrefixWorker:
@@ -104,6 +108,10 @@ class DdrPrefixWorker:
     def _event(self, req, status, *, stopped=False, completed=False, size=0, error=None, pool_receipt=None):
         event = DdrTransferEvent(req.job_id, req.worker_epoch, req.operation, status,
                                  req.entry_refs, size, completed, stopped, error, req.delivery_sequence, pool_receipt)
+        pending = self.pending
+        if (not stopped and error is not None and pending is not None
+                and pending.request == req and pending.first_failure is None):
+            pending.first_failure = event
         if stopped:
             self.transfer_replay.finish(req, event, protected=self.poisoned)
         return event
@@ -163,6 +171,8 @@ class DdrPrefixWorker:
             if pending.handle is None:
                 raise RuntimeError("backend returned no native handle")
         except Exception as exc:
+            pending.first_failure_detail = {'stage': 'native-submit', 'exception_type': type(exc).__qualname__,
+                                            'traceback': traceback.format_exc()}
             if isinstance(exc, NativeSubmissionError):
                 pending.handle = exc.handle
             if isinstance(exc, NativeSubmissionError) and exc.stopped and exc.handle is None:
@@ -241,6 +251,9 @@ class DdrPrefixWorker:
                                 pool_receipt=result.pool_receipt,
                                 error=None if success else "incomplete native transfer"),)
         except Exception as exc:
+            if pending.first_failure_detail is None:
+                pending.first_failure_detail = {'stage': 'native-result-or-range-finalize',
+                    'exception_type': type(exc).__qualname__, 'traceback': traceback.format_exc()}
             self.poisoned = True
             pending.quarantined = True
             # Even a result()/cleanup exception is not a stop receipt. Preserve

@@ -24,7 +24,7 @@ import traceback
 from m2_baseline import LONG_PROMPT, SHORT_PROMPT, record_processes, validate_output, write_json
 
 
-async def exercise(args, report):
+async def exercise(args, report, *, cli_arguments=None, scenario=None, startup_check=None, minimum_new_tokens=0):
     import httpx
     import uvicorn
     from pypto_serving.cli.main import build_parser, build_serving_engine_config
@@ -41,6 +41,8 @@ async def exercise(args, report):
            "--npu-memory-utilization", str(args.utilization)]
     cli += ["--enable-native-ddr-kv", "--native-ddr-kv-bytes", str(16 * 20971520)] if args.native_enabled else [
         "--no-enable-native-ddr-kv"]
+    if cli_arguments is not None:
+        cli = list(cli_arguments)
     config = build_serving_engine_config(build_parser().parse_args(cli))
     report.update(cli_arguments=cli, engine_config=asdict(config), requests=[], coordinator_trace=[], schedule_events=[])
     if args.native_enabled:
@@ -62,7 +64,8 @@ async def exercise(args, report):
             } for sr in output.scheduled_requests]})
         return output
     core.scheduler.schedule = observe_schedule
-    generate = GenerateConfig(max_new_tokens=4, temperature=0.0, top_p=1.0, top_k=None, seed=0, stream=True)
+    generate = GenerateConfig(max_new_tokens=4, min_tokens=minimum_new_tokens,
+                              temperature=0.0, top_p=1.0, top_k=None, seed=0, stream=True)
     server = server_task = None
     last_sequence = 0
 
@@ -107,7 +110,11 @@ async def exercise(args, report):
             report["startup"] = asdict(core._native_ddr_startup)
             report["startup"]["namespace_digest"] = core._native_ddr_startup.namespace_digest.hex()
             report["startup"]["compatibility_json"] = json.loads(core._native_ddr_startup.compatibility_json)
-            assert core._native_ddr is core.scheduler._native_ddr and core._native_ddr.max_entries == 16
+            assert core._native_ddr is core.scheduler._native_ddr
+            if startup_check is None:
+                assert core._native_ddr.max_entries == 16
+            else:
+                startup_check(report["startup"])
         else:
             assert core._native_ddr is None and core._native_ddr_output_queue is None
             assert not hasattr(core._worker_process, "native_ddr_output_queue")
@@ -140,7 +147,9 @@ async def exercise(args, report):
             assert body["choices"][0]["text"].strip() and body["usage"]["completion_tokens"] == 4
             assert body["usage"]["prompt_tokens"] == len(engine.tokenizer.encode(SHORT_PROMPT))
             report["http"] = {"status": response.status_code, "payload": payload, "body": body}
-        if args.case == "matrix":
+        if scenario is not None:
+            await scenario(engine, core, collect, collect_trace, args, report, cold, warm)
+        elif args.case == "matrix":
             await matrix(engine, core, collect, collect_trace, args, report, cold, warm)
         elif args.case == "ledger":
             from r_replay_probe import ledger
@@ -231,7 +240,7 @@ async def native_pending_stop(engine, core, collect, args, report):
     report["native_pending_stop"]["all_page_refs_released_after_proof"] = True
 
 
-async def matrix(engine, core, collect, collect_trace, args, report, cold, warm):
+async def matrix(engine, core, collect, collect_trace, args, report, cold, warm, *, stop_at_end=True):
     from pypto_serving.config.types import GenerateConfig
     from pypto_serving.serving.native_ddr.types import PrefixKey
 
@@ -586,6 +595,9 @@ async def matrix(engine, core, collect, collect_trace, args, report, cold, warm)
     assert not any(e["event"] == "ddr_ready" and e["job"] == failure["job"] for e in events)
     report["postsubmit_store_failure"] = {"layer": "short host receipt after actual native result/cleanup",
                                          "terminal": failure, "request_completed": failed_store["request_id"]}
+
+    if not stop_at_end:
+        return
 
     # Both native operation types get a real pending shutdown across the paired
     # main/pressure configurations. Idle shutdown is covered by smoke/disabled.

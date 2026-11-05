@@ -17,7 +17,7 @@ import queue
 import sys
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -1563,11 +1563,18 @@ class WorkerProcess:
     def _emit_native_ddr(self, message):
         if message.kind in ("transfer", "control"):
             event = message.event if message.kind == "transfer" else message.control
+            pending = self._native_ddr_worker.pending
             logger.info("native_ddr_receipt %s", json.dumps({
                 "kind": message.kind, "identity": getattr(event, "job_id", getattr(event, "command_id", "")),
                 "delivery_sequence": event.delivery_sequence,
                 "status": event.status.value if message.kind == "transfer" else "control",
                 "error": event.error,
+                "event": asdict(event) if message.kind == 'transfer' else None,
+                "first_nonterminal_failure": pending.first_failure_detail if pending is not None else None,
+                "pending_owner": ({'has_handle': pending.handle is not None,
+                    'quarantined': pending.quarantined, 'cancelled': pending.cancelled,
+                    'entry_state': pending.entry.state.value, 'readers': pending.entry.readers}
+                    if pending is not None else None),
                 "transfer_replay": self._native_ddr_worker.transfer_replay.stats(),
                 "control_replay": (self._native_ddr_control_replay.stats()
                                    if getattr(self, "_native_ddr_control_replay", None) is not None else None),

@@ -14,7 +14,7 @@ All leases below are actual references in the supplied KvCacheManager.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import json
 import logging
 
@@ -376,7 +376,12 @@ class DdrPrefixCoordinator:
             return
         self.record("transfer_terminal", job=req.job_id, status=event.status.value,
                     native_completed=event.native_completed, stopped=event.stopped,
-                    bytes=event.transferred_bytes)
+                    bytes=event.transferred_bytes, error=event.error,
+                    worker_epoch=event.worker_epoch, operation=event.operation.value,
+                    entry_refs=[asdict(ref) for ref in event.entry_refs],
+                    page_lease_id=req.page_lease_id, pages=list(req.page_ids),
+                    delivery_sequence=event.delivery_sequence,
+                    pool_receipt=asdict(event.pool_receipt) if event.pool_receipt is not None else None)
         if not event.stopped:
             job.state = LoadState.QUARANTINED
             self.poisoned = True

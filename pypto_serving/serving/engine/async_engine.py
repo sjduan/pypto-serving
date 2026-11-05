@@ -1818,6 +1818,21 @@ class ReplicaEngineCore:
         """
         input_q = self._input_queue
         process = self._worker_process
+        runtime = getattr(self, '_runtime', None)
+        if process is not None and runtime is not None and runtime.native_ddr.enabled:
+            # A managed client may be paused with Unknown native/range obligations.
+            # Keep its process handle and queues available for the preinstalled
+            # cooperative channel. Process death cannot substitute for SDK unmap.
+            if input_q is not None:
+                with contextlib.suppress(Exception):
+                    input_q.put(encode_command(ShutdownCommand()))
+            if not self._reap(process, timeout):
+                self._worker_stranded = True
+                logger.error('Managed pool client retained alive after cooperative shutdown timeout')
+                return False
+            self._worker_process = None
+            self._input_queue = self._output_queue = self._profile_output_queue = None
+            return True
         self._worker_process = None
         self._input_queue = None
         self._output_queue = None

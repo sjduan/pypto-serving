@@ -17,6 +17,54 @@ from pathlib import Path
 import re
 
 
+def capture_idle_pool(slots, root, label):
+    """Guard-only physical observation, never a prefix read/commit authority.
+
+    Unlike entry readback (which uses an SDK R lease), guards include unallocated
+    and Invalid bytes. Observe the existing registered map only while idle and
+    reject competing clients/leases. Do not allocate, initialize, or consume it.
+    """
+    from dataclasses import asdict
+    access = slots.access
+    if slots.busy is not None or access.leases or access.unknown or access.closed:
+        raise RuntimeError('pool guard observation requires already idle managed access')
+    if set(slots.child_registrations.items()) != set(access.children):
+        raise RuntimeError('pool guard observation lost the actual inherited child registry')
+    def snapshot():
+        value = access.port.client.snapshot()
+        pools = [p for p in value['pools'] if p['pool_id'] == access.identity.pool_id]
+        if len(pools) != 1:
+            raise ValueError('pool guard observation lost its unique resource')
+        pool = pools[0]
+        if (pool['pool_epoch'] != access.identity.pool_epoch or pool['frozen']
+                or pool['ranges']['leases'] or pool['nbytes'] != access.identity.nbytes
+                or (pool['canonical']['dev'], pool['canonical']['inode']) != (
+                    access.identity.device, access.identity.inode)
+                or len([c for c in pool['clients'] if c['state'] != 'Unmapped']) != 1
+                or not any(c['client_session'] == access.identity.client_session and c['state'] == 'Mapped'
+                           for c in pool['clients'])):
+            raise RuntimeError('pool guard observation has competing/unknown physical access')
+        return pool
+    before = snapshot()
+    path = Path(root) / (label + '-pool.bin')
+    digest = hashlib.sha256()
+    with path.open('xb') as stream:
+        for start in range(0, access.identity.nbytes, 1 << 20):
+            data = bytes(access.buffer[start:start + (1 << 20)])
+            stream.write(data)
+            digest.update(data)
+    after = snapshot()
+    if before != after:
+        raise RuntimeError('pool state changed during idle guard observation')
+    return {'file': str(path), 'bytes': access.identity.nbytes, 'sha256': digest.hexdigest(),
+            'identity': asdict(access.identity), 'snapshot': after,
+            'write_ranges': [[b.byte_offset + 2097152, 20971520] for b in slots._blocks.values()],
+            'scope': 'idle guard-only physical observation; not Committed prefix consumption',
+            'child_registry_matches_sdk': set(slots.child_registrations.items()) == set(access.children),
+            'registered_children': [list(key) for key in slots.child_registrations.items()],
+            'helper_pids': list(slots.child_helpers)}
+
+
 def inspect_idle_pages(backend, module, command):
     import torch
     from .types import EntryState
@@ -63,6 +111,14 @@ def inspect_idle_pages(backend, module, command):
         result["ddr"] = {"entry_id": entry.ref.entry_id, "slot": entry.slot,
                          "generation": entry.ref.slot_generation, "file": str(path), "bytes": len(raw),
                          "sha256": hashlib.sha256(raw).hexdigest()}
+        if getattr(backend, 'is_managed', False):
+            from dataclasses import asdict
+            result['ddr'].update(byte_offset=entry.backing.byte_offset,
+                                 committed=asdict(entry.backing.committed),
+                                 pool_identity=asdict(backend.slots.access.identity))
+    if (command.diagnostic_label.startswith('r04-')
+            and os.environ.get('PYPTO_NATIVE_DDR_POOL_EVIDENCE') == '1'):
+        result['pool'] = capture_idle_pool(backend.slots, root, command.diagnostic_label)
     return json.dumps(result, sort_keys=True).encode()
 
 def arm_short_receipt(backend, module, kind):
