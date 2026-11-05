@@ -156,3 +156,30 @@ revoke counts as revocation evidence only when the pinned SDK's actual
 Transport, malformed/protocol replies and unknown outcomes are failures. This
 additional SDK-private inspection belongs only to the negative test driver;
 it does not change the SDK or turn arbitrary exceptions into permission proofs.
+# Deployment-bound device FD policy (test harness only)
+
+The first Linux attempt remains failed: its old prefix assertion did not save
+the rejected FD target. A separate loader investigation found that loading this
+actual CANN/shim opens three `/dev/davinci_manager` character handles (235:0)
+and one `/dev/hisi_hdc` (509:0). This is not evidence of zero driver interaction.
+
+The revised harness saves every FD before applying policy. Only the daemon may
+hold those exact controls, in those counts, bound to fresh actual loaded shim,
+CANN and fence hashes. Numbered devices, devmm, unknown nodes, wrong counts or
+rdev, and all Ascend FDs in producer/consumer remain forbidden. A test-only
+libc API fence intercepts every exported fixed-shim `uf_acl_*` entry plus the
+listed ACL device APIs. Each entry emits its name and exits86 without calling
+the original implementation or returning fake success. The loader verifies all
+bindings using dladdr; the safe positive UF call must hit this fence first.
+
+Bootstrap and daemon retain LD_PRELOAD throughout this host test. Actual mapped
+fence/shim/CANN hashes are checked at every daemon FD checkpoint. This adds a
+small shared library and bounded loader probes to testing only; production
+libraries and the fixed data-service sources are unchanged. It does not prove
+arbitrary vendor internal behavior, model execution, native Ready or performance.
+
+An explicit strict `--attempt attempt2-api-fenced` token creates a fresh task
+fixture and separate logs/results only after all earlier task fixtures are
+confirmed normally clean with no owned live process, socket or locked authority.
+Existing failed fixtures and markers are preserved. Namespace FD/inode/parent
+and private propagation checks precede every private bind/bootstrap.

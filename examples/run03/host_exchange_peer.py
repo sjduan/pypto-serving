@@ -63,16 +63,17 @@ def exact_pattern(data):
         assert all(view[i:i+len(CHUNK)] == CHUNK for i in range(0, len(view), len(CHUNK)))
 
 
+_fd_sample = 0
+
+
 def own_fds():
-    result = {}
-    for fd in Path('/proc/self/fd').iterdir():
-        try:
-            target = os.readlink(fd)
-        except FileNotFoundError:
-            continue
-        assert not target.startswith(('/dev/davinci', '/dev/devmm', '/dev/hisi_hdc', '/dev/ascend'))
-        result[fd.name] = target
-    return result
+    from examples.run03.host_exchange_guard import record_and_check
+
+    global _fd_sample
+    _fd_sample += 1
+    role = os.environ['UFLOW_H2_PEER_ROLE']
+    output = Path('/workspace/uflow/runs/host-exchange')/f'{role}-fds-{_fd_sample}.json'
+    return record_and_check({}, role, os.getpid(), role, output)
 
 
 def sdk_identity():
