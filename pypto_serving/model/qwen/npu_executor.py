@@ -128,19 +128,17 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         platform: str = "a2a3sim",
         device_ids: Sequence[int] = (0,),
         pypto_build_dir: str | None = None,
-        native_ddr_probe_slots: int = 0,
         native_ddr_config=None,
+        native_ddr_pool_access=None,
     ) -> None:
         # ``pypto_build_dir`` is an explicit diagnostic/output request (set by
         # the serving worker only when the user asks for build output); it
         # bypasses PyPTO's JIT cache. The persistent cache policy reaches pypto
         # through the run config instead.
-        if type(native_ddr_probe_slots) is not int or not 0 <= native_ddr_probe_slots <= 2:
-            raise ValueError("native_ddr_probe_slots must be 0, 1 or 2")
-        self._native_ddr_probe_slots = native_ddr_probe_slots
-        if native_ddr_config is not None and native_ddr_probe_slots:
-            raise ValueError("production native DDR and probe slots are mutually exclusive")
         self._native_ddr_config = native_ddr_config
+        self._native_ddr_pool_access = native_ddr_pool_access
+        if native_ddr_config is not None and native_ddr_config.enabled and native_ddr_pool_access is None:
+            raise ValueError('enabled DDR requires a registered UFlow access view before model startup')
         super().__init__(
             kv_cache_manager,
             platform=platform,
@@ -166,6 +164,11 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         if runner is not None:
             runner.close()
             del self._runners[model_id]
+
+    def close_native_ddr_domain_preserving_pool(self, model_id):
+        """Partial shutdown only: no pool-unmapped or overall stop proof."""
+        runner = self._runners[model_id]
+        runner.close_native_domain_preserving_pool()
 
     @property
     def device_topk_sampling_k(self) -> int:
@@ -323,16 +326,16 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             topk_width=topk_width,
         )
         native_programs = native_slots = None
-        slot_count = self._native_ddr_probe_slots
+        slot_count = 0
         native_config = getattr(self, "_native_ddr_config", None)
         if native_config is not None and native_config.enabled:
             slot_count = native_config.capacity_bytes // 20971520
         if slot_count:
             from pypto_serving.model.qwen.native_ddr_kv import compile_programs
-            from pypto_serving.model.qwen.native_ddr_transfer import PreforkDdrSlots
+            from pypto_serving.model.qwen.native_ddr_transfer import ManagedDdrSlots
 
             native_programs = compile_programs(self._compiler)
-            native_slots = PreforkDdrSlots(slot_count)
+            native_slots = ManagedDdrSlots(slot_count, self._native_ddr_pool_access)
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,

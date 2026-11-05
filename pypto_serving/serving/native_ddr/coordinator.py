@@ -23,6 +23,7 @@ from .types import (
     Operation, PrefixKey, RestoreDecision, RestoreKind, TransferStatus,
 )
 from .replay import DeliverySender
+from .managed_pool import ManagedTransferReceipt, prefix_content_id
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ class _Waiter:
 
 
 class DdrPrefixCoordinator:
-    def __init__(self, manager, *, namespace_digest: bytes, worker_epoch: str, max_entries: int):
+    def __init__(self, manager, *, namespace_digest: bytes, worker_epoch: str, max_entries: int, pool_identity=None):
         if manager.has_groups or manager.block_size != 128 or not manager.enable_prefix_cache:
             raise ValueError("DDR coordinator requires existing single-pool page128 prefix cache")
         if len(namespace_digest) != 32 or not worker_epoch or max_entries <= 0:
@@ -65,6 +66,9 @@ class DdrPrefixCoordinator:
         self.worker_epoch = worker_epoch
         self.cache_epoch = worker_epoch
         self.max_entries = max_entries
+        self.pool_identity = pool_identity
+        self.managed_ready = {}
+        self.pending_imports = {}
         self.ready: dict[PrefixKey, DdrEntryRef] = {}
         self.loads_by_key: dict[tuple[str, PrefixKey], str] = {}
         self.stores_by_key: dict[PrefixKey, str] = {}
@@ -94,9 +98,11 @@ class DdrPrefixCoordinator:
         self.trace.append(item)
         logger.info("native_ddr_coordinator %s", json.dumps(item, sort_keys=True))
 
-    def _control(self, operation, *, job_id="", entry_ref=None, page_ids=(), diagnostic_label="", fault=""):
+    def _control(self, operation, *, job_id="", entry_ref=None, page_ids=(), diagnostic_label="", fault="",
+                 imported=None, imported_key=None):
         command = DdrControlRequest(self._id(operation), self.worker_epoch, operation, job_id, entry_ref,
-                                    tuple(page_ids), diagnostic_label, fault)
+                                    tuple(page_ids), diagnostic_label, fault,
+                                    imported=imported, imported_key=imported_key)
         self.controls[command.command_id] = command
         self.control_outbound.append(command.command_id)
         return command
@@ -116,10 +122,33 @@ class DdrPrefixCoordinator:
         ref = self.ready.pop(key, None)
         if ref is None:
             return False
+        self.managed_ready.pop(key, None)
         self.retiring[ref.entry_id] = ref
         self._control("evict", entry_ref=ref)
         self.record("evict_lookup_withdrawn", entry=ref.entry_id)
         return True
+
+    def prepare_import_prefix(self, prompt_token_ids, committed_ranges):
+        if (self.pool_identity is None or self.closed or self.poisoned or self.jobs or self.steps
+                or self.waiters or self.controls):
+            raise ValueError('prefix import requires an idle managed coordinator')
+        hashes = self.manager.compute_block_hashes(prompt_token_ids)
+        limit = max(0, len(prompt_token_ids) - 1) // 128
+        if not 0 < len(committed_ranges) <= min(limit, self.max_entries - len(self.ready)):
+            raise ValueError('import must cover a bounded token0 prefix and preserve the final-token rule')
+        keys = [PrefixKey(self.namespace, block_hash) for block_hash in hashes[:len(committed_ranges)]]
+        if any(key in self.ready for key in keys):
+            raise ValueError('prefix already has a canonical managed entry')
+        for key, committed in zip(keys, committed_ranges):
+            committed.validate(self.pool_identity, content_id=prefix_content_id(key))
+        commands = []
+        for key, committed in zip(keys, committed_ranges):
+            entry_id = self._id('imported-entry')
+            ref = DdrEntryRef(self.worker_epoch, entry_id, self._sequence)
+            cmd = self._control('import', entry_ref=ref, imported=committed, imported_key=key)
+            self.pending_imports[cmd.command_id] = (key, ref, committed)
+            commands.append(cmd.command_id)
+        return tuple(commands)
 
     def on_control_event(self, event):
         command = self.controls.get(event.command_id)
@@ -128,6 +157,23 @@ class DdrPrefixCoordinator:
         if event.delivery_sequence != command.delivery_sequence or command.delivery_sequence <= 0:
             self.poisoned = True
             raise RuntimeError("native DDR control delivery identity mismatch")
+        if command.operation == 'import':
+            key, ref, committed = self.pending_imports[event.command_id]
+            ack = event.pool_ack
+            if (event.worker_epoch != command.worker_epoch or event.operation != 'import'
+                    or event.entry_ref != ref or event.error or event.imported != committed or ack is None
+                    or ack.pool != self.pool_identity or ack.operation != 'release' or ack.applied is not True
+                    or not ack.lease_id or type(ack.lease_generation) is not int or ack.lease_generation <= 0):
+                self.poisoned = True
+                raise RuntimeError('import has no current UFlow committed/read-release receipt')
+            committed.validate(self.pool_identity, content_id=prefix_content_id(key))
+            self.ready[key] = ref
+            self.managed_ready[key] = committed
+            self.control_delivery.consume(event.delivery_sequence)
+            del self.controls[event.command_id]
+            del self.pending_imports[event.command_id]
+            self.record('managed_prefix_imported', entry=ref.entry_id, block=committed.block.block_id)
+            return
         if command.operation in ("diagnostic", "fault"):
             if event.worker_epoch != command.worker_epoch or event.operation != command.operation:
                 raise RuntimeError("diagnostic receipt identity mismatch")
@@ -335,16 +381,39 @@ class DdrPrefixCoordinator:
             job.state = LoadState.QUARANTINED
             self.poisoned = True
             return
-        self.transfer_delivery.consume(event.delivery_sequence)
         success = (event.status == TransferStatus.SUCCEEDED and event.native_completed
                    and event.transferred_bytes == 20971520 and not job.discard)
         key = req.entry_keys[0]
+        if success and self.pool_identity is not None:
+            try:
+                receipt = event.pool_receipt
+                if not isinstance(receipt, ManagedTransferReceipt):
+                    raise ValueError('managed native result lacks a pool range receipt')
+                receipt.validate(pool=self.pool_identity, operation=req.operation.value,
+                                 page_lease_id=req.page_lease_id, content_id=prefix_content_id(key))
+                if req.operation == Operation.LOAD:
+                    if receipt.content != self.managed_ready.get(key):
+                        raise ValueError('LOAD completion changed the imported/committed content generation')
+                    lease = job.lease
+                    if (lease.cache_epoch != self.cache_epoch or lease.lease_id != req.page_lease_id
+                            or lease.block_ids != req.page_ids or any(
+                                self.manager.blocks[p].ref_cnt <= 0 or self.manager.blocks[p].block_hash is not None
+                                for p in req.page_ids)):
+                        raise ValueError('destination HBM page lease changed before publication')
+            except (ValueError, TypeError) as error:
+                self.poisoned = True
+                job.state = LoadState.QUARANTINED
+                self.record('managed_completion_quarantined', job=req.job_id, error=str(error))
+                return
+        self.transfer_delivery.consume(event.delivery_sequence)
         # Match and settle the exact old job first. Epoch changes must not leak
         # its pin, nor authorize publication into a replacement cache epoch.
         publish = success and req.worker_epoch == self.worker_epoch and not self.closed and not self.poisoned
         if req.operation == Operation.STORE:
             if publish:
                 self.ready[key] = event.entry_refs[0]
+                if self.pool_identity is not None:
+                    self.managed_ready[key] = event.pool_receipt.content
                 self.record("ddr_ready", job=req.job_id, entry=event.entry_refs[0].entry_id)
             elif not self.stopped:
                 self.retiring[req.entry_refs[0].entry_id] = req.entry_refs[0]
@@ -362,6 +431,7 @@ class DdrPrefixCoordinator:
                 job.state = LoadState.DISCARD_PENDING
                 if not success and self.ready.get(key) == req.entry_refs[0]:
                     self.ready.pop(key, None)
+                    self.managed_ready.pop(key, None)
                 self.loads_by_key.pop((req.worker_epoch, key), None)
                 if not self.stopped and not success:
                     self.retiring[req.entry_refs[0].entry_id] = req.entry_refs[0]
@@ -499,6 +569,8 @@ class DdrPrefixCoordinator:
             if self.steps[step_id][0].cache_epoch == worker_epoch:
                 self.discard_step(step_id, stopped=True)
         self.ready.clear()
+        self.managed_ready.clear()
+        self.pending_imports.clear()
         self.retiring.clear()
         self.controls.clear()
         self.control_outbound.clear()

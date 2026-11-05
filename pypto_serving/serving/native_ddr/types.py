@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from .managed_pool import CommittedRange, ManagedTransferReceipt, PoolAck, PoolIdentity
 
 
 class Operation(str, Enum):
@@ -56,6 +57,10 @@ class NativeDdrPrefixConfig:
     enabled: bool = False
     capacity_bytes: int = 0
     max_inflight_transfers: int = 1
+    pool_endpoint: str = ''
+    pool_id: str = ''
+    pool_epoch: str = ''
+    sdk_sha256: str = ''
 
     def __post_init__(self):
         if type(self.enabled) is not bool:
@@ -73,6 +78,12 @@ class NativeDdrPrefixConfig:
         if (executor_cls != "PyptoQwen14BExecutor" or tp != 1 or page_size != 128
                 or dtype != "bfloat16" or grouped or not prefix_cache):
             raise ValueError("native DDR supports only Qwen TP1 BF16 page128 single-pool prefix caching")
+        if not all(isinstance(value, str) and value for value in (
+                self.pool_endpoint, self.pool_id, self.pool_epoch)):
+            raise ValueError('enabled DDR requires an explicit registered UFlow pool endpoint/id/epoch')
+        if (len(self.sdk_sha256) != 64
+                or any(c not in '0123456789abcdef' for c in self.sdk_sha256)):
+            raise ValueError('enabled DDR requires the accepted managed-pool SDK SHA256')
 
 
 @dataclass(frozen=True)
@@ -187,6 +198,7 @@ class DdrTransferEvent:
     stopped: bool
     error: str | None = None
     delivery_sequence: int = 0
+    pool_receipt: ManagedTransferReceipt | None = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +217,9 @@ class DdrStartup:
     capacity_bytes: int
     max_entries: int
     compatibility_json: bytes
+    pool_identity: PoolIdentity | None = None
+    control_metadata_bytes: int = 0
+    control_metadata_mapped_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -217,6 +232,8 @@ class DdrControlEvent:
     error: str | None = None
     payload: bytes = b""
     delivery_sequence: int = 0
+    imported: CommittedRange | None = None
+    pool_ack: PoolAck | None = None
 
 
 @dataclass(frozen=True)
@@ -231,3 +248,5 @@ class DdrControlRequest:
     fault: str = ""
     delivery_sequence: int = 0
     retire_through: int = field(default=0, compare=False)
+    imported: CommittedRange | None = None
+    imported_key: PrefixKey | None = None

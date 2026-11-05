@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import hashlib
 import json
 import queue
 import time
@@ -247,6 +246,8 @@ class ReplicaEngineCore:
         runtime = config.resolve_runtime_config()
         if runtime.native_ddr.enabled and (config.platform != "a2a3" or runtime.weight_dtype != "bfloat16"):
             raise ValueError("native DDR requires a2a3 and BF16 weights")
+        if runtime.native_ddr.enabled and getattr(config.parallel_config, 'data_parallel_size', 1) != 1:
+            raise ValueError('D1 managed DDR supports one single-card Qwen instance only')
         runtime.native_ddr.validate_runtime(
             executor_cls=config.executor_cls, tp=len(config.worker_device_ids()),
             page_size=runtime.page_size, dtype=runtime.kv_dtype,
@@ -952,6 +953,7 @@ class ReplicaEngineCore:
 
     async def _install_native_ddr(self, process, reported_num_blocks):
         from pypto_serving.serving.native_ddr.coordinator import DdrPrefixCoordinator
+        from pypto_serving.serving.native_ddr.compatibility import data_compatibility_digest
 
         channel = self._native_ddr_output_queue
         if channel is None:
@@ -974,19 +976,41 @@ class ReplicaEngineCore:
         descriptor = json.loads(info.compatibility_json)
         if (not info.worker_epoch or info.layout.num_pages != reported_num_blocks
                 or info.max_entries != count or info.capacity_bytes != count * info.layout.block_bytes
-                or hashlib.sha256(info.compatibility_json).digest() != info.namespace_digest
+                or data_compatibility_digest(descriptor) != info.namespace_digest
                 or descriptor["worker_epoch"] != info.worker_epoch
-                or descriptor["scope"] != "single-loaded-owner-incarnation-only"
+                or descriptor["scope"] != 'managed-pool-compatible-data-local-owner'
                 or descriptor["layout"] != asdict(info.layout) or descriptor["tensor_parallel"] != 1
                 or descriptor["model"]["model_id"] != self.config.model_id):
             raise RuntimeError("native DDR owner/layout/capacity/compatibility handshake mismatch")
+        pool = info.pool_identity
+        if pool is None or (pool.pool_id, pool.pool_epoch) != (
+                self._runtime.native_ddr.pool_id, self._runtime.native_ddr.pool_epoch):
+            raise RuntimeError('enabled native DDR has no matching UFlow access identity')
+        if (type(info.control_metadata_bytes) is not int or info.control_metadata_bytes != 4
+                or type(info.control_metadata_mapped_bytes) is not int
+                or info.control_metadata_mapped_bytes < info.control_metadata_bytes):
+            raise RuntimeError('native DDR control metadata has no separately measured shared-mapping charge')
         self._native_ddr_startup = info
         self._native_ddr = DdrPrefixCoordinator(self.kv_cache_manager,
-            namespace_digest=info.namespace_digest, worker_epoch=info.worker_epoch, max_entries=info.max_entries)
+            namespace_digest=info.namespace_digest, worker_epoch=info.worker_epoch, max_entries=info.max_entries,
+            pool_identity=pool)
         self.scheduler._native_ddr = self._native_ddr
         logger.info("native_ddr_startup epoch=%s pages=%d slots=%d bytes=%d namespace=%s compatibility=%s",
                     info.worker_epoch, reported_num_blocks, info.max_entries, info.capacity_bytes,
                     info.namespace_digest.hex(), info.compatibility_json.decode())
+
+    async def import_managed_prefix(self, prompt_token_ids, committed_ranges):
+        """Explicit typed token0 import before requests; never writes the ready table directly."""
+        if self._native_ddr is None or self._batch_queue or self.scheduler.has_work():
+            raise ValueError('managed prefix import requires a started idle engine')
+        commands = self._native_ddr.prepare_import_prefix(prompt_token_ids, committed_ranges)
+        deadline = time.monotonic() + 30
+        while any(identity in self._native_ddr.controls for identity in commands):
+            self._pump_native_ddr()
+            if time.monotonic() > deadline:
+                self._native_ddr.poisoned = True
+                raise TimeoutError('managed import has no correlated current UFlow receipt')
+            await asyncio.sleep(.001)
 
     def _pump_native_ddr(self, *, raise_poison=True):
         # No new query/RPC/thread on the disabled path. Auxiliary events are
@@ -1020,7 +1044,8 @@ class ReplicaEngineCore:
                 operation=command.operation, command_id=command.command_id, worker_epoch=command.worker_epoch,
                 job_id=command.job_id, entry_ref=command.entry_ref, page_ids=command.page_ids,
                 diagnostic_label=command.diagnostic_label, fault=command.fault,
-                delivery_sequence=command.delivery_sequence, retire_through=command.retire_through)))
+                delivery_sequence=command.delivery_sequence, retire_through=command.retire_through,
+                imported=command.imported, imported_key=command.imported_key)))
         request = native_ddr.next_transfer()
         if request is not None:
             self._input_queue.put(encode_command(NativeDdrCommand(operation="submit", request=request)))

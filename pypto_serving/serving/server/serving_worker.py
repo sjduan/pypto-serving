@@ -165,6 +165,7 @@ class WorkerProcess:
         self.native_ddr_output_queue = native_ddr_output_queue
         self._native_ddr_worker: DdrPrefixWorker | None = None
         self._native_ddr_backend = None
+        self._native_ddr_pool_access = None
         self._native_ddr_startup = None
         self._native_ddr_stop_sent = False
         self._native_ddr_controls = {}
@@ -231,11 +232,15 @@ class WorkerProcess:
             executor_cls = self._resolve_executor_cls()
             executor_kwargs = dict(self.config.executor_kwargs)
             if native_config.enabled:
-                from pypto_serving.serving.native_ddr.compatibility import capture_assets
-                assets = capture_assets(self.config.model_dir)
-                if "native_ddr_config" in executor_kwargs or "native_ddr_probe_slots" in executor_kwargs:
+                from pypto_serving.serving.native_ddr.compatibility import capture_full_assets
+                from pypto_serving.serving.native_ddr.managed_pool_sdk import register_managed_pool
+                self._native_ddr_pool_access = register_managed_pool(native_config)
+                assets = capture_full_assets(self.config.model_dir)
+                if any(key in executor_kwargs for key in (
+                        'native_ddr_config', 'native_ddr_probe_slots', 'native_ddr_pool_access')):
                     raise ValueError("native DDR startup owns the executor configuration")
                 executor_kwargs["native_ddr_config"] = native_config
+                executor_kwargs['native_ddr_pool_access'] = self._native_ddr_pool_access
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_ids=device_ids,
@@ -267,12 +272,11 @@ class WorkerProcess:
 
             if native_config.enabled:
                 import uuid
-                from pypto_serving.serving.native_ddr.compatibility import build_compatibility
+                from pypto_serving.serving.native_ddr.compatibility import build_compatibility, verify_loaded_assets
                 from pypto_serving.serving.native_ddr.types import DdrStartup
                 from pypto_serving.serving.native_ddr.worker import DdrPrefixWorker
 
-                if capture_assets(self.config.model_dir) != assets:
-                    raise RuntimeError("model assets changed during owner initialization")
+                verify_loaded_assets(self.config.model_dir, assets)
                 epoch = uuid.uuid4().hex
                 runner = self.executor._runners[self.config.model_id]
                 backend = runner.create_native_ddr_backend(loaded.runtime_model, epoch,
@@ -281,9 +285,10 @@ class WorkerProcess:
                 namespace, descriptor = build_compatibility(loaded, assets, epoch, backend.layout)
                 self._native_ddr_worker = DdrPrefixWorker(native_config, backend.layout, epoch, backend,
                                                         namespace_digest=namespace)
-                count = len(backend.slots.tensors)
+                count = backend.slots.capacity
                 self._native_ddr_startup = DdrStartup(epoch, namespace, backend.layout,
-                                                     count * backend.layout.block_bytes, count, descriptor)
+                    count * backend.layout.block_bytes, count, descriptor, backend.slots.access.identity,
+                    backend.slots.control_metadata_bytes, backend.slots.control_metadata_mapped_bytes)
                 self._emit_native_ddr(NativeDdrMessage("startup", startup=self._native_ddr_startup))
 
             if self._services_factory is not None:
@@ -1467,7 +1472,15 @@ class WorkerProcess:
                 if module.pending is not None:
                     time.sleep(0.002)
             if module.pending is not None or module.poisoned:
-                raise RuntimeError("native DDR shutdown has unproven native obligations")
+                backend = self._native_ddr_backend
+                if getattr(backend, 'is_managed', False):
+                    # A UF control ACK can be unknown after real native cleanup.
+                    # Stop our physical device domain while retaining the UF
+                    # lease/view/unknown charge. This never emits StopProof.
+                    backend.drain_native_domain()
+                    self.executor.close_native_ddr_domain_preserving_pool(self.config.model_id)
+                    backend.owner_stopped_preserving_pool()
+                raise RuntimeError("native DDR shutdown retains unresolved native/pool obligations")
             self._finish_native_ddr_drain()
         elif getattr(self, "_native_ddr_backend", None) is not None:
             # Startup failed between backend retention and handshake assembly.
@@ -1480,16 +1493,23 @@ class WorkerProcess:
             self._accepted_output_lengths.clear()
         executor = self.executor
         if executor is None:
+            access = getattr(self, '_native_ddr_pool_access', None)
+            if access is not None and not access.closed:
+                access.close()
             return
 
         close = getattr(executor, "close", None)
-        if getattr(self, "_native_ddr_backend", None) is not None:
+        if (getattr(self, "_native_ddr_backend", None) is not None
+                or getattr(self, '_native_ddr_pool_access', None) is not None):
             # This strict path propagates owner-close errors; the generic
             # executor.close logger must not turn them into a stop proof.
             executor.close_native_ddr_owner(self.config.model_id)
         if callable(close):
             close()
         self.executor = None
+        access = getattr(self, '_native_ddr_pool_access', None)
+        if access is not None and not access.closed:
+            access.close()
         if getattr(self, "_native_ddr_worker", None) is not None and not self._native_ddr_stop_sent:
             from pypto_serving.serving.native_ddr.worker import NativeStopProof
             proof = NativeStopProof(self._native_ddr_worker.worker_epoch, True, True)
@@ -1547,7 +1567,9 @@ class WorkerProcess:
     def _complete_native_ddr_control(self, cmd, event):
         from dataclasses import replace
         event = replace(event, delivery_sequence=cmd.delivery_sequence)
-        self._native_ddr_control_replay.finish(cmd, event)
+        access = getattr(getattr(self._native_ddr_backend, 'slots', None), 'access', None)
+        self._native_ddr_control_replay.finish(cmd, event,
+            protected=self._native_ddr_worker.poisoned or bool(access is not None and access.unknown))
         self._emit_native_ddr(NativeDdrMessage("control", control=event))
 
     def _finish_native_ddr_drain(self):
@@ -1594,7 +1616,7 @@ class WorkerProcess:
             from pypto_serving.serving.native_ddr.replay import ReplayError, ReplayLedger
             cmd = DdrControlRequest(cmd.command_id, cmd.worker_epoch, cmd.operation, cmd.job_id,
                                     cmd.entry_ref, cmd.page_ids, cmd.diagnostic_label, cmd.fault,
-                                    cmd.delivery_sequence, cmd.retire_through)
+                                    cmd.delivery_sequence, cmd.retire_through, cmd.imported, cmd.imported_key)
             if cmd.worker_epoch != module.worker_epoch or not cmd.command_id:
                 event = DdrControlEvent(cmd.command_id, cmd.worker_epoch, cmd.operation,
                                         cmd.entry_ref, error="invalid control epoch/identity",
@@ -1617,6 +1639,17 @@ class WorkerProcess:
             if cmd.operation == "cancel":
                 module.cancel(cmd.job_id)
                 event = DdrControlEvent(cmd.command_id, module.worker_epoch, "cancel")
+                self._complete_native_ddr_control(cmd, event)
+            elif cmd.operation == 'import':
+                try:
+                    if cmd.entry_ref is None or cmd.imported_key is None or cmd.imported is None:
+                        raise ValueError('typed managed import requires exact ref/key/committed metadata')
+                    backing = module.import_committed(cmd.entry_ref, cmd.imported_key, cmd.imported)
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, 'import', cmd.entry_ref,
+                                            imported=cmd.imported, pool_ack=backing.import_ack)
+                except (ValueError, RuntimeError) as error:
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, 'import', cmd.entry_ref,
+                                            error=str(error))
                 self._complete_native_ddr_control(cmd, event)
             elif cmd.operation == "evict":
                 if cmd.entry_ref is None:

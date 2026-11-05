@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .replay import ReplayError, ReplayLedger
+from .managed_pool import ManagedTransferReceipt, prefix_content_id
 
 from .types import (
     DdrEntryRef, DdrTransferEvent, DdrTransferRequest, EntryState,
@@ -33,6 +34,7 @@ class NativeCompletion:
     transferred_bytes: int
     native_completed: bool
     stopped: bool
+    pool_receipt: ManagedTransferReceipt | None = None
 
 
 class NativeTransferHandle(Protocol):
@@ -43,8 +45,9 @@ class NativeTransferHandle(Protocol):
 class NativeTransferBackend(Protocol):
     """M3 seam: same-owner pack/unpack, prefork backing, real native fence.
 
-    reserve_slot must return a retained owning allocation, not an interior
-    pointer. submit must either return the accepted handle or raise
+    reserve_slot must return a retained validated view of the registered whole
+    UFlow allocation, with its owner and exact range metadata. submit must
+    either return the accepted handle or raise
     NativeSubmissionError with its handle/stop evidence. An ordinary exception
     is UNKNOWN, never proof that native submission had no side effects.
     """
@@ -98,9 +101,9 @@ class DdrPrefixWorker:
         self.closed = False
         self.poisoned = False
 
-    def _event(self, req, status, *, stopped=False, completed=False, size=0, error=None):
+    def _event(self, req, status, *, stopped=False, completed=False, size=0, error=None, pool_receipt=None):
         event = DdrTransferEvent(req.job_id, req.worker_epoch, req.operation, status,
-                                 req.entry_refs, size, completed, stopped, error, req.delivery_sequence)
+                                 req.entry_refs, size, completed, stopped, error, req.delivery_sequence, pool_receipt)
         if stopped:
             self.transfer_replay.finish(req, event, protected=self.poisoned)
         return event
@@ -171,6 +174,27 @@ class DdrPrefixWorker:
             return self._event(request, TransferStatus.FAILED, error=f"native submit outcome unknown: {exc}")
         return self._event(request, TransferStatus.ACCEPTED)
 
+    def import_committed(self, ref, key, committed):
+        if (self.closed or self.poisoned or self.pending is not None or self.backend is None
+                or not getattr(self.backend, 'is_managed', False)):
+            raise ValueError('typed committed import requires an idle managed native owner')
+        if (ref.worker_epoch != self.worker_epoch or ref.entry_id in self.entries
+                or ref.slot_generation <= self._generation or key.namespace_digest != self.namespace_digest):
+            raise ValueError('imported entry owner/generation/loaded compatibility mismatch')
+        used = {entry.slot for entry in self.entries.values()}
+        slot = next((index for index in range(self.capacity) if index not in used), None)
+        if slot is None:
+            raise ValueError('managed prefix cache entry capacity exhausted')
+        try:
+            backing = self.backend.slots.import_committed(slot, committed, content_id=prefix_content_id(key))
+        except Exception:
+            if self.backend.slots.access.unknown:
+                self.poisoned = True
+            raise
+        self.entries[ref.entry_id] = _Entry(ref, slot, backing, key, EntryState.READY)
+        self._generation = ref.slot_generation
+        return backing
+
     def _settle(self, pending, *, success):
         entry = pending.entry
         if pending.request.operation == Operation.LOAD:
@@ -203,11 +227,18 @@ class DdrPrefixWorker:
             if not result.stopped:
                 raise RuntimeError("native completion has no stop proof")
             success = result.native_completed and result.transferred_bytes == self.layout.block_bytes
+            if success and getattr(self.backend, 'is_managed', False):
+                if not isinstance(result.pool_receipt, ManagedTransferReceipt):
+                    raise RuntimeError('managed completion has no correlated UFlow range receipt')
+                result.pool_receipt.validate(pool=self.backend.slots.access.identity,
+                    operation=req.operation.value, page_lease_id=req.page_lease_id,
+                    content_id=prefix_content_id(req.entry_keys[0]))
             self._settle(pending, success=success)
             status = (TransferStatus.CANCELLED if pending.cancelled else
                       TransferStatus.SUCCEEDED if success else TransferStatus.FAILED)
             return (self._event(req, status, stopped=True, completed=result.native_completed,
                                 size=result.transferred_bytes,
+                                pool_receipt=result.pool_receipt,
                                 error=None if success else "incomplete native transfer"),)
         except Exception as exc:
             self.poisoned = True

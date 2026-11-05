@@ -13,7 +13,7 @@ accepted v1 SDK; it does not implement an allocator, directory or lock manager.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 import uuid
 
@@ -54,13 +54,18 @@ class PoolIdentity:
     placement_id: str
     binding_id: str
     access_generation: int
+    simpler_owner: str
+    simpler_buffer_id: int
+    simpler_generation: int
+    resource_generation: int
     provider_kind: str = 'posix_shm_simpler'
 
     def __post_init__(self):
         for name in ('pool_id', 'pool_epoch', 'provider_session', 'client_session',
-                     'resource_id', 'placement_id', 'binding_id'):
+                     'resource_id', 'placement_id', 'binding_id', 'simpler_owner'):
             opaque(getattr(self, name), name)
-        for name in ('nbytes', 'inode', 'access_generation'):
+        for name in ('nbytes', 'inode', 'access_generation', 'simpler_buffer_id',
+                     'simpler_generation', 'resource_generation'):
             positive(getattr(self, name), name)
         if type(self.device) is not int or not 0 <= self.device <= U64_MAX or self.provider_kind != 'posix_shm_simpler':
             raise ValueError('unsupported managed pool physical identity')
@@ -94,6 +99,8 @@ class PoolLease:
     mode: str
     state: str
     content_version: int
+    holder_session: str
+    token: str = field(repr=False)
     content_id: str = ''
 
     def validate(self, pool, block, mode, offset, size):
@@ -103,6 +110,9 @@ class PoolLease:
         opaque(self.lease_id, 'range lease ID')
         positive(self.lease_generation, 'lease generation')
         positive(self.content_version, 'content version')
+        opaque(self.token, 'range capability token')
+        if self.holder_session != pool.client_session:
+            raise ValueError('range lease holder is not the registered client session')
         interval(self.byte_offset, self.nbytes, pool.nbytes)
         if not block.byte_offset <= self.byte_offset or self.byte_offset + self.nbytes > block.byte_offset + block.nbytes:
             raise ValueError('range lease escapes allocation')
@@ -186,6 +196,40 @@ class PoolOutcomeUnknown(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class ManagedTransferReceipt:
+    operation: str
+    pool: PoolIdentity
+    lease_id: str
+    lease_generation: int
+    content: CommittedRange
+    page_lease_id: str
+    release_ack: PoolAck | None = None
+
+    def validate(self, *, pool, operation, page_lease_id, content_id):
+        if (self.pool, self.operation, self.page_lease_id) != (pool, operation, page_lease_id):
+            raise ValueError('managed transfer completion belongs to another pool/page lease')
+        opaque(self.lease_id, 'native range lease')
+        positive(self.lease_generation, 'native lease generation')
+        self.content.validate(pool, content_id=content_id)
+        if operation == 'STORE':
+            if self.release_ack is not None or self.content.writer_lease_id != self.lease_id:
+                raise ValueError('STORE completion has no matching committed writer')
+        elif operation == 'LOAD':
+            ack = self.release_ack
+            if (not isinstance(ack, PoolAck) or ack.pool != pool or ack.operation != 'release'
+                    or ack.applied is not True or (ack.lease_id, ack.lease_generation) != (
+                        self.lease_id, self.lease_generation)):
+                raise ValueError('LOAD completion has no matching released reader')
+            opaque(ack.operation_id, 'reader release operation')
+        else:
+            raise ValueError('invalid managed native operation')
+
+
+def prefix_content_id(key):
+    return 'qwen3-prefix-v1:' + key.namespace_digest.hex() + ':' + key.block_hash.hex()
+
+
 class ManagedPoolAccess:
     """Local references to UFlow promises; no client-side lock or budget decisions."""
     def __init__(self, port: ManagedPoolPort):
@@ -217,17 +261,24 @@ class ManagedPoolAccess:
             raise ValueError('UFlow allocation did not preserve the requested guard interval')
         return block
 
-    def acquire(self, block, mode, *, committed=None):
+    def acquire(self, block, mode, *, committed=None, byte_offset=None):
         self._admit()
         block.validate(self.identity)
         if mode not in ('r', 'w'):
             raise ValueError('invalid managed access mode')
-        offset = committed.byte_offset if committed is not None else block.byte_offset + GUARD_BYTES
+        offset = committed.byte_offset if committed is not None else (
+            block.byte_offset + GUARD_BYTES if byte_offset is None else byte_offset)
         size = BLOCK_BYTES
         interval(offset, size, self.identity.nbytes)
-        if offset + size > block.byte_offset + block.nbytes or offset % ALIGNMENT:
+        if offset < block.byte_offset or offset + size > block.byte_offset + block.nbytes or offset % ALIGNMENT:
             raise ValueError('native range escapes its allocation or alignment')
-        lease = self.port.acquire_range(block, mode, block.generation, offset - block.byte_offset, size)
+        try:
+            lease = self.port.acquire_range(block, mode, block.generation, offset - block.byte_offset, size)
+        except (PoolOutcomeUnknown, TimeoutError, ConnectionError) as error:
+            # A lost or undecodable grant is not a rejected lock request. The
+            # SDK port retains its original reply/call for later reconciliation.
+            self.report_unknown(None, f'range acquisition outcome unknown: {error}')
+            raise
         # Retain even a malformed/ambiguous SDK answer. Do not silently lose a
         # lock granted remotely because local validation discovered a mismatch.
         identity = getattr(lease, 'lease_id', uuid.uuid4().hex)
@@ -294,6 +345,7 @@ class ManagedPoolAccess:
             self.report_unknown(lease, str(error))
             raise
         del self.leases[lease.lease_id]
+        return ack
 
     def attach_child(self, pid, birth):
         self._admit()

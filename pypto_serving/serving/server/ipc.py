@@ -29,7 +29,9 @@ from typing import Any, Literal, Union
 import msgspec
 from pypto_serving.serving.native_ddr.types import (
     DdrControlEvent, DdrEntryRef, DdrStartup, DdrTransferEvent, DdrTransferRequest,
+    PrefixKey,
 )
+from pypto_serving.serving.native_ddr.managed_pool import CommittedRange
 from pypto_serving.serving.native_ddr.worker import NativeStopProof
 
 # Sentinel for a decode input token the worker must resolve from its own cache.
@@ -149,7 +151,7 @@ class ControlCommand(msgspec.Struct, tag="control"):
 class NativeDdrCommand(msgspec.Struct, tag="native_ddr"):
     """Narrow non-barrier command; replies NEVER enter the StepResult FIFO."""
 
-    operation: Literal["submit", "cancel", "evict", "drain", "diagnostic", "fault"]
+    operation: Literal["submit", "cancel", "evict", "drain", "diagnostic", "fault", "import"]
     request: DdrTransferRequest | None = None
     job_id: str = ""
     entry_ref: DdrEntryRef | None = None
@@ -160,6 +162,8 @@ class NativeDdrCommand(msgspec.Struct, tag="native_ddr"):
     fault: str = ""
     delivery_sequence: int = 0
     retire_through: int = 0
+    imported: CommittedRange | None = None
+    imported_key: PrefixKey | None = None
 
 
 class NativeDdrMessage(msgspec.Struct):

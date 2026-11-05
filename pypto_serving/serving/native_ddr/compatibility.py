@@ -71,6 +71,47 @@ def capture_assets(model_dir):
     return {"resolved": str(root), "files": files}
 
 
+def capture_full_assets(model_dir):
+    """D1 startup content proof; payloads are hashed once, never per request."""
+    assets = capture_assets(model_dir)
+    root = Path(assets['resolved'])
+    for name, row in assets['files'].items():
+        path = root / name
+        row['sha256'] = digest_file(path)
+        current = path.stat()
+        if (current.st_size, current.st_dev, current.st_ino, current.st_mtime_ns) != (
+                row['bytes'], row['device'], row['inode'], row['mtime_ns']):
+            raise ValueError('model asset changed while capturing complete content')
+        row['evidence'] = 'full-asset-content-at-startup'
+    return assets
+
+
+def verify_loaded_assets(model_dir, captured):
+    """After loading, verify the same files/stat/headers/small content without a second shard scan."""
+    current = capture_assets(model_dir)
+    if current['resolved'] != captured['resolved'] or current['files'].keys() != captured['files'].keys():
+        raise ValueError('loaded model assets differ from captured content manifest')
+    for name, row in current['files'].items():
+        expected = captured['files'][name]
+        if any(value != expected.get(key) for key, value in row.items() if key != 'evidence'):
+            raise ValueError(f'loaded asset changed after full hash capture: {name}')
+
+
+def data_compatibility_digest(descriptor):
+    """Data identity excludes owner/access session, addresses and local arena P."""
+    assets = descriptor['assets']
+    if not all(row.get('evidence') == 'full-asset-content-at-startup' and 'sha256' in row
+               for row in assets['files'].values()):
+        raise ValueError('managed prefix compatibility requires complete loaded asset hashes')
+    layout = {key: value for key, value in descriptor['layout'].items() if key != 'num_pages'}
+    data = {'schema': 1, 'model': descriptor['model'],
+            'asset_content': {name: row['sha256'] for name, row in assets['files'].items()},
+            'tokenizer_type': descriptor['tokenizer_type'], 'adapter': descriptor['adapter'],
+            'position': descriptor['position'], 'layout': layout,
+            'tensor_parallel': descriptor['tensor_parallel'], 'deployment': descriptor['deployment']}
+    return hashlib.sha256(canonical_json(data)).digest()
+
+
 def build_compatibility(loaded, assets, worker_epoch, layout):
     # Hash the actual imported sources/binaries, independently of Git availability
     # in an installed deployment. No management or previous experiment path is used.
@@ -85,7 +126,7 @@ def build_compatibility(loaded, assets, worker_epoch, layout):
                    for p in sorted(root.rglob("*.py")) if "__pycache__" not in p.parts}
         components[name] = {"source_manifest_sha256": hashlib.sha256(canonical_json(entries)).hexdigest(),
                             "source_files": len(entries)}
-    for name in ("pypto", "pypto.pypto_core", "pypto.runtime", "simpler", "_task_interface"):
+    for name in ("pypto", "pypto.pypto_core", "pypto.runtime", "simpler", "_task_interface", 'uflow.managed_pool'):
         module = importlib.import_module(name)
         path = Path(module.__file__).resolve()
         components[name] = {"sha256": digest_file(path),
@@ -99,7 +140,7 @@ def build_compatibility(loaded, assets, worker_epoch, layout):
     ptoas = shutil.which("ptoas")
     components["ptoas"] = {"sha256": digest_file(ptoas),
                            "version": subprocess.check_output([ptoas, "--version"], text=True, timeout=10).strip()}
-    descriptor = {"schema": 1, "scope": "single-loaded-owner-incarnation-only",
+    descriptor = {"schema": 1, "scope": "managed-pool-compatible-data-local-owner",
                   "worker_epoch": worker_epoch, "model": asdict(loaded.config),
                   "assets": assets, "tokenizer_type": type(loaded.tokenizer).__qualname__,
                   "adapter": None, "position": "absolute-token-offset/loaded-config-RoPE",
@@ -107,4 +148,4 @@ def build_compatibility(loaded, assets, worker_epoch, layout):
     encoded = canonical_json(descriptor)
     if len(encoded) > 60000:
         raise ValueError("compatibility descriptor exceeds bounded startup metadata")
-    return hashlib.sha256(encoded).digest(), encoded
+    return data_compatibility_digest(descriptor), encoded

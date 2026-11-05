@@ -35,7 +35,8 @@ from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerC
 
 
 LAYOUT = QwenKvLayout(40, 16, 128, 8, 128)
-CONFIG = NativeDdrPrefixConfig(True, LAYOUT.block_bytes * 2)
+CONFIG = NativeDdrPrefixConfig(True, LAYOUT.block_bytes * 2, pool_endpoint='/test-only/not-a-daemon',
+                               pool_id='test-pool', pool_epoch='test-epoch', sdk_sha256='a' * 64)
 KEY = PrefixKey(b'n' * 32, b'h' * 32)
 REF = DdrEntryRef("worker1", "entry1", 1)
 _wire_sequences = {}
@@ -511,7 +512,9 @@ def test_enabled_backend_fails_before_executor_construction():
                                        (["--native-ddr-kv-bytes", "20971520"], True)])
 def test_cli_native_config_without_reading_model_or_device(flags, valid):
     from pypto_serving.cli.main import build_parser, _build_native_ddr_config
-    args = build_parser().parse_args(["--model", "not-a-model-load", "--enable-native-ddr-kv", *flags])
+    args = build_parser().parse_args(["--model", "not-a-model-load", "--enable-native-ddr-kv",
+        '--native-ddr-pool-endpoint', CONFIG.pool_endpoint, '--native-ddr-pool-id', CONFIG.pool_id,
+        '--native-ddr-pool-epoch', CONFIG.pool_epoch, '--native-ddr-sdk-sha256', CONFIG.sdk_sha256, *flags])
     if valid:
         assert _build_native_ddr_config(args).enabled
     else:
@@ -862,21 +865,26 @@ def test_joining_committed_canonical_target_does_not_wait_for_another_event():
 
 def test_startup_waits_for_delayed_auxiliary_metadata_and_validates_capacity():
     import asyncio
-    import hashlib
     import json
     import queue
     import threading
     from pypto_serving.serving.native_ddr.types import DdrStartup
+    from pypto_serving.serving.native_ddr.managed_pool import PoolIdentity
+    from pypto_serving.serving.native_ddr.compatibility import data_compatibility_digest
 
     core = ReplicaEngineCore(EngineConfig(model_id="qwen", runtime_config=RuntimeConfig(
         page_size=128, native_ddr=CONFIG)), SimpleNamespace())
     core.kv_cache_manager.initialize(core._runtime, num_blocks=16)
     core._native_ddr_output_queue = queue.Queue()
-    descriptor = json.dumps({"worker_epoch": "worker1", "scope": "single-loaded-owner-incarnation-only",
+    descriptor = json.dumps({"worker_epoch": "worker1", "scope": "managed-pool-compatible-data-local-owner",
                              "model": {"model_id": "qwen"}, "layout": asdict(LAYOUT),
-                             "tensor_parallel": 1}).encode()
-    info = DdrStartup("worker1", hashlib.sha256(descriptor).digest(), LAYOUT,
-                      CONFIG.capacity_bytes, 2, descriptor)
+                             "tensor_parallel": 1, 'tokenizer_type': 'test-only', 'adapter': None,
+                             'position': 'absolute', 'deployment': {}, 'assets': {'files': {
+                                 'asset': {'sha256': 'a' * 64, 'evidence': 'full-asset-content-at-startup'}}}}).encode()
+    pool = PoolIdentity(CONFIG.pool_id, CONFIG.pool_epoch, 'provider', 'client', 134217728, 1, 2,
+                         'resource', 'placement', 'binding', 1, 'owner', 1, 1, 1)
+    info = DdrStartup("worker1", data_compatibility_digest(json.loads(descriptor)), LAYOUT,
+                      CONFIG.capacity_bytes, 2, descriptor, pool, 4, 4096)
     producer = threading.Timer(.03, lambda: core._native_ddr_output_queue.put(
         encode_native_ddr_message(NativeDdrMessage("startup", startup=info))))
     producer.start()
@@ -980,6 +988,30 @@ def test_stop_proof_follows_strict_owner_close_not_module_drain(owner_error):
         assert calls == ["module_close", "backend_close", "owner_close", "executor_close"]
 
 
+@pytest.mark.parametrize('owner_error', [False, True])
+def test_unknown_pool_shutdown_can_stop_owned_native_domain_without_emitting_whole_stop_proof(owner_error):
+    import queue
+    from pypto_serving.serving.server.serving_worker import WorkerProcess
+    calls = []
+    def close_domain(_model):
+        calls.append('owner_domain_close')
+        if owner_error:
+            raise RuntimeError('owner close not proven')
+    process = WorkerProcess.__new__(WorkerProcess)
+    process.config = SimpleNamespace(model_id='qwen')
+    process._native_ddr_worker = SimpleNamespace(pending=None, poisoned=True)
+    process._native_ddr_backend = SimpleNamespace(is_managed=True,
+        drain_native_domain=lambda: calls.append('native_drain'),
+        owner_stopped_preserving_pool=lambda: calls.append('release_device_refs_keep_pool'))
+    process.executor = SimpleNamespace(close_native_ddr_domain_preserving_pool=close_domain)
+    process.native_ddr_output_queue = queue.Queue()
+    with pytest.raises(RuntimeError, match='not proven' if owner_error else 'unresolved native/pool'):
+        process.close()
+    assert calls == (['native_drain', 'owner_domain_close'] if owner_error else
+                     ['native_drain', 'owner_domain_close', 'release_device_refs_keep_pool'])
+    assert process.native_ddr_output_queue.empty()
+
+
 def test_asset_namespace_evidence_tracks_content_and_rejects_escaping_shards(tmp_path):
     import json
     import struct
@@ -1033,9 +1065,9 @@ def test_production_worker_rejects_foreign_namespace_before_reserving_or_submitt
 def test_receipt_filter_exception_keeps_real_handle_obligations_until_explicit_result():
     from pypto_serving.model.qwen.native_ddr_transfer import NativeDdrRun
     calls = []
-    slot = SimpleNamespace(native_complete=False)
+    slot = SimpleNamespace()
     backend = SimpleNamespace(worker=object(), keys=object(), values=object(),
-        slots=SimpleNamespace(page_ids=object(), busy=slot), layout=LAYOUT,
+        slots=SimpleNamespace(page_ids=object(), busy=slot, finish_native=lambda *args: None), layout=LAYOUT,
         record=lambda *args, **kwargs: calls.append(args[0]), pending=None)
     def reject(_request, _result):
         raise RuntimeError("injected host receipt exception")
@@ -1050,6 +1082,7 @@ def test_receipt_filter_exception_keeps_real_handle_obligations_until_explicit_r
     backend.completion_filter = None  # explicit host-fixture repair, not production recovery
     assert handle.result() == NativeCompletion(LAYOUT.block_bytes, True, True)
     assert backend.pending is None and backend.slots.busy is None and handle._keepalive is None
+    assert calls.count('native_result') == 1
 
 
 def test_same_owner_reuses_slots_for_256_cycles_and_retires_old_load_before_backend():

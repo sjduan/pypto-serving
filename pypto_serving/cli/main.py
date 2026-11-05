@@ -107,9 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Runtime
     parser.add_argument("--enable-native-ddr-kv", action=argparse.BooleanOptionalAction, default=False,
-                        help="Enable experimental native DDR prefix KV (requires verified M3 backend).")
+                        help="Enable native prefix KV access to an existing UFlow-managed DDR pool.")
     parser.add_argument("--native-ddr-kv-bytes", type=int, default=0,
-                        help="Explicit bounded DDR capacity in bytes; at least one 20971520-byte block.")
+                        help="Maximum live prefix bytes accessed in the UFlow pool; does not allocate a pool.")
+    parser.add_argument('--native-ddr-pool-endpoint', default='', help='Existing UFlow managed-pool endpoint.')
+    parser.add_argument('--native-ddr-pool-id', default='', help='Existing UFlow pool ID.')
+    parser.add_argument('--native-ddr-pool-epoch', default='', help='Expected UFlow pool incarnation.')
+    parser.add_argument('--native-ddr-sdk-sha256', default='', help='Accepted managed-pool SDK module SHA256.')
     parser.add_argument("--max-model-len", type=int, default=1024, help="Maximum sequence length (prompt + generated; default: 1024).")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
     parser.add_argument(
@@ -545,6 +549,10 @@ def _build_native_ddr_config(args):
     config = NativeDdrPrefixConfig(
         enabled=getattr(args, "enable_native_ddr_kv", False),
         capacity_bytes=getattr(args, "native_ddr_kv_bytes", 0),
+        pool_endpoint=getattr(args, 'native_ddr_pool_endpoint', ''),
+        pool_id=getattr(args, 'native_ddr_pool_id', ''),
+        pool_epoch=getattr(args, 'native_ddr_pool_epoch', ''),
+        sdk_sha256=getattr(args, 'native_ddr_sdk_sha256', ''),
     )
     dtype = args.dtype if args.kv_cache_dtype == "auto" else args.kv_cache_dtype
     if config.enabled and (args.block_size != 128 or dtype != "bfloat16"
