@@ -34,11 +34,17 @@ try:
             return
         _ctx['busy'], _ctx['attempt'] = True, _ctx['attempt'] + 1
         try:
-            _write(f"diagnostic-{_ctx['attempt']}.json", _actions.diagnose(_ctx, _cfg))
+            if _cfg.get('action') == 'close-existing-device':
+                assert _ctx['attempt'] == 1
+                _write('before-device-close-diagnostic.json', _actions.diagnose(_ctx, _cfg))
+                _actions.close_device(_ctx, _cfg, _write)
+            else:
+                _write(f"diagnostic-{_ctx['attempt']}.json", _actions.diagnose(_ctx, _cfg))
         except BaseException as error:
             try:
                 _write(f"diagnostic-failed-{_ctx['attempt']}.json", {'pid': os.getpid(), 'error': repr(error),
-                    'traceback': traceback.format_exc(), 'original_context_retained': True, 'no_cleanup_attempted': True})
+                    'traceback': traceback.format_exc(), 'original_context_retained': True,
+                    'stage': _ctx.get('stage', 'diagnosis'), 'device_close_attempted': _cfg.get('action') == 'close-existing-device'})
             except BaseException:
                 pass
         finally:

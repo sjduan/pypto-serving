@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import re
 import signal
-import socket
 import subprocess
 import sys
 
@@ -34,7 +33,7 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def run(root, shared, expected_manifest_sha, expected_driver_sha):
+def run(root, shared, expected_manifest_sha, expected_driver_sha, action):
     driver_file = BASE / 'f-n004-recovery-r005/shared/driver.py'
     assert sha(driver_file) == expected_driver_sha
     spec = importlib.util.spec_from_file_location('n005_install_driver', driver_file)
@@ -44,7 +43,6 @@ def run(root, shared, expected_manifest_sha, expected_driver_sha):
     from existing_pool import ExistingPoolService, retained_pool
     from host_guard import inventory
     from pypto_serving.serving.native_ddr.managed_process import descendants
-    from r_guard import snapshot
     from uflow.managed_pool import _exchange
     root.mkdir()
     for name in ('logs', 'inventories', 'catalog'):
@@ -103,30 +101,39 @@ def run(root, shared, expected_manifest_sha, expected_driver_sha):
     assert {k: leases[0][k] for k in ('lease_id', 'lease_generation', 'block_id', 'offset', 'nbytes', 'state', 'client_session')} == {
         'lease_id': LEASE, 'lease_generation': 1018, 'block_id': 5, 'offset': 2097152, 'nbytes': 20971520,
         'state': 'Unknown', 'client_session': CLIENT}
-    with Path('/workspace/uflow/locks/run02-npu-10.lock').open('a+') as lock, socket.socket() as sock:
+    # Hold only our task cleanup mutex. No new card reservation or service port
+    # is acquired while A/B are held for the user's other service.
+    with (root.parent / 'existing-n005-cleanup.lock').open('a+') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        resource = snapshot(root, 'diagnostic-before', 10)
-        driver.save(root / 'resource-before.json', resource)
-        assert resource['status']['health'] == 'OK' and not resource['fds']['denied']
-        assert {x['pid'] for x in resource['fds']['users']} <= {PID, 1146316}
-        board, occupants = resource['status']['board'], []
-        for line in resource['npu'].splitlines():
-            match = re.fullmatch(r'\|\s*(\d+)\s+(\d+)\s*\|\s*(\d+)\s*\|.*', line)
-            if match and int(match[1]) == board:
-                occupants.append(int(match[3]))
-        assert occupants and set(occupants) <= {PID, 1146316}
-        sock.bind(('127.0.0.1', 18892))
-        driver.save(root / 'reservation.json', {'pid': os.getpid(), 'selected_device': 10, 'SMI_occupants': occupants,
-            'scope': 'advisory held for diagnostic only; original own context is still alive'})
+        driver.save(root / 'cleanup-mutex.json', {'pid': os.getpid(), 'new_card_reservation': False,
+            'scope': 'single cleaner for existing original n005 only; no port or run02 card lock acquired'})
         driver.save(root / 'config.json', {'pid': PID, 'birth': BIRTH, 'children': CHILDREN,
-            'pool_id': POOL, 'client_id': CLIENT, 'lease_id': LEASE, 'source_hashes': source_hashes,
+            'action': action, 'pool_id': POOL, 'client_id': CLIENT, 'lease_id': LEASE, 'source_hashes': source_hashes,
             'target_source': str(SOURCE / 'examples/run04/pool_native_probe.py'),
-            'previous_payload': str(BASE / 'f-n005-recovery-r001/shared/payload.py'),
-            'previous_root': str(BASE / 'f-n005-recovery-r001/diagnostic-c001'),
-            'previous_payload_sha256': '9fa7eb239b643cd6c67d74a7dc84f57e1fd60d8b66bd17f66c8d35fde857449c'})
+            'previous_payload': str(BASE / 'f-n005-recovery-r002/shared/payload.py'),
+            'previous_root': str(BASE / 'f-n005-recovery-r002/diagnostic-c001'),
+            'previous_payload_sha256': '260ed754da25d02d70008cbc527ad941c296b6dfc1efd9daf4e932e97eec1518'})
         assert driver.install(root, shared), 'install failed; original objects/PID retained'
         assert driver.birth(PID) == BIRTH and driver.tracer(PID) == 0
         os.kill(PID, signal.SIGUSR1)  # The newly installed action is diagnostic only.
+        if action == 'close-existing-device':
+            import time
+            deadline = time.monotonic() + 80
+            while not (root / 'device-stage-complete.json').exists():
+                assert driver.birth(PID) == BIRTH
+                assert not (root / 'diagnostic-failed-1.json').exists(), 'normal cleanup failed; preserve original context'
+                assert time.monotonic() < deadline, 'normal close still pending; do not launch anything new'
+                time.sleep(.1)
+            assert driver.birth(1146316) != CHILDREN[1146316]
+            npu = subprocess.check_output(['npu-smi', 'info'], text=True, timeout=15)
+            (root / 'npu-after-existing-close.txt').write_text(npu)
+            rows = [line for line in npu.splitlines() if re.fullmatch(r'\|\s*5\s+0\s*\|\s*1146316\s*\|.*', line)]
+            assert not rows
+            driver.save(root / 'device-result.json', {'existing_original_chip_gone': True, 'original_chip_no_longer_in_A10_SMI': True,
+                'normal_Worker_close': True, 'signals_TERM_KILL_used': False, 'new_card_reservation': False,
+                'new_Worker_init_or_submit': False, 'scope': 'cleanup only under A/B hold; Unknown pool still charged'})
+            print('Original n005 A10 owner normally closed; no TERM/KILL, no new device work')
+            return
         value = driver.await_file(root / 'diagnostic-1.json', PID, BIRTH, timeout=20)
         after = service.snapshot('fresh-after-diagnostic')
         assert retained_pool(after) == service.expected
@@ -144,5 +151,6 @@ if __name__ == '__main__':
     parser.add_argument('--shared', type=Path, required=True)
     parser.add_argument('--manifest-sha', required=True)
     parser.add_argument('--driver-sha', required=True)
+    parser.add_argument('--action', choices=['diagnose', 'close-existing-device'], default='diagnose')
     args = parser.parse_args()
-    run(args.root, args.shared, args.manifest_sha, args.driver_sha)
+    run(args.root, args.shared, args.manifest_sha, args.driver_sha, args.action)

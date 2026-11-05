@@ -23,7 +23,7 @@ def serial(value):
         return {'hex': value.hex()}
     if isinstance(value, dict):
         return {str(k): serial(v) for k, v in value.items()}
-    if isinstance(value, (tuple, list)):
+    if isinstance(value, (tuple, list, set, frozenset)):
         return [serial(v) for v in value]
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -141,3 +141,67 @@ def diagnose(ctx, cfg):
         'scope': 'original object read-only diagnostic; no new submit/SDK mutation/pin release/owner close/frame clear'}
     ctx['diagnosis'] = result
     return result
+
+
+def quiescence(ctx):
+    """Current access proof, under the actual admission/lifecycle locks; no historical-count claim."""
+    worker, low = ctx['worker'], ctx['worker']._w
+    assert ctx['original'].paused and not ctx['original'].busy and ctx['module'].poisoned
+    empty = ('_accepted_run_handles', '_abandoned_run_handles', '_chip_runs', '_chip_run_touched_identities',
+        '_chip_source_uses', '_pending_remote_buffer_frees', '_pending_remote_import_releases',
+        '_pending_remote_import_release_states', '_chip_service_factories', '_lease_depth', '_run_finalization_depth')
+    clear = ('_ordered_cleanup_error', '_worker_host_mapped_cleanup_error', '_delegated_session_fatal',
+             '_building_run_resources', '_region_access_service')
+    with worker._dispatch_submit_mu, low._submit_mu.exclusive(), low._hierarchical_start_cv:
+        values = {name: serial(getattr(low, name)) for name in (*empty, *clear)}
+        assert not worker._active_dispatch_handles
+        assert all(not f.in_use and f.handle is None and not f.tensors and not f.keepalive and not f.cleanup
+                   for f in worker._dispatch_frames)
+        for name in empty:
+            assert not getattr(low, name), f'current native/cleanup obligation: {name}'
+        for name in clear:
+            assert getattr(low, name) is None, f'current native poison/accessor: {name}'
+        assert low._active_ops == 0 and not low._source_context_failed
+        assert low._worker_host_mapped_cleanup_state == (None, ())
+        values.update(active_operations=low._active_ops, source_context_failed=low._source_context_failed,
+                      mapped_cleanup_state=serial(low._worker_host_mapped_cleanup_state))
+    import simpler.worker as source
+    values['actual_Simpler_source'] = {'path': source.__file__, 'sha256': hashlib.sha256(Path(source.__file__).read_bytes()).hexdigest(),
+        'acceptance_rule': inspect.getsource(type(low)._submit_l3_locked),
+        'abandonment_publication_rule': inspect.getsource(type(low)._publish_abandoned_run)}
+    values.update(current_access_ended=True, scope='current static pause: no accepted/active/pending/building/abandoned/debt/poison/accessor',
+                  historical_native_submit_count_claimed=False, callable_registrations_retained=serial(low._live_handles))
+    return values
+
+
+def close_device(ctx, cfg, save):
+    """Release only the original n005 device owner. Pool Unknown/SDK obligations remain untouched."""
+    from pypto_serving.serving.native_ddr.managed_process import process_birth, descendants, detach_closed_children
+    proof = quiescence(ctx)
+    save('native-current-quiescence.json', proof)
+    ctx['stage'] = 'release-service-pins'
+    assert set(ctx['backend']._pins) == ctx['worker']._service_tokens and len(ctx['backend']._pins) == 2
+    pins = list(ctx['backend']._pins)
+    ctx['backend']._release_pins()  # Actual release_service_tensor calls; ambiguous is deliberately retained.
+    assert not ctx['worker']._service_tokens and not ctx['backend']._pins and not ctx['worker']._w._service_buffers
+    save('pins-actually-released.json', {'pins': pins, 'runtime_service_tokens_empty': True,
+        'underlying_service_buffers_empty': True, 'business_ambiguous_retained': ctx['backend'].ambiguous is not None})
+    ctx['stage'] = 'actual-worker-close'
+    ctx['worker'].close()
+    assert ctx['worker']._close_complete and not ctx['worker']._active_dispatch_handles
+    assert not ctx['worker']._inherited_host_tensors
+    assert process_birth(1146316) != 484537554
+    remaining = descendants(cfg['pid'])
+    assert set(remaining) <= {1146315}
+    save('device-close-success.json', {'pid': cfg['pid'], 'birth': cfg['birth'],
+        'actual_Worker_close_returned': True, 'actual_close_complete': True,
+        'original_chip_pid': 1146316, 'original_chip_birth_gone': True, 'remaining_children': remaining,
+        'SDK_state_mutated': False, 'unmap_ACK_done': False, 'pool_destroyed': False,
+        'scope': 'normal close of existing device owner under A/B hold; pool/client Unknown responsibility remains'})
+    ctx['device_closed'] = True
+    ctx['stage'] = 'detach-actually-stopped-child'
+    slots = ctx['slots']
+    detach_closed_children(ctx['access'], slots.child_registrations, slots.child_baseline, helpers=slots.child_helpers)
+    save('device-stage-complete.json', {'normal_Worker_close': True, 'original_mapping_child_detached': True,
+        'original_writer_unknown_retained': True, 'unmap_ACK_done': False, 'pool_destroyed': False,
+        'scope': 'existing device resource released; further host terminal-unmap still required'})
