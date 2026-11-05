@@ -95,13 +95,21 @@ def run(root, shared, expected_manifest_sha, expected_driver_sha, action):
     active = [p for p in current['pools'] if p['state'] != 'Released']
     assert {p['pool_id'] for p in active} == {service.expected['pool_id'], POOL}
     pool = next(p for p in active if p['pool_id'] == POOL)
-    assert not pool['frozen'] and pool['provider_session'] == '71d2e8ab-4b5c-400c-a77c-131619490cac'
+    assert pool['provider_session'] == '71d2e8ab-4b5c-400c-a77c-131619490cac'
+    if not host_terminal:
+        assert not pool['frozen']
     assert pool['pool_epoch'] == '60074e16-5fed-49ba-9546-0eb4c67839d6'
     assert (pool['canonical']['dev'], pool['canonical']['inode'], pool['canonical']['nbytes']) == (25, 842044, 134217728)
     assert len(pool['clients']) == 1 and pool['clients'][0]['state'] == 'Mapped'
     assert pool['clients'][0]['client_session'] == CLIENT
     if host_terminal:
-        assert not pool['clients'][0]['children']
+        children = pool['clients'][0]['children']
+        assert len(children) <= 1
+        if children:
+            assert children[0]['birth']['pid'] == 1146316
+            assert children[0]['birth']['starttime_ticks'] == 484537554
+            assert type(children[0]['unknown']) is bool
+        assert pool['frozen'] == bool(children and children[0]['unknown'])
     else:
         assert len(pool['clients'][0]['children']) == 1
         assert pool['clients'][0]['children'][0]['birth']['pid'] == 1146316

@@ -137,6 +137,7 @@ def consumer(args):
     _RECOVERY.worker = worker
     registered = attach_new_children(access, baseline, helpers=slots.child_helpers,
                                      control_resources=slots.control_resources)
+    slots.child_registrations = registered
     registered_pids = tuple(registered)
     helper_evidence = dict(slots.child_helpers)
     save(root / 'children.json', {'baseline': baseline, 'registered': registered,

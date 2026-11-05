@@ -68,7 +68,8 @@ def prepare(ctx, cfg):
     assert access.identity.pool_id == cfg['pool_id'] and access.identity.client_session == cfg['client_id']
     assert access.identity.device == 25 and access.identity.inode == 842044
     ctx.update(original=original, frames=frames, module=module, backend=backend,
-               worker=worker, slots=slots, access=access, client=access.port.client)
+               worker=worker, slots=slots, access=access, client=access.port.client,
+               registrations=consumer.f_locals['registered'])
     return {'pid': os.getpid(), 'birth': process_birth(os.getpid()), 'prepared_only': True,
             'original_objects_preserved': True, 'actions': 'diagnostic only; no native/SDK state mutation'}
 
@@ -201,7 +202,8 @@ def close_device(ctx, cfg, save):
     ctx['device_closed'] = True
     ctx['stage'] = 'detach-actually-stopped-child'
     slots = ctx['slots']
-    detach_closed_children(ctx['access'], slots.child_registrations, slots.child_baseline, helpers=slots.child_helpers)
+    detach_closed_children(ctx['access'], ctx['registrations'], slots.child_baseline, helpers=slots.child_helpers)
+    assert not ctx['access'].children and not ctx['client']._children
     save('device-stage-complete.json', {'normal_Worker_close': True, 'original_mapping_child_detached': True,
         'original_writer_unknown_retained': True, 'unmap_ACK_done': False, 'pool_destroyed': False,
         'scope': 'existing device resource released; further host terminal-unmap still required'})
@@ -217,7 +219,15 @@ def finish_host_unmap(ctx, cfg, save, previous_namespace):
     assert ctx['worker']._close_complete and not ctx['worker']._service_tokens
     assert process_birth(1146316) != 484537554
     assert descendants(cfg['pid']) == {1146315: 484537553}
-    assert not ctx['slots'].child_registrations and not ctx['access'].children and not ctx['client']._children
+    if ctx['access'].children:
+        assert set(ctx['access'].children) == {(1146316, 484537554)}
+        assert ctx['registrations'] == {1146316: 484537554}
+        from pypto_serving.serving.native_ddr.managed_process import detach_closed_children
+        detach_closed_children(ctx['access'], ctx['registrations'], ctx['slots'].child_baseline,
+                               helpers=ctx['slots'].child_helpers)
+        save('original-SDK-child-actually-detached.json', {'child_pid': 1146316, 'child_birth': 484537554,
+            'actual_Worker_close_preceded_detach': True, 'original_access_SDK_children_empty': not ctx['access'].children and not ctx['client']._children})
+    assert not ctx['registrations'] and not ctx['access'].children and not ctx['client']._children
     helper = Path(__file__).with_name('terminal_unmap.py')
     assert hashlib.sha256(helper.read_bytes()).hexdigest() == cfg['terminal_helper_sha256']
     spec = importlib.util.spec_from_file_location('uflow_terminal_unmap_task', helper)
