@@ -192,6 +192,12 @@ def check_round(round_, report, root, *, inspect_bytes, raw_log=None):
                 and block['restored']['page'] == target, 'LOAD destination is not a distinct original-arena page')
         targets.add(target)
         overwrite = next(r for r in report['requests'] if r['request_id'] == block['overwrite_request'])
+        original_request = next(r for r in report['requests'] if r['request_id'] == round_['cold_request'])
+        original_tokens = original_request['prompt_token_ids'][index * 128:(index + 1) * 128]
+        emitted = [o['token_id'] for o in overwrite['outputs'] if o.get('token_id') is not None]
+        require(len(original_tokens) == 128 and emitted and all(a != b for a, b in zip(
+                    overwrite['prompt_token_ids'] + emitted[:1], original_tokens)),
+                'overwrite stimulus reuses original token values; all rows must have distinct actual model inputs')
         schedule = steps(report, block['overwrite_request'])
         require(len(overwrite['prompt_token_ids']) == 127 and all(s['pages'] == [source] for s in schedule)
                 and {position for s in schedule for position in range(s['computed_before'],

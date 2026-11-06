@@ -89,7 +89,7 @@ def metadata():
                 'delivery_sequence': i * 2 + (1 if op == 'STORE' else 2)})
         overwrite = f'overwrite{i}'
         report['requests'].append({'request_id': overwrite, 'prompt_token_ids': list(range(127)),
-                                    'begin_ns': 20, 'completed_ns': 40})
+                                    'begin_ns': 20, 'completed_ns': 40, 'outputs': [{'token_id': 127}]})
         report['schedule_events'].append({'requests': [
             {'request_id': overwrite, 'is_prefill': True, 'computed_before': 0, 'tokens': 127, 'pages': [i]},
             {'request_id': overwrite, 'is_prefill': False, 'computed_before': 127, 'tokens': 1, 'pages': [i]}]})
@@ -102,6 +102,8 @@ def metadata():
                       'sequence': 5 + i, 'page': i + 4}})
     report['coordinator_trace'] = [copy.deepcopy(event) for block in round_['blocks']
                                    for event in (block['store'], block['load'], block['valid'])]
+    report['requests'].append({'request_id': 'cold', 'prompt_token_ids': list(range(1000, 1257)),
+                               'prompt': 'synthetic direct prefix'})
     return round_, report
 
 
@@ -143,6 +145,45 @@ def test_two_contiguous_blocks_have_complete_host_order_without_native_acceptanc
     round_, report = metadata()
     result = evidence.check_round(round_, report, '.', inspect_bytes=False)
     assert result['status'] == 'HOST-METADATA-CHECKED' and result['native_acceptance'] is False
+
+
+def test_overwrite_candidates_require_disjoint_roundtripping_token_rows():
+    from qwen_scenario import overwrite_candidates
+
+    class WordTokenizer:
+        def __init__(self):
+            self.words = {}
+
+        def encode(self, text):
+            return [self.words.setdefault(word, len(self.words)) for word in text.split()]
+
+        def decode(self, ids):
+            words = {value: key for key, value in self.words.items()}
+            return ' '.join(words[token] for token in ids)
+
+    tokenizer = WordTokenizer()
+    source = tokenizer.encode('apple ' * 128)
+    candidates = list(overwrite_candidates(tokenizer, source))
+    assert candidates and len(candidates) <= 12
+    assert len({tuple(ids) for _, ids in candidates}) == len(candidates)
+    for text, ids in candidates:
+        assert len(ids) == 127 and tokenizer.encode(text) == ids
+        assert all(token != original for token, original in zip(ids, source))
+    with pytest.raises(ValueError, match='128-token'):
+        list(overwrite_candidates(tokenizer, source[:127]))
+
+
+@pytest.mark.parametrize('row', [0, 126, 127])
+def test_overwrite_rejects_same_input_token_including_actual_decode(row):
+    round_, report = metadata()
+    overwrite = report['requests'][0]
+    original = report['requests'][-1]['prompt_token_ids']
+    if row == 127:
+        overwrite['outputs'][0]['token_id'] = original[row]
+    else:
+        overwrite['prompt_token_ids'][row] = original[row]
+    with pytest.raises(ValueError, match='reuses original token'):
+        evidence.check_round(round_, report, '.', inspect_bytes=False)
 
 
 @pytest.mark.parametrize('fault', ['missing-block', 'old-worker', 'wrong-token-start', 'early-valid',

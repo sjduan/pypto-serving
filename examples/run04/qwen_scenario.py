@@ -13,6 +13,34 @@ import json
 from pathlib import Path
 import time
 
+
+def overwrite_candidates(tokenizer, source_tokens):
+    """Bounded real prompts whose 127 prefill tokens differ at every source row.
+
+    Layer-zero V can be identical for the same input token regardless of context.
+    Check the emitted decode token separately after actual model computation.
+    """
+    if len(source_tokens) != 128:
+        raise ValueError('overwrite stimulus requires one original 128-token source block')
+    phrases = (
+        'Antarctic penguins inhabit frozen coastal habitats while researchers monitor ocean temperatures '
+        'beneath drifting icebergs, marine biologists classify plankton species around submerged volcanic ridges',
+        'Astronomers analyze distant galaxies using infrared telescopes while physicists calculate quantum '
+        'transitions beneath magnetic fields, laboratory technicians calibrate sensitive instruments',
+        'Botanists classify tropical orchids beside volcanic slopes while ecologists track migratory '
+        'butterflies across remote islands, conservation teams protect fragile ecosystems',
+        'apple', 'zebra', 'volcano', 'cobalt', 'cucumber', 'penguin', 'isotope', 'tangerine', 'sapphire')
+    seen = set()
+    for phrase in phrases:
+        ids = tokenizer.encode((phrase + ' ') * 256)[:127]
+        text = tokenizer.decode(ids)
+        key = tuple(ids)
+        if (len(ids) == 127 and key not in seen and tokenizer.encode(text) == ids
+                and all(token != source_tokens[index] for index, token in enumerate(ids))):
+            seen.add(key)
+            yield text, ids
+
+
 async def normal(engine, core, collect, collect_trace, args, report, cold, warm):
     import httpx
     from pypto_serving.config.types import GenerateConfig
@@ -110,14 +138,24 @@ async def normal(engine, core, collect, collect_trace, args, report, cold, warm)
             claim_free()
             for index, source in enumerate(sources):
                 release((source,))
-                other = await collect(f'r04-{number}-{index}-real-model-overwrite',
-                    token_prompt(f'Different calculation {number} {index}.', 127), generation)
-                await idle()
-                schedule = steps(other['request_id'])
-                assert all(s['pages'] == [source] for s in schedule)
-                assert sum(s['tokens'] for s in schedule if s['is_prefill']) == 127
-                assert any(not s['is_prefill'] and s['computed_before'] == 127 and s['tokens'] == 1 for s in schedule)
+                source_tokens = seed['prompt_token_ids'][index * 128:(index + 1) * 128]
+                attempts = []
+                for attempt, (text, ids) in enumerate(overwrite_candidates(engine.tokenizer, source_tokens)):
+                    other = await collect(f'r04-{number}-{index}-real-model-overwrite-{attempt}', text, generation)
+                    await idle()
+                    schedule = steps(other['request_id'])
+                    assert all(s['pages'] == [source] for s in schedule)
+                    assert sum(s['tokens'] for s in schedule if s['is_prefill']) == 127
+                    assert any(not s['is_prefill'] and s['computed_before'] == 127 and s['tokens'] == 1 for s in schedule)
+                    first = next(output['token_id'] for output in other['outputs'] if output['token_id'] is not None)
+                    attempts.append({'request_id': other['request_id'], 'prefill_tokens_differ_at_all_rows': True,
+                                     'actual_decode_token_differs': first != source_tokens[127]})
+                    if first != source_tokens[127]:
+                        break
+                else:
+                    raise RuntimeError('bounded real model overwrite prompts did not change the final source token')
                 overwritten.append({'request_id': other['request_id'], 'schedule': schedule,
+                                    'attempts': attempts,
                                     'capture': await inspect((source,), None, f'{number}-{index}-overwrite')})
                 allocated = manager.allocate_blocks(1)
                 assert allocated is not None and [b.block_id for b in allocated] == [source]
@@ -174,6 +212,7 @@ async def normal(engine, core, collect, collect_trace, args, report, cold, warm)
                     'source': original['pages'][0], 'committed': original['ddr'],
                     'overwritten': overwritten[index]['capture']['pages'][0],
                     'overwrite_request': overwritten[index]['request_id'], 'restored': restored['pages'][0],
+                    'overwrite_attempts': overwritten[index]['attempts'],
                     'store': stores[0], 'load': terminals[0],
                     'valid': next(e for e in events if e['event'] == 'restored_page_valid'
                                   and e['job'] == terminals[0]['job'])})

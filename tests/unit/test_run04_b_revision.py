@@ -168,6 +168,7 @@ def complete_synthetic_bundle():
         second = rewrite(copy.deepcopy(first), renames)
         second.update(number=1, interface='http')
         report['requests'] += rewrite(copy.deepcopy(report['requests']), renames)
+        next(a for a in report['requests'] if a['request_id'] == 'cold-r1')['prompt'] = 'synthetic HTTP prefix'
         report['schedule_events'] += rewrite(copy.deepcopy(report['schedule_events']), renames)
         for block in second['blocks']:
             for terminal in (block['store'], block['load']):
