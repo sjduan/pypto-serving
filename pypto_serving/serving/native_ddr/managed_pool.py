@@ -243,7 +243,11 @@ def prefix_content_id(key):
 
 class ManagedPoolAccess:
     """Local references to UFlow promises; no client-side lock or budget decisions."""
-    def __init__(self, port: ManagedPoolPort):
+    def __init__(self, port: ManagedPoolPort, *, max_registered_children=None):
+        if max_registered_children is not None and (type(max_registered_children) is not int or max_registered_children < 1):
+            raise ValueError('stricter inherited-child execution bound must be a positive integer')
+        self.max_registered_children = max_registered_children
+        self._child_admissions = 0
         self.port = port
         self.identity = port.identity
         if not isinstance(self.identity, PoolIdentity):
@@ -378,6 +382,12 @@ class ManagedPoolAccess:
             return
         self.children[key] = None
         try:
+            if self.max_registered_children is not None and self._child_admissions >= self.max_registered_children:
+                # This actual inherited holder remains unacknowledged locally.
+                # Reporting Unknown retains the entire original access/domain;
+                # it never treats the extra mapping as absent or safe to unmap.
+                raise PoolOutcomeUnknown('shared execution child-count bound exceeded; original holder retained')
+            self._child_admissions += 1
             ack = self.port.attach_child(pid, birth)
             if (not isinstance(ack, PoolAck) or ack.pool != self.identity or ack.applied is not True
                     or (ack.operation, ack.child_pid, ack.child_birth) != ('attach_child', pid, birth)):

@@ -342,11 +342,18 @@ def register_managed_pool(config):
         raise ValueError('configured SDK is not the manager-accepted P1 module')
     if getattr(config, 'shared_slots_path', ''):
         from .shared_pool import partition_metadata
-        document, _, manifest = partition_metadata(config.shared_slots_path)
+        document, shared_blocks, manifest = partition_metadata(config.shared_slots_path)
         if ((document['pool']['pool_id'], document['pool']['pool_epoch']) != (config.pool_id, config.pool_epoch)
                 or config.pool_endpoint != manifest['endpoint']):
             raise ValueError('shared partition/configuration identity differs before SDK registration')
     module, operation = accepted_sdk(), uuid.uuid4().hex
+    if getattr(config, 'shared_slots_path', ''):
+        from .shared_directory import DirectoryAuthority
+        if module.describe_pool(config.pool_endpoint, config.pool_id, config.pool_epoch) != document['pool']:
+            raise ValueError('actual pool differs from sealed partition before SDK registration')
+        snapshot = module._exchange(config.pool_endpoint, 'GetManagedPoolSnapshot',
+            {k: document['pool'][k] for k in ('pool_id', 'pool_epoch', 'provider_session')})[0]
+        DirectoryAuthority(document['pool'], shared_blocks, lambda: snapshot, lambda *args: None)
     try:
         client = module.ManagedPoolClient.register(config.pool_endpoint, config.pool_id, config.pool_epoch,
                                                    access='rw', operation_id=operation)
@@ -361,7 +368,7 @@ def register_managed_pool(config):
         if getattr(config, 'shared_slots_path', ''):
             from .shared_pool import register_partition_client
             register_partition_client(config.shared_slots_path, port.identity.client_session)
-        return ManagedPoolAccess(port)
+        return ManagedPoolAccess(port, max_registered_children=3 if getattr(config, 'shared_slots_path', '') else None)
     except BaseException as error:
         try:
             client.begin_unregister()

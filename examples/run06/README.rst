@@ -1,55 +1,135 @@
-Run06: independent Qwen services sharing one managed DDR pool
-===========================================================
+Run06: independent Qwen replicas sharing one existing DDR pool
+=============================================================
 
-This example consumes the common owner public manifest. It does not create a
-pool, allocate another set of slots, obtain an admin capability, or finalize
-another line. The accepted SDK remains the mapping, range, version and budget
-authority. The four M1 slots are actual preallocated 22MiB ranges: a 2MiB guard
-and a 20MiB Qwen KV payload each. Each service maps the same 128MiB backing.
+Status and scope
+----------------
 
-The explicitly configured shared directory stores at most four canonical keys
-and four publication intents. Current UF snapshot metadata and an independent
-real SDK reader/revalidation/release receipt are required before publication.
-Writer operation IDs are provenance, not cross-process access capabilities;
-the accepted journal scopes their queries to the original peer PID.
-The directory maps the common pool only to obtain these metadata-only read
-promises; it neither reads nor transports KV payloads. Discovering a descriptor grants no
-read access: the worker imports it through the original replay/epoch-controlled
-interface, obtains a current reader, releases that reader, then reacquires and
-revalidates the exact version before native LOAD. Local HBM hits take priority.
-Directory misses, pressure and confirmed stale readers fall back safely; an
-ambiguous grant/result retains the original client/native obligations.
+This directory implements the metadata partition preflight and an executable
+scenario controller. CPU fake transports test orchestration only. No new
+Run06 model/native result is implied by a successful plan or CPU suite.
+Current host-only inputs leave ``device_release`` and ``operation_allowance``
+null. Neither a plan nor an example supplies execution authority or a device
+reservation. Frozen SDK/Lib/PyPTO/Simpler are unchanged.
 
-``shared-slots.json`` is a task-local normalized copy of the common public
-manifest. It names the actual pool descriptor, four actual allocation identities,
-source manifest SHA256 and public session-manifest path. Startup checks these
-against the registered descriptor and real current allocation snapshot. It also
-registers the actual ordinary SDK session with the common lifecycle owner.
+The only pool is the lifecycle owner's existing 128MiB B pool. Four actual M1
+allocations each contain a 2MiB guard and a 20MiB payload. Every replica uses
+the same allocations. The metadata directory carries keys/receipts and never
+KV payloads. UF remains the lease/version/mapping authority. Ordinary clients
+register with the existing external owner; this controller never creates,
+destroys or restarts that pool, changes its public manifest, or retires M1.
 
-Explicit optional CLI configuration::
+Partition preflight
+-------------------
 
-  --enable-native-ddr-kv --native-ddr-kv-bytes 83886080
-  --native-ddr-pool-endpoint /exact/common/u.sock
-  --native-ddr-pool-id ACTUAL_ID --native-ddr-pool-epoch ACTUAL_EPOCH
-  --native-ddr-sdk-sha256 ACCEPTED_SDK_SHA256
-  --shared-ddr-directory /exact/m1/d.sock
-  --shared-ddr-directory-epoch EXPLICIT_DIRECTORY_EPOCH
-  --shared-ddr-slots /exact/m1/shared-slots.json
+``shared_pool.partition_metadata`` validates exact schema, public SHA, group,
+B domain, full descriptor, M1/O1 indices, allocation line/identity/generation/
+offset/size, and complete guard/payload layout. Every normalized block must
+match the ordered public M1 list. The production SDK adapter also performs
+readonly real descriptor/allocation checks before RegisterPoolClient. A
+metadata seal grants no access; consumers still acquire/revalidate real UF
+readers. Bad/duplicate/O1/stale/bool-schema configurations fail before any new
+SDK mutation or directory startup.
 
-``directory_service.py`` owns only the bounded metadata service. Its fixed
-epoch-matching stop file requires no remaining intents and never destroys UF.
-Normal producer retirement leaves valid UF-owned content discoverable.
+Generating a pure plan
+----------------------
 
-``host_probe.py`` runs the actual common SDK through independent producer and
-reader interpreters. It proves producer exit before consumption, two same-version
-read leases, actual overlapping-write rejection and another-range commit while
-readers remain live. Its byte patterns are host tests, not model/native evidence.
-The common heavy-job lock is held for that host test. Each SDK client is normally
-unmapped; the M1 line and shared owner remain live for subsequent model testing.
+Prepare from a sealed task-local deployment and a JSON containing the twelve
+previously accepted complete model asset hashes::
 
-Native/model processes must never inherit the host API fence. Model evidence
-must separately cover two then four actual physical cards, cold target services,
-two token-zero prefix blocks, full 80-side bytes, legitimate allocator pages,
-direct/HTTP suffix and decode, actual prefill reductions and cooperative stops.
-No two-instance or host result constitutes four-model completion. Measurement
-uses the common bounded window without a held UF lease or directory lock.
+  python -B examples/run06/prepare_scenario.py \
+    --deployment /path/to/sealed-m1-deployment \
+    --assets /path/to/model-assets.json --replicas 2 \
+    --root /workspace/uflow/runs/phasef-parallel-20261106/m1/device-two-001 \
+    --output /path/to/new-local-plan-two
+
+  python -B examples/run06/scenario.py plan \
+    --config /path/to/new-local-plan-two/local-plan-config.json \
+    --output /path/to/new-local-plan-two/independent-plan.json
+
+The local bindings copy uses the exact recorded public manifest bytes. The
+separate ``runtime-config.NOT-RELEASED.json`` references the B deployment and
+has no runtime release or journal allowance. For the four-instance stage use
+``--replicas 4`` with another new root. Its future release must identify the
+sealed real two-instance result from the same source/physical pool first.
+These commands do not scan assets/source on B, import device runtimes, call
+SDK/control endpoints, query/reserve cards, or start models.
+
+Future execution and evidence
+-----------------------------
+
+Only after the actual resource/headroom gate is released, execute on B under
+the sealed native environment::
+
+  python -B examples/run06/scenario.py run \
+    --config /path/to/released-runtime-config.json \
+    --output /path/to/new-real-device-evidence.json
+
+The release and shared operation allowance are source/public-manifest/pool
+bound. All normal cached records from both lines must stay below4096; real
+terminal recovery headroom is separately checked against8192. No allowance
+is inferred from historical counters. Missing identity, full source/assets/
+binary closure, unknown/frozen pool state, retired line, mapping conflicts,
+occupied FD/driver domain or insufficient HBM prevents a new model/SDK
+mutation. Per-card admission uses full FD/health/HBM and actual physical/
+board/chip/BDF mapping plus legal locks and common reservations. Qwen requires
+at least40000MiB free, following accepted D1, not the O1 4GiB microbenchmark
+budget. The actual KV allocation uses the original0.8 utilization policy.
+
+The baseline loads only one model per physical card at a time, disables DDR,
+and performs3warmup+20measured requests after genuine original-allocator
+HBM-cold reset for every sample. It normally stops before a shared model is
+loaded on that card. Source compilation/startup shares the bounded host-job
+slots. Each actor has distinct ports/build/cache/log/diagnostic roots.
+
+Then one independent directory and two/four independent TP1 engines run on
+separate physical devices. The producer calculates and STOREs two contiguous
+token0 blocks. Each never-STORE consumer does2direct+2HTTP requests from cold
+HBM, with two actual LOADs, true257-to1 prefill, suffix/decode, and full80-side
+source/DDR/restored payload captures. Two held original-arena HBM sentinel
+pages are captured before/after every functional restore. Assigned UF guards
+use actual readers, revalidation and release ACKs. A separate host-fenced
+ordinary observer holds two original real readers while the producer's
+original allocator/model calculation overwrites its source pages. Producer
+normal exit and actual SDK unmap precede each consumer's next2direct+2HTTP
+restores; the observer is released and normally closed.
+
+Shared performance also uses3warmup+20measured pairs per consumer, resetting
+HBM every sample and requiring fresh native LOAD receipts. No second-sample
+HBM hit can masquerade as shared DDR timing. Raw per-request outputs, actual
+prefill schedules, native typed receipts and original node submit/result
+bindings, process CPU/RSS, bounded measurement-window/co-tenant context,
+median/p90 and paired differences are retained. HBM priority is tested without
+reset; unrelated double misses run last, after all shared measurements, so
+finite replacement cannot contaminate them. Optional four-instance routing
+uses only existing ordinary static replicas; no cache-aware router or router
+owned models are added.
+
+The controller reads/correlates full original actor evidence files. It does
+not accept stdout readiness, labels, or an accepted-only native event as a
+pass. Normal SDK Unmapped/children/lease state and original process births,
+selected FD/health, owned sockets and reservations are checked before normal
+release. Failure/cancel/unknown retains the original owner/domain; there is
+no automatic new attempt, kill, reset, force-unmap or fake cleanup. The shared
+owner stays allocated until both lines genuinely finish.
+
+Finite operation-record budget
+------------------------------
+
+With all normal close ACKs included, the two-instance full stage is248 and the
+four-instance full stage636 new cached mutations:884 total. This preserves
+all samples and guard/ACK evidence. Shared accesses enforce a total lifetime
+maximum of3 SDK child-attach admissions. An unexpected fourth actual
+inherited holder remains unacknowledged/Unknown and blocks continuation and
+ordinary close; it is never classified away. Legacy non-shared behavior is
+unchanged. Historical accepted D1 captures had1 mapped child; that history is
+supporting topology evidence, not a new M1 result or grant.
+
+The source-derived table is emitted in every plan. Source directories and
+observer each cost registration/mapping plus normal unregistration/unmap.
+All real native LOAD/import/diagnostic/guard/publication readers and writer
+commit paths are counted. Readonly snapshot/describe/query and same-ID replay
+cost no new cached record. At the last captured312 plus proposed O1 maximum
+2888, normal completion would total4084, leaving12 to the admission boundary;
+this arithmetic is a coordination input, not permission. A larger safety
+margin requires an explicit cross-line decision, not a sample reduction,
+new pool/Catalog or changed4096/8192 limit.

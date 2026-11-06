@@ -60,7 +60,8 @@ def validate_partition(value, manifest):
         'manifest_version owner_births owner_root partitions pool_descriptor protocol provider_loaded schema state')
     if (type(manifest['schema']) is not int or manifest['schema'] != 1
             or type(manifest['manifest_version']) is not int or manifest['manifest_version'] != 1
-            or manifest['state'] != 'ready' or manifest['group'] != value['resource_group']
+            or manifest['state'] != 'ready' or manifest['group'] != 'phasef-parallel-20261106'
+            or manifest['group'] != value['resource_group']
             or manifest['host_alias'] != 'serving-b-sj' or manifest['container'] != 'openeuler-2403-DS'):
         raise ValueError('sealed common manifest group/schema/B domain differs')
     _shape(manifest['partitions'], 'M1 O1')
@@ -97,6 +98,11 @@ def validate_partition(value, manifest):
         _integer(canonical[name])
     for name in ('body_hex', 'kind', 'native_descriptor', 'owner_instance_id'):
         _text(canonical[name])
+    for name in ('buffer_id', 'dev', 'generation', 'inode', 'nbytes'):
+        _integer(canonical[name], 1)
+    if (canonical['access'] != 2 or canonical['address_space'] != 0 or canonical['backend_kind'] != 1
+            or canonical['kind'] != 'posix_shm_simpler' or canonical['native_descriptor'] != 'validated-Simpler-Buffer-ABI-v1'):
+        raise ValueError('canonical managed backing ABI differs')
     if descriptor['nbytes'] != 134217728 or canonical['nbytes'] != descriptor['nbytes']:
         raise ValueError('common backing must remain the original 128MiB pool')
     # JSON equality alone accepts True == 1: compare the canonical typed encoding.

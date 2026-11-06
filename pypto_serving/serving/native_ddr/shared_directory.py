@@ -72,6 +72,8 @@ class DirectoryAuthority:
             raise ValueError('shared pool has unresolved mapping/native obligations')
         for block in self.blocks:
             rows = [a for a in pool['ranges']['allocations'] if a['block_id'] == block.block_id]
+            if (len(rows) == 1 and any(type(rows[0][k]) is not int for k in ('block_id','generation','offset','nbytes'))):
+                raise ValueError('actual UFlow allocation counters are not strict integers')
             if (block.pool_id != pool['pool_id'] or block.pool_epoch != pool['pool_epoch']
                     or block.nbytes != BLOCK_BYTES + GUARD_BYTES or len(rows) != 1
                     or any(rows[0][a] != b for a, b in (
