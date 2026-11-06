@@ -250,7 +250,8 @@ def test_native_correlation_requires_real_submit_outcome_and_cleanup_order(fault
             evidence.correlate_native(report, '\n'.join(lines))
 
 
-@pytest.mark.parametrize('fault', [None, 'unstopped', 'early-valid', 'store-published', 'new-native-run', 'missing-raw'])
+@pytest.mark.parametrize('fault', [None, 'unstopped', 'early-valid', 'store-published', 'new-native-run', 'missing-raw',
+    'store-completed-before-cancel', 'load-completed-before-cancel', 'failed-cancel'])
 def test_cancel_failure_and_retired_replay_evidence_are_checked_against_trace(fault):
     trace = []
     def row(job, status, bytes_):
@@ -282,7 +283,13 @@ def test_cancel_failure_and_retired_replay_evidence_are_checked_against_trace(fa
         stale['native_runs_before_after'][1] += 1
     elif fault == 'missing-raw':
         raw = ''
-    if fault is None:
+    elif fault == 'store-completed-before-cancel':
+        store['terminal']['status'] = 'SUCCEEDED'
+    elif fault == 'load-completed-before-cancel':
+        all_['terminal']['status'] = 'SUCCEEDED'
+    elif fault == 'failed-cancel':
+        store['terminal']['status'] = 'FAILED'
+    if fault in (None, 'store-completed-before-cancel', 'load-completed-before-cancel'):
         evidence.check_controls(report, raw)
     else:
         with pytest.raises(ValueError):

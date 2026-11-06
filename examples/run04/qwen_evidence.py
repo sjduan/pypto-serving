@@ -278,7 +278,8 @@ def check_controls(report, raw_log):
     trace = report['coordinator_trace']
     def terminal(row, status, bytes_):
         value = row['terminal']
-        require(value['status'] == status and value['stopped'] is True and value['native_completed'] is True
+        allowed = (status,) if isinstance(status, str) else status
+        require(value['status'] in allowed and value['stopped'] is True and value['native_completed'] is True
                 and value['bytes'] == bytes_, 'negative scenario lacks an actual stopped native receipt')
         require([e for e in trace if e['event'] == 'transfer_terminal' and e['job'] == value['job']] == [value],
                 'negative scenario terminal differs from the actual coordinator trace')
@@ -286,14 +287,16 @@ def check_controls(report, raw_log):
     cancellations = report['load_cancellation']
     require([r['all_waiters'] for r in cancellations] == [False, True], 'both LOAD cancellation cohorts are required')
     for row in cancellations:
-        job = terminal(row, 'CANCELLED' if row['all_waiters'] else 'SUCCEEDED', BLOCK_BYTES)
+        job = terminal(row, ('CANCELLED', 'SUCCEEDED') if row['all_waiters'] else 'SUCCEEDED', BLOCK_BYTES)
         require(row['pending_target_retained'] is True and row['early_valid'] is False,
                 'cancellation did not retain the pending destination pin')
         if row['all_waiters']:
             require(not any(e['event'] == 'restored_page_valid' and e['job'] == job for e in trace),
                     'cancelled LOAD destination was published')
     row = report['store_cancellation']
-    job = terminal(row, 'CANCELLED', BLOCK_BYTES)
+    # A cancellation may race with physical completion. The parent must discard
+    # either stopped outcome, without publishing content or releasing pins early.
+    job = terminal(row, ('CANCELLED', 'SUCCEEDED'), BLOCK_BYTES)
     require(row['source_pin_released_after_stop'] is True and row['ddr_ready_not_published'] is True
             and not any(e['event'] == 'ddr_ready' and e['job'] == job for e in trace),
             'cancelled STORE was committed as a usable entry')
