@@ -20,7 +20,9 @@ import time
 import traceback
 import uuid
 
-from pypto_serving.serving.native_ddr.managed_pool import BLOCK_BYTES, GUARD_BYTES, PoolBlock, prefix_content_id
+from pypto_serving.serving.native_ddr.managed_pool import (
+    BLOCK_BYTES, GUARD_BYTES, CommittedRange, PoolBlock, StaleCommittedRange, prefix_content_id,
+)
 from pypto_serving.serving.native_ddr.managed_pool_sdk import SDK_SHA256, register_managed_pool
 from pypto_serving.serving.native_ddr.shared_directory import DirectoryClient
 from pypto_serving.serving.native_ddr.shared_pool import load_bindings
@@ -104,6 +106,81 @@ def guards(access, bindings):
         rows.append({'block': asdict(block), 'sha256': hashlib.sha256(data).hexdigest(),
                      'reader_lease': lease.lease_id, 'release_ack': asdict(ack)})
     return rows
+
+
+def negatives(access, directory, old, root):
+    """Real SDK negative scenarios; no forced crash or Unknown injection."""
+    k, owner = key(4), f'half-{os.getpid()}'
+    block = PoolBlock(**directory.claim(k, owner)['block'])
+    access.host_intents.append((k, owner))
+    lease = access.acquire(block, 'w')
+    middle = BLOCK_BYTES // 2
+    access.buffer[lease.byte_offset:lease.byte_offset + middle] = bytes([174]) * middle
+    writing_snapshot = access.port.client.snapshot()
+    assert directory.discover([k]) == ()
+    uncommitted = CommittedRange(access.identity.pool_id, access.identity.pool_epoch,
+        access.identity.provider_session, block, lease.byte_offset, BLOCK_BYTES, 1,
+        prefix_content_id(k), 'not-a-committed-operation', lease.lease_id)
+    try:
+        directory.publish(k, owner, uncommitted)
+    except ValueError as error:
+        half_rejection = str(error)
+    else:
+        raise AssertionError('half-written data was published')
+    try:
+        directory.cancel(k, owner)
+    except ValueError as error:
+        inflight_rejection = str(error)
+    else:
+        raise AssertionError('metadata intent was cancelled while its actual W lease remained active')
+    access.buffer[lease.byte_offset + middle:lease.byte_offset + BLOCK_BYTES] = bytes([174]) * (BLOCK_BYTES - middle)
+    committed = access.complete_write(lease, prefix_content_id(k), uuid.uuid4().hex)
+    directory.publish(k, owner, committed)
+    access.host_intents.remove((k, owner))
+
+    cancel_key, cancel_owner = key(5), f'cancel-{os.getpid()}'
+    cancel_block = PoolBlock(**directory.claim(cancel_key, cancel_owner)['block'])
+    access.host_intents.append((cancel_key, cancel_owner))
+    cancelled = access.acquire(cancel_block, 'w')
+    operation = uuid.uuid4().hex
+    # No byte was written under this W grant. Only the original SDK can release
+    # that exact lease with write_not_started, followed by its exact ACK.
+    try:
+        ack = access.port.release(cancelled, operation)
+        ack.validate(access.identity, 'release', operation, cancelled)
+    except Exception as error:
+        access.report_unknown(cancelled, str(error))
+        raise
+    del access.leases[cancelled.lease_id]
+    directory.cancel(cancel_key, cancel_owner)
+    access.host_intents.remove((cancel_key, cancel_owner))
+    assert directory.discover([cancel_key]) == ()
+    fresh = write_prefix(access, directory, 6, 176)
+    assert fresh['content']['block']['block_id'] == old.block.block_id
+    try:
+        access.acquire(old.block, 'r', committed=old, reject_stale=True)
+    except StaleCommittedRange as error:
+        stale_rejection = str(error)
+    else:
+        raise AssertionError('a cached old content version admitted native access')
+    assert not access.leases and not access.unknown
+    assert directory.discover([PrefixKey(b'incompatible-namespace!!!!!!!!!!'[:32], key(6).block_hash)]) == ()
+    intents = []
+    for n in range(7, 11):
+        candidate = key(n), f'pressure-{n}'
+        assert directory.claim(*candidate)['state'] == 'Intent'
+        intents.append(candidate)
+        access.host_intents.append(candidate)
+    assert directory.claim(key(11), 'one-too-many')['state'] == 'Busy'
+    for candidate in intents:
+        directory.cancel(*candidate)
+        access.host_intents.remove(candidate)
+    save(root / 'real-negative-controls.json', {'scope': 'actual common SDK/directory host; no native/model proof',
+        'half_write_snapshot': writing_snapshot, 'half_write_publication_rejected': half_rejection,
+        'inflight_intent_cancel_rejected': inflight_rejection, 'not_started_W_actual_release_ACK': asdict(ack),
+        'old_committed_version_rejected_after_real_current_R_release': stale_rejection,
+        'pressure_four_intents_then_Busy': True, 'incompatible_namespace_missed': True,
+        'current_fresh_content': fresh})
 
 
 def role(args):
@@ -206,6 +283,23 @@ def controller(args):
                  'different_range_write_committed_while_readers_live': third, 'producer_exited_before_readers': True,
                  'different_peer_cannot_query_original_operation': cross_peer_query,
                  'directory_independent_SDK_reader_confirmations': DirectoryClient(args.endpoint, args.epoch).call('snapshot')})
+            for reader in readers:
+                reader.communicate('release\n', timeout=30)
+                assert reader.returncode == 0
+            before = guards(access, load_bindings(args.bindings, access))
+            from types import SimpleNamespace
+            from pypto_serving.serving.native_ddr.diagnostics import capture_shared_guards
+            observed = SimpleNamespace(access=access, bindings=load_bindings(args.bindings, access), busy=None,
+                shared_directory=DirectoryClient(args.endpoint, args.epoch), child_registrations={})
+            production_before = capture_shared_guards(observed, root, 'r06-host-before')
+            negatives(access, DirectoryClient(args.endpoint, args.epoch), first, root)
+            after = guards(access, load_bindings(args.bindings, access))
+            production_after = capture_shared_guards(observed, root, 'r06-host-after')
+            assert [x['sha256'] for x in before] == [x['sha256'] for x in after]
+            assert [x['sha256'] for x in production_before['guards']] == [x['sha256'] for x in production_after['guards']]
+            save(root / 'final-real-guard-readers.json', {'before': before, 'after': after,
+                 'same_complete_four_assigned_2MiB_guards': True,
+                 'production_shared_capture_before': production_before, 'production_shared_capture_after': production_after})
         finally:
             for reader in readers:
                 if reader.poll() is None:

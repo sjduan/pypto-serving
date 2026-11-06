@@ -97,6 +97,92 @@ def capture_idle_pool(slots, root, label):
             'helper_pids': list(slots.child_helpers)}
 
 
+def capture_shared_guards(slots, root, label):
+    """Read only assigned committed guards under actual SDK readers.
+
+    Peer model mappings and disjoint payload operations may remain live. This
+    does not relax the Run04 single-client full-pool observation above, consume
+    a peer payload, or claim a lease for unallocated bytes.
+    """
+    from dataclasses import asdict
+    import uuid
+    from .managed_pool import GUARD_BYTES
+    access = slots.access
+    if (slots.bindings is None or slots.shared_directory is None or slots.busy is not None
+            or access.leases or access.unknown or access.closed):
+        raise RuntimeError('shared guard capture requires idle exact preallocated access')
+    retained = access.port._children
+    birth_fields = {'pid', 'starttime_ticks', 'uid', 'gid', 'pid_namespace_dev', 'pid_namespace_ino'}
+    def checked_birth(birth):
+        if (type(birth) is not dict or set(birth) != birth_fields
+                or any(type(v) is not int or v < 0 for v in birth.values())
+                or any(birth[k] <= 0 for k in ('pid', 'starttime_ticks', 'pid_namespace_dev', 'pid_namespace_ino'))):
+            raise RuntimeError('shared guard original SDK birth schema is invalid')
+        return birth['pid'], birth['starttime_ticks']
+    if type(retained) is not dict or any(checked_birth(birth) != key for key, birth in retained.items()):
+        raise RuntimeError('shared guard retained birth keys disagree with their full identities')
+    if (set(slots.child_registrations.items()) != set(access.children) or set(retained) != set(access.children)
+            or access.port.client._children != {pid: birth for (pid, _), birth in retained.items()}):
+        raise RuntimeError('shared guard capture lost its original inherited child registries')
+    def own_client():
+        snapshot = access.port.client.snapshot()
+        pools = [p for p in snapshot['pools'] if p['pool_id'] == access.identity.pool_id]
+        if len(pools) != 1:
+            raise RuntimeError('shared guard lost the unique actual pool')
+        pool = pools[0]
+        if (pool['pool_epoch'] != access.identity.pool_epoch or pool['provider_session'] != access.identity.provider_session
+                or pool['state'] != 'Allocated' or pool['frozen']
+                or (pool['canonical']['dev'], pool['canonical']['inode'], pool['nbytes']) != (
+                    access.identity.device, access.identity.inode, access.identity.nbytes)):
+            raise RuntimeError('shared guard pool/backing incarnation changed')
+        clients = [c for c in pool['clients'] if c['client_session'] == access.identity.client_session]
+        if (len(clients) != 1 or clients[0]['state'] != 'Mapped' or clients[0]['closing']
+                or clients[0]['access'] != 'rw' or clients[0]['access_generation'] != access.identity.access_generation):
+            raise RuntimeError('shared guard owner is not the original mapped/admitting client')
+        client = clients[0]
+        checked_birth(client['birth'])
+        children = {}
+        for child in client['children']:
+            if set(child) != {'birth', 'unknown'}:
+                raise RuntimeError('shared guard child schema changed')
+            birth = child['birth']
+            key = checked_birth(birth)
+            if (child['unknown'] is not False or key in children
+                    or any(birth[k] != client['birth'][k] for k in ('uid', 'gid', 'pid_namespace_dev', 'pid_namespace_ino'))):
+                raise RuntimeError('shared guard child is Unknown/duplicated or outside the original namespace')
+            children[key] = birth
+        if children != retained:
+            raise RuntimeError('shared guard public SDK child births differ from retained originals')
+        return client
+    before = own_client()
+    rows = []
+    for block in slots.bindings:
+        lease = access.port.acquire_range(block, 'r', block.generation, 0, GUARD_BYTES)
+        access.leases[lease.lease_id] = lease
+        try:
+            lease.validate(access.identity, block, 'r', block.byte_offset, GUARD_BYTES)
+            access.port.revalidate(lease)
+            data = bytes(access.buffer[block.byte_offset:block.byte_offset + GUARD_BYTES])
+            access.port.revalidate(lease)
+            ack = access.complete_read(lease, uuid.uuid4().hex)
+        except Exception as error:
+            access.report_unknown(lease, f'shared guard reader outcome retained: {error}')
+            raise
+        path = Path(root) / f'{label}-guard-{block.block_id}.bin'
+        with path.open('xb') as stream:
+            stream.write(data)
+        rows.append({'block': asdict(block), 'file': str(path), 'bytes': len(data),
+            'sha256': hashlib.sha256(data).hexdigest(), 'lease_id': lease.lease_id,
+            'lease_generation': lease.lease_generation, 'content_version': lease.content_version,
+            'release_ack': asdict(ack)})
+    after = own_client()
+    if before != after:
+        raise RuntimeError('own mapped child/birth obligations changed while capturing shared guards')
+    return {'scope': 'assigned committed guard bytes with actual SDK R/revalidate/release; peer payloads excluded',
+            'identity': asdict(access.identity), 'client_before': before, 'client_after': after,
+            'registered_child_births': list(retained.values()), 'guards': rows}
+
+
 def inspect_idle_pages(backend, module, command):
     import torch
     from .types import EntryState
@@ -151,6 +237,9 @@ def inspect_idle_pages(backend, module, command):
     if (command.diagnostic_label.startswith('r04-')
             and os.environ.get('PYPTO_NATIVE_DDR_POOL_EVIDENCE') == '1'):
         result['pool'] = capture_idle_pool(backend.slots, root, command.diagnostic_label)
+    if (command.diagnostic_label.startswith('r06-') and backend.slots.shared_directory is not None
+            and os.environ.get('PYPTO_NATIVE_DDR_POOL_EVIDENCE') == '1'):
+        result['shared_guards'] = capture_shared_guards(backend.slots, root, command.diagnostic_label)
     return json.dumps(result, sort_keys=True).encode()
 
 def arm_short_receipt(backend, module, kind):

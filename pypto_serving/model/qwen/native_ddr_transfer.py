@@ -423,7 +423,8 @@ class QwenNativeTransferBackend:
         if self.slots.busy is backing or backing.committed is None:
             raise RuntimeError("DDR contents are not consumable before native result/finalize")
         self.record("consumer", slot=backing.slot)
-        lease = self.slots.access.acquire(backing.block, 'r', committed=backing.committed)
+        lease = self.slots.access.acquire(backing.block, 'r', committed=backing.committed,
+                                          reject_stale=self.slots.shared_directory is not None)
         try:
             result = backing.tensor.clone()
         except BaseException as error:
