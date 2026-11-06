@@ -68,6 +68,29 @@ def bind_round_event(summary, report, raw_log=None):
     producers = [row for row in log_records(raw_log, 'native_ddr_receipt ')
                  if row['kind'] == 'transfer' and row['identity'] == summary['job']
                  and row['status'] != 'ACCEPTED']
+    stale = report.get('stale_original_transfer', {}).get('receipt')
+    if stale in producers:
+        # The final negative deliberately resends one original normal envelope.
+        # Its unique, fully bound rejection is not a second native completion.
+        event = {'job_id': summary['job'], 'worker_epoch': summary['worker_epoch'],
+            'operation': summary['operation'], 'status': 'REJECTED', 'entry_refs': summary['entry_refs'],
+            'transferred_bytes': 0, 'native_completed': False, 'stopped': True,
+            'error': 'retired delivery sequence; replay rejected before effects',
+            'delivery_sequence': summary['delivery_sequence'], 'pool_receipt': None}
+        accepted = log_records(raw_log, 'native_ddr_trace ')
+        before = sum(r['event'] == 'accepted' and r['time_ns'] < stale['time_ns'] for r in accepted)
+        total = sum(r['event'] == 'accepted' for r in accepted)
+        require(producers.count(stale) == 1 and stale['status'] == 'REJECTED'
+                and stale['event'] == event and stale['error'] == event['error']
+                and stale['delivery_sequence'] == summary['delivery_sequence']
+                and stale['request'] is None and stale['pending_owner'] is None
+                and stale['first_nonterminal_failure'] is None
+                and stale['transfer_replay']['retired_through'] >= summary['delivery_sequence']
+                and stale['time_ns'] > summary['time_ns']
+                and report['stale_original_transfer']['native_runs_before_after'] == [before, total]
+                and before == total > 0,
+                'retired-envelope rejection differs from the unique original negative without native effects')
+        producers.remove(stale)
     require(len(producers) == 1, 'normal terminal has missing/duplicate/conflicting producer receipts')
     producer = producers[0]
     expected = {'job_id': summary['job'], 'worker_epoch': summary['worker_epoch'],

@@ -313,3 +313,54 @@ def test_full_check_entry_binds_normal_summaries_to_original_typed_raw_events(co
         with pytest.raises(ValueError):
             driver.main(argv)
         assert not (tmp_path / 'result.json').exists()
+
+
+@pytest.mark.parametrize('fault', [None, 'duplicate', 'native-completed', 'wrong-lease', 'early',
+    'not-retired', 'new-native', 'request-present', 'wrong-original-sequence', 'unreported-rejection'])
+def test_full_check_distinguishes_only_proven_late_retired_original_rejection(
+        complete_synthetic_bundle, tmp_path, fault):
+    root, original, original_records = complete_synthetic_bundle
+    report, records = copy.deepcopy(original), copy.deepcopy(original_records)
+    records = [(m, v) for m, v in records if v != report['stale_original_transfer']['receipt']]
+    producer = next(v for m, v in records if m == 'native_ddr_receipt ' and v['identity'] == 'STORE0')
+    stale = {'kind': 'transfer', 'identity': producer['identity'], 'status': 'REJECTED',
+        'error': 'retired delivery sequence; replay rejected before effects',
+        'delivery_sequence': producer['delivery_sequence'], 'request': None,
+        'pending_owner': None, 'first_nonterminal_failure': None, 'time_ns': 1000,
+        'transfer_replay': {'retired_through': 22},
+        'event': {**copy.deepcopy(producer['event']), 'status': 'REJECTED',
+            'error': 'retired delivery sequence; replay rejected before effects',
+            'native_completed': False, 'transferred_bytes': 0, 'pool_receipt': None}}
+    report['stale_original_transfer'] = {'receipt': stale, 'native_runs_before_after': [8, 8]}
+    records.append(('native_ddr_receipt ', stale))
+    if fault == 'duplicate':
+        records.append(('native_ddr_receipt ', copy.deepcopy(stale)))
+    elif fault == 'native-completed':
+        stale['event']['native_completed'] = True
+    elif fault == 'wrong-lease':
+        stale['event']['pool_receipt'] = producer['event']['pool_receipt']
+    elif fault == 'early':
+        stale['time_ns'] = 1
+    elif fault == 'not-retired':
+        stale['transfer_replay']['retired_through'] = 0
+    elif fault == 'new-native':
+        records.append(('native_ddr_trace ', {'event': 'accepted', 'job': 'unexpected',
+                                             'native_run_id': 99, 'time_ns': 1001}))
+    elif fault == 'request-present':
+        stale['request'] = producer['request']
+    elif fault == 'wrong-original-sequence':
+        stale['delivery_sequence'] += 1
+    elif fault == 'unreported-rejection':
+        report['stale_original_transfer']['receipt'] = {'error': 'retired delivery sequence; unrelated'}
+    contract.save(tmp_path / 'report.json', report)
+    (tmp_path / 'raw.log').write_text('\n'.join(m + (json.dumps(v) if m else v) for m, v in records))
+    argv = ['check', '--config', str(root / 'config.json'), '--report', str(tmp_path / 'report.json'),
+            '--descriptor', str(root / 'descriptor.json'), '--log', str(tmp_path / 'raw.log'),
+            '--output', str(tmp_path / 'result.json')]
+    if fault is None:
+        assert driver.main(argv) == 0
+        assert contract.load(tmp_path / 'result.json')['D1_acceptance'] is False
+    else:
+        with pytest.raises(ValueError):
+            driver.main(argv)
+        assert not (tmp_path / 'result.json').exists()
