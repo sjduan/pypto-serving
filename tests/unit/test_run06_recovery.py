@@ -14,7 +14,7 @@ from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 
 import pytest
 
@@ -119,7 +119,8 @@ def test_recovery_endpoint_binds_original_identity_and_duplicate_never_reexecute
                 reader, writer = await asyncio.open_unix_connection(str(endpoint.path))
                 writer.write((json.dumps(packet) + '\n').encode());await writer.drain()
                 answer = json.loads(await asyncio.wait_for(reader.readline(), 5))
-                writer.close();await writer.wait_closed()
+                writer.close()
+                with suppress(ConnectionError):await writer.wait_closed()
                 return answer
             try:
                 assert (await send({'op': 'stop-owned', 'identity': None, 'operation_id': None}))['status'] == 'rejected'
