@@ -340,6 +340,12 @@ def register_managed_pool(config):
     """Only register access. Retain uncertain startup clients; never create/destroy."""
     if config.sdk_sha256 != SDK_SHA256:
         raise ValueError('configured SDK is not the manager-accepted P1 module')
+    if getattr(config, 'shared_slots_path', ''):
+        from .shared_pool import partition_metadata
+        document, _, manifest = partition_metadata(config.shared_slots_path)
+        if ((document['pool']['pool_id'], document['pool']['pool_epoch']) != (config.pool_id, config.pool_epoch)
+                or config.pool_endpoint != manifest['endpoint']):
+            raise ValueError('shared partition/configuration identity differs before SDK registration')
     module, operation = accepted_sdk(), uuid.uuid4().hex
     try:
         client = module.ManagedPoolClient.register(config.pool_endpoint, config.pool_id, config.pool_epoch,

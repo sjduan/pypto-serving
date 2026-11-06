@@ -34,8 +34,8 @@ def main():
     root, endpoint = Path(args.root).resolve(), Path(args.endpoint).resolve()
     if endpoint.parent != root.parent or len(str(endpoint).encode()) >= 108:
         raise ValueError('directory socket must be a bounded path in its own task root')
-    root.mkdir()
     document, _ = bindings_document(args.bindings)
+    root.mkdir()
     descriptor = document['pool']
     config = NativeDdrPrefixConfig(True, 4 * BLOCK_BYTES, pool_endpoint=args.pool_endpoint,
         pool_id=descriptor['pool_id'], pool_epoch=descriptor['pool_epoch'], sdk_sha256=SDK_SHA256,
