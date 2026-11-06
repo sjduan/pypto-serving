@@ -146,7 +146,9 @@ class DdrPrefixWorker:
                 slot = next((s for s in range(self.capacity) if s not in used), None)
                 if slot is None:
                     raise ValueError("DDR capacity exhausted")
-                backing = self.backend.reserve_slot(slot, self.layout.block_bytes)
+                reserve = getattr(self.backend, 'reserve_entry', None)
+                backing = (reserve(slot, self.layout.block_bytes, request) if reserve is not None else
+                           self.backend.reserve_slot(slot, self.layout.block_bytes))
                 entry = _Entry(ref, slot, backing, request.entry_keys[0])
                 self.entries[ref.entry_id] = entry
                 self._generation = ref.slot_generation

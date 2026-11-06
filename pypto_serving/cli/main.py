@@ -114,6 +114,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--native-ddr-pool-id', default='', help='Existing UFlow pool ID.')
     parser.add_argument('--native-ddr-pool-epoch', default='', help='Expected UFlow pool incarnation.')
     parser.add_argument('--native-ddr-sdk-sha256', default='', help='Accepted managed-pool SDK module SHA256.')
+    parser.add_argument('--shared-ddr-directory', default='', help='Explicit shared prefix metadata endpoint.')
+    parser.add_argument('--shared-ddr-directory-epoch', default='', help='Expected shared directory incarnation.')
+    parser.add_argument('--shared-ddr-slots', default='', help='Validated preallocated M1 partition document.')
     parser.add_argument("--max-model-len", type=int, default=1024, help="Maximum sequence length (prompt + generated; default: 1024).")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
     parser.add_argument(
@@ -553,6 +556,9 @@ def _build_native_ddr_config(args):
         pool_id=getattr(args, 'native_ddr_pool_id', ''),
         pool_epoch=getattr(args, 'native_ddr_pool_epoch', ''),
         sdk_sha256=getattr(args, 'native_ddr_sdk_sha256', ''),
+        shared_directory_endpoint=getattr(args, 'shared_ddr_directory', ''),
+        shared_directory_epoch=getattr(args, 'shared_ddr_directory_epoch', ''),
+        shared_slots_path=getattr(args, 'shared_ddr_slots', ''),
     )
     dtype = args.dtype if args.kv_cache_dtype == "auto" else args.kv_cache_dtype
     if config.enabled and (args.block_size != 128 or dtype != "bfloat16"

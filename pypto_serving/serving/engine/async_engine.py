@@ -994,6 +994,18 @@ class ReplicaEngineCore:
         self._native_ddr = DdrPrefixCoordinator(self.kv_cache_manager,
             namespace_digest=info.namespace_digest, worker_epoch=info.worker_epoch, max_entries=info.max_entries,
             pool_identity=pool)
+        shared = self._runtime.native_ddr
+        if shared.shared_directory_endpoint:
+            from pypto_serving.serving.native_ddr.shared_directory import DirectoryClient
+            directory = DirectoryClient(shared.shared_directory_endpoint, shared.shared_directory_epoch)
+            description = directory.call('describe')
+            descriptor = description['descriptor']
+            if (description['capacity'] != info.max_entries or any(descriptor[k] != v for k, v in (
+                    ('pool_id', pool.pool_id), ('pool_epoch', pool.pool_epoch),
+                    ('provider_session', pool.provider_session), ('nbytes', pool.nbytes)))
+                    or (descriptor['canonical']['dev'], descriptor['canonical']['inode']) != (pool.device, pool.inode)):
+                raise ValueError('shared directory does not describe the actual registered resource')
+            self._native_ddr.shared_directory = directory
         self.scheduler._native_ddr = self._native_ddr
         logger.info("native_ddr_startup epoch=%s pages=%d slots=%d bytes=%d namespace=%s compatibility=%s",
                     info.worker_epoch, reported_num_blocks, info.max_entries, info.capacity_bytes,

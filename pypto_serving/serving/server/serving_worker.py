@@ -287,6 +287,11 @@ class WorkerProcess:
                                                           observer=self._trace_native_ddr)
                 self._native_ddr_backend = backend
                 namespace, descriptor = build_compatibility(loaded, assets, epoch, backend.layout)
+                if native_config.shared_directory_endpoint:
+                    from pypto_serving.serving.native_ddr.shared_directory import DirectoryClient
+                    backend.slots.shared_directory = DirectoryClient(native_config.shared_directory_endpoint,
+                                                                      native_config.shared_directory_epoch)
+                    backend.slots.shared_directory.call('describe')
                 self._native_ddr_worker = DdrPrefixWorker(native_config, backend.layout, epoch, backend,
                                                         namespace_digest=namespace)
                 count = backend.slots.capacity
@@ -1674,8 +1679,11 @@ class WorkerProcess:
                     event = DdrControlEvent(cmd.command_id, module.worker_epoch, 'import', cmd.entry_ref,
                                             imported=cmd.imported, pool_ack=backing.import_ack)
                 except (ValueError, RuntimeError) as error:
+                    from pypto_serving.serving.native_ddr.managed_pool import SharedImportUnavailable
+                    detail = ('shared-import-unavailable:' + str(error)
+                              if isinstance(error, SharedImportUnavailable) and not module.poisoned else str(error))
                     event = DdrControlEvent(cmd.command_id, module.worker_epoch, 'import', cmd.entry_ref,
-                                            error=str(error))
+                                            error=detail)
                 self._complete_native_ddr_control(cmd, event)
             elif cmd.operation == "evict":
                 if cmd.entry_ref is None:

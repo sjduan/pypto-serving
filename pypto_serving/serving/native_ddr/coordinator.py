@@ -69,6 +69,8 @@ class DdrPrefixCoordinator:
         self.pool_identity = pool_identity
         self.managed_ready = {}
         self.pending_imports = {}
+        self.shared_directory = None
+        self.shared_import_misses = {}
         self.ready: dict[PrefixKey, DdrEntryRef] = {}
         self.loads_by_key: dict[tuple[str, PrefixKey], str] = {}
         self.stores_by_key: dict[PrefixKey, str] = {}
@@ -128,21 +130,26 @@ class DdrPrefixCoordinator:
         self.record("evict_lookup_withdrawn", entry=ref.entry_id)
         return True
 
-    def prepare_import_prefix(self, prompt_token_ids, committed_ranges):
+    def prepare_import_prefix(self, prompt_token_ids, committed_ranges, *, skip_existing=False):
         if (self.pool_identity is None or self.closed or self.poisoned or self.jobs or self.steps
                 or self.waiters or self.controls):
             raise ValueError('prefix import requires an idle managed coordinator')
         hashes = self.manager.compute_block_hashes(prompt_token_ids)
         limit = max(0, len(prompt_token_ids) - 1) // 128
-        if not 0 < len(committed_ranges) <= min(limit, self.max_entries - len(self.ready)):
+        if not 0 < len(committed_ranges) <= min(limit, self.max_entries):
             raise ValueError('import must cover a bounded token0 prefix and preserve the final-token rule')
         keys = [PrefixKey(self.namespace, block_hash) for block_hash in hashes[:len(committed_ranges)]]
-        if any(key in self.ready for key in keys):
+        if not skip_existing and any(key in self.ready for key in keys):
             raise ValueError('prefix already has a canonical managed entry')
         for key, committed in zip(keys, committed_ranges):
             committed.validate(self.pool_identity, content_id=prefix_content_id(key))
+            if key in self.ready and self.managed_ready.get(key) != committed:
+                raise ValueError('existing imported key has another committed generation')
+        pairs = [(key, value) for key, value in zip(keys, committed_ranges) if key not in self.ready]
+        if len(pairs) > self.max_entries - len(self.ready):
+            raise ValueError('import exceeds the bounded local entry capacity')
         commands = []
-        for key, committed in zip(keys, committed_ranges):
+        for key, committed in pairs:
             entry_id = self._id('imported-entry')
             ref = DdrEntryRef(self.worker_epoch, entry_id, self._sequence)
             cmd = self._control('import', entry_ref=ref, imported=committed, imported_key=key)
@@ -160,6 +167,18 @@ class DdrPrefixCoordinator:
         if command.operation == 'import':
             key, ref, committed = self.pending_imports[event.command_id]
             ack = event.pool_ack
+            if (self.shared_directory is not None and event.worker_epoch == command.worker_epoch
+                    and event.operation == 'import' and event.entry_ref == ref
+                    and event.error and event.error.startswith('shared-import-unavailable:')
+                    and event.imported is None and ack is None):
+                if len(self.shared_import_misses) >= self.max_entries and key not in self.shared_import_misses:
+                    self.shared_import_misses.pop(next(iter(self.shared_import_misses)))
+                self.shared_import_misses[key] = committed.content_version
+                self.control_delivery.consume(event.delivery_sequence)
+                del self.controls[event.command_id]
+                del self.pending_imports[event.command_id]
+                self.record('shared_import_unavailable', entry=ref.entry_id, error=event.error)
+                return
             if (event.worker_epoch != command.worker_epoch or event.operation != 'import'
                     or event.entry_ref != ref or event.error or event.imported != committed or ack is None
                     or ack.pool != self.pool_identity or ack.operation != 'release' or ack.applied is not True
@@ -220,6 +239,25 @@ class DdrPrefixCoordinator:
             return RestoreDecision(RestoreKind.WAIT, tuple(self.waiters[req_key].jobs))
         hashes = self.manager.compute_block_hashes(request.prompt_token_ids)
         limit = min(max_hit_tokens, max(0, len(request.prompt_token_ids) - 1)) // 128
+        if self.shared_directory is not None and len(local_blocks) < limit:
+            if self.pending_imports:
+                self.manager.release_cached_blocks(local_blocks)
+                return RestoreDecision(RestoreKind.WAIT)
+            chain = [PrefixKey(self.namespace, h) for h in hashes[:min(limit, self.max_entries)]]
+            if (chain and not self.jobs and not self.steps and not self.waiters and not self.controls
+                    and any(key not in self.ready for key in chain)):
+                try:
+                    values = self.shared_directory.discover(chain)
+                    if values and not any(self.shared_import_misses.get(key) == value.content_version
+                                          for key, value in zip(chain, values)):
+                        commands = self.prepare_import_prefix(request.prompt_token_ids, values, skip_existing=True)
+                        if commands:
+                            self.record('shared_prefix_discovered', request=request.request_id,
+                                        blocks=[value.block.block_id for value in values])
+                            self.manager.release_cached_blocks(local_blocks)
+                            return RestoreDecision(RestoreKind.WAIT)
+                except (ValueError, OSError) as error:
+                    self.record('shared_discovery_miss', request=request.request_id, error=str(error))
         keys = []
         for block_hash in hashes[len(local_blocks):limit]:
             key = PrefixKey(self.namespace, block_hash)
@@ -415,6 +453,18 @@ class DdrPrefixCoordinator:
         # its pin, nor authorize publication into a replacement cache epoch.
         publish = success and req.worker_epoch == self.worker_epoch and not self.closed and not self.poisoned
         if req.operation == Operation.STORE:
+            if self.shared_directory is not None:
+                try:
+                    if publish:
+                        value = self.shared_directory.publish(key, req.job_id, event.pool_receipt.content)
+                        if value != event.pool_receipt.content:
+                            raise ValueError('shared publication changed the typed committed receipt')
+                        self.record('shared_prefix_published', job=req.job_id, committed=asdict(value))
+                    else:
+                        self.shared_directory.cancel(key, req.job_id)
+                except (ValueError, OSError) as error:
+                    # Metadata failure is not a new native/SDK completion fact.
+                    self.record('shared_publication_unavailable', job=req.job_id, error=str(error))
             if publish:
                 self.ready[key] = event.entry_refs[0]
                 if self.pool_identity is not None:

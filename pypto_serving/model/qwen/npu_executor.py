@@ -335,7 +335,11 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             from pypto_serving.model.qwen.native_ddr_transfer import ManagedDdrSlots
 
             native_programs = compile_programs(self._compiler)
-            native_slots = ManagedDdrSlots(slot_count, self._native_ddr_pool_access)
+            bindings = None
+            if native_config.shared_slots_path:
+                from pypto_serving.serving.native_ddr.shared_pool import load_bindings
+                bindings = load_bindings(native_config.shared_slots_path, self._native_ddr_pool_access)
+            native_slots = ManagedDdrSlots(slot_count, self._native_ddr_pool_access, bindings=bindings)
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,

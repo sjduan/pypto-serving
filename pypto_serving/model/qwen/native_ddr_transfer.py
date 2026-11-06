@@ -34,6 +34,8 @@ class DdrSlot:
     committed: CommittedRange | None = None
     active_lease: Any = field(default=None, repr=False)
     import_ack: PoolAck | None = None
+    shared_key: Any = None
+    intent_owner: str = ''
 
 
 class ManagedDdrSlots:
@@ -43,7 +45,7 @@ class ManagedDdrSlots:
     Logical slots hold UFlow allocation metadata; they do not allocate KV bytes.
     """
 
-    def __init__(self, count: int, access: ManagedPoolAccess):
+    def __init__(self, count: int, access: ManagedPoolAccess, *, bindings=None):
         if type(count) is not int or count <= 0:
             raise ValueError("native DDR requires an explicit finite positive prefork slot count")
         import numpy as np
@@ -53,6 +55,15 @@ class ManagedDdrSlots:
             raise ValueError('finite prefix access budget does not fit the actual UFlow pool')
         self.capacity = count
         self.access = access
+        self.shared_directory = None
+        self.bindings = None if bindings is None else tuple(bindings)
+        if self.bindings is not None:
+            if len(self.bindings) != count or len(set(self.bindings)) != count:
+                raise ValueError('preallocated bindings must cover each finite slot exactly once')
+            for block in self.bindings:
+                block.validate(access.identity)
+                if block.nbytes != BLOCK_BYTES + GUARD_BYTES:
+                    raise ValueError('preallocated slot lacks its complete payload and guard')
         # NumPy's owner keeps a real buffer export for the storage's entire
         # lifetime, including detached/dtype/slice aliases after logical release.
         # torch.frombuffer alone retains an object but permits mmap.close while
@@ -119,13 +130,31 @@ class ManagedDdrSlots:
         self.generation += 1
         block = self._blocks.get(slot)
         if block is None:
-            block = self.access.allocate()
+            block = self.access.allocate() if self.bindings is None else self.bindings[slot]
             self._blocks[slot] = block
             self._offsets[slot] = block.byte_offset + GUARD_BYTES
         offset = self._offsets[slot]
         lease = DdrSlot(slot, self.generation, self._view(offset), self, offset, block)
         self.leases[slot] = lease
         return lease
+
+    def reserve_shared(self, slot, size, key, owner):
+        if self.shared_directory is None:
+            return self.reserve(slot, size)
+        if (self.bindings is None or type(slot) is not int or not 0 <= slot < self.capacity
+                or slot in self.leases or size != BLOCK_BYTES):
+            raise ValueError('shared STORE requires a free bounded preallocated logical slot')
+        from pypto_serving.serving.native_ddr.managed_pool import PoolBlock
+        intent = self.shared_directory.claim(key, owner)
+        if intent['state'] != 'Intent':
+            raise ValueError('shared prefix already committed or all shared slots are busy')
+        block = PoolBlock(**intent['block'])
+        if block not in self.bindings or intent['owner'] != owner:
+            raise ValueError('shared directory selected a foreign allocation/intent')
+        self._blocks[slot], self._offsets[slot] = block, block.byte_offset + GUARD_BYTES
+        backing = self.reserve(slot, size)
+        backing.shared_key, backing.intent_owner = key, owner
+        return backing
 
     def import_committed(self, slot, committed, *, content_id):
         committed.validate(self.access.identity, content_id=content_id)
@@ -138,12 +167,18 @@ class ManagedDdrSlots:
         # This is an explicit control-plane import, not synthetic local STORE
         # completion. LOAD later obtains and verifies a fresh reader again.
         try:
-            lease = self.access.acquire(committed.block, 'r', committed=committed)
-        except Exception:
+            if self.bindings is not None and committed.block not in self.bindings:
+                raise ValueError('shared import escaped the manifest partition')
+            lease = self.access.acquire(committed.block, 'r', committed=committed,
+                                        reject_stale=self.shared_directory is not None)
+        except Exception as error:
             if not self.access.unknown:
                 # An explicit pre-grant rejection owns no native obligation.
                 del self.leases[slot]
                 backing.tensor = None
+                if self.shared_directory is not None and isinstance(error, ValueError):
+                    from pypto_serving.serving.native_ddr.managed_pool import SharedImportUnavailable
+                    raise SharedImportUnavailable(str(error)) from error
             raise
         backing.active_lease = lease
         backing.import_ack = self.access.complete_read(lease, uuid.uuid4().hex)
@@ -161,7 +196,8 @@ class ManagedDdrSlots:
             if backing.committed is None:
                 raise ValueError('LOAD requires a current UFlow Committed entry')
             backing.committed.validate(self.access.identity, content_id=prefix_content_id(request.entry_keys[0]))
-            lease = self.access.acquire(backing.block, 'r', committed=backing.committed)
+            lease = self.access.acquire(backing.block, 'r', committed=backing.committed,
+                                        reject_stale=self.shared_directory is not None)
         else:
             lease = self.access.acquire(backing.block, 'w', byte_offset=backing.byte_offset)
             backing.committed = None
@@ -197,6 +233,8 @@ class ManagedDdrSlots:
         self.validate(lease)
         if self.busy is lease or lease.active_lease is not None:
             raise RuntimeError("pending native transfer retains DDR backing")
+        if lease.intent_owner:
+            self.shared_directory.cancel(lease.shared_key, lease.intent_owner)
         del self.leases[lease.slot]
         lease.tensor = None
 
@@ -327,6 +365,11 @@ class QwenNativeTransferBackend:
         if self.closed:
             raise RuntimeError("transfer backend closed")
         return self.slots.reserve(slot, size)
+
+    def reserve_entry(self, slot, size, request):
+        if self.closed:
+            raise RuntimeError('transfer backend closed')
+        return self.slots.reserve_shared(slot, size, request.entry_keys[0], request.job_id)
 
     def release_slot(self, backing):
         self.slots.release(backing)

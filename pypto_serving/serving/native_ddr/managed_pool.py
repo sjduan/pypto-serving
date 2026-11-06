@@ -199,6 +199,14 @@ class PoolOutcomeUnknown(RuntimeError):
     pass
 
 
+class StaleCommittedRange(ValueError):
+    """A valid fresh reader was explicitly released without native admission."""
+
+
+class SharedImportUnavailable(ValueError):
+    """Confirmed no native admission and no retained range/unknown obligation."""
+
+
 @dataclass(frozen=True)
 class ManagedTransferReceipt:
     operation: str
@@ -264,11 +272,15 @@ class ManagedPoolAccess:
             raise ValueError('UFlow allocation did not preserve the requested guard interval')
         return block
 
-    def acquire(self, block, mode, *, committed=None, byte_offset=None):
+    def acquire(self, block, mode, *, committed=None, byte_offset=None, reject_stale=False):
         self._admit()
         block.validate(self.identity)
         if mode not in ('r', 'w'):
             raise ValueError('invalid managed access mode')
+        if reject_stale:
+            if mode != 'r' or committed is None:
+                raise ValueError('stale rejection applies only to an exact committed reader')
+            committed.validate(self.identity, content_id=committed.content_id)
         offset = committed.byte_offset if committed is not None else (
             block.byte_offset + GUARD_BYTES if byte_offset is None else byte_offset)
         size = BLOCK_BYTES
@@ -291,7 +303,14 @@ class ManagedPoolAccess:
             if committed is not None:
                 committed.validate(self.identity, content_id=committed.content_id)
                 if (lease.content_version, lease.content_id) != (committed.content_version, committed.content_id):
+                    if reject_stale:
+                        # The response is an exact valid current R grant. Release
+                        # it through the SDK; never discard a remote obligation.
+                        self.complete_read(lease, uuid.uuid4().hex)
+                        raise StaleCommittedRange('stale committed range; current reader explicitly released')
                     raise ValueError('committed version changed before native admission')
+        except StaleCommittedRange:
+            raise
         except Exception as error:
             self.report_unknown(lease, str(error))
             raise

@@ -61,6 +61,9 @@ class NativeDdrPrefixConfig:
     pool_id: str = ''
     pool_epoch: str = ''
     sdk_sha256: str = ''
+    shared_directory_endpoint: str = ''
+    shared_directory_epoch: str = ''
+    shared_slots_path: str = ''
 
     def __post_init__(self):
         if type(self.enabled) is not bool:
@@ -71,6 +74,10 @@ class NativeDdrPrefixConfig:
             raise ValueError("Run02 supports max_inflight_transfers=1 only")
         if self.enabled and self.capacity_bytes < 20971520:
             raise ValueError("native DDR needs explicit capacity for at least one complete block (20971520)")
+        shared = (self.shared_directory_endpoint, self.shared_directory_epoch, self.shared_slots_path)
+        if any(shared) and (not self.enabled or not all(isinstance(v, str) and v for v in shared)
+                            or self.capacity_bytes != 4 * 20971520):
+            raise ValueError('shared DDR requires a complete directory/partition configuration and four logical slots')
 
     def validate_runtime(self, *, executor_cls, tp, page_size, dtype, grouped=False, prefix_cache=True):
         if not self.enabled:

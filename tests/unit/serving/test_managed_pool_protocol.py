@@ -263,6 +263,8 @@ class ManagedNativeOrderingTests(unittest.TestCase):
         self.slots = ManagedDdrSlots.__new__(ManagedDdrSlots)
         self.slots.capacity = 5
         self.slots.access = self.access
+        self.slots.bindings = None
+        self.slots.shared_directory = None
         self.slots._blocks, self.slots._offsets, self.slots.leases = {}, {}, {}
         self.slots.generation, self.slots.busy = 0, None
         self.slots.page_ids = object()

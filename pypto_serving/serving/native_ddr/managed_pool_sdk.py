@@ -352,6 +352,9 @@ def register_managed_pool(config):
         port = SdkManagedPoolPort(client)
         if (port.identity.pool_id, port.identity.pool_epoch) != (config.pool_id, config.pool_epoch):
             raise ValueError('registered pool differs from configuration')
+        if getattr(config, 'shared_slots_path', ''):
+            from .shared_pool import register_partition_client
+            register_partition_client(config.shared_slots_path, port.identity.client_session)
         return ManagedPoolAccess(port)
     except BaseException as error:
         try:
