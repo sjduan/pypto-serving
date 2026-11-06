@@ -22,6 +22,8 @@ them -- uvicorn waiting out the requests already accepted.
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
+import os
 
 import pytest
 
@@ -276,3 +278,52 @@ def test_one_core_failing_does_not_leave_its_siblings_unstopped():
     reaped, stopped = asyncio.run(scenario())
     assert stopped == [True, True, True], "a sibling was left holding its devices"
     assert reaped is False, "a core that could not say what became of its worker counts"
+
+
+def _cpu_shutdown_worker(queue, seen, release, ignore):
+    queue.get(timeout=15)
+    seen.set()
+    if ignore:
+        release.wait(15)
+
+
+@pytest.mark.parametrize('ignore', [False, True])
+@pytest.mark.skipif(os.name != 'posix', reason='Linux process lifecycle; Windows sandbox denies multiprocessing named pipes')
+def test_cooperative_only_shutdown_uses_real_cpu_process_without_signal_escalation(ignore):
+    """A genuine child ignores shutdown until the test releases its own CPU gate."""
+    context = multiprocessing.get_context('spawn')
+    queue, seen, release = context.Queue(), context.Event(), context.Event()
+    process = context.Process(target=_cpu_shutdown_worker, args=(queue, seen, release, ignore))
+    process.start()
+    signals = []
+    process.terminate = lambda: signals.append('terminate')
+    process.kill = lambda: signals.append('kill')
+    core = _core(process, queue)
+    core._cooperative_only_stop = True
+    # Wait for the child to receive the real encoded ShutdownCommand, then
+    # allow enough time for the cooperative positive case's normal exit.
+    try:
+        outcome = core._shutdown_worker(timeout=5)
+        assert seen.wait(1)
+        assert signals == []
+        assert outcome is not ignore
+        if ignore:
+            assert process.is_alive() and core._worker_process is process
+            assert core._input_queue is queue and core._worker_stranded
+        else:
+            assert process.exitcode == 0 and core._worker_process is None
+    finally:
+        release.set()
+        process.join(15)
+        queue.close()
+        queue.join_thread()
+        assert not process.is_alive(), 'CPU fixture did not exit through its own release gate'
+
+
+def test_cooperative_mode_cannot_relabel_an_existing_legacy_cleanup():
+    async def scenario():
+        core = _core(_FakeProcess(dies_after=0), _FakeQueue())
+        await core.stop()
+        with pytest.raises(RuntimeError, match='existing legacy cleanup'):
+            await core.stop(cooperative_only=True)
+    asyncio.run(scenario())

@@ -241,7 +241,11 @@ class ReplicaEngineCore:
         *,
         scheduler_factory=Scheduler,
         worker_factory=spawn_worker,
+        cooperative_only_stop: bool = False,
     ) -> None:
+        if type(cooperative_only_stop) is not bool:
+            raise ValueError('cooperative_only_stop must be boolean')
+        self._cooperative_only_stop = cooperative_only_stop
         self._worker_factory = worker_factory
         runtime = config.resolve_runtime_config()
         if runtime.native_ddr.enabled and (config.platform != "a2a3" or runtime.weight_dtype != "bfloat16"):
@@ -469,13 +473,19 @@ class ReplicaEngineCore:
             and self._worker_process.is_alive()
         )
 
-    async def stop(self) -> bool:
+    async def stop(self, *, cooperative_only: bool = False) -> bool:
         """Stop engine loop and worker process.
 
         The boolean proves only parent worker reap, never native-child drain,
         driver threads/FDs or reservation release. See shutdown_report. Repeated
         calls share one cleanup owner, including when their callers cancel.
         """
+        if type(cooperative_only) is not bool:
+            raise ValueError('cooperative_only must be boolean')
+        if cooperative_only:
+            if getattr(self, '_stop_task', None) is not None and not getattr(self, '_cooperative_only_stop', False):
+                raise RuntimeError('existing legacy cleanup cannot promise cooperative-only shutdown')
+            self._cooperative_only_stop = True
         task = self._ensure_stop_task(timeout=30)
         try:
             return await asyncio.shield(task)
@@ -1831,7 +1841,8 @@ class ReplicaEngineCore:
         input_q = self._input_queue
         process = self._worker_process
         runtime = getattr(self, '_runtime', None)
-        if process is not None and runtime is not None and runtime.native_ddr.enabled:
+        if process is not None and (getattr(self, '_cooperative_only_stop', False)
+                or runtime is not None and runtime.native_ddr.enabled):
             # A managed client may be paused with Unknown native/range obligations.
             # Keep its process handle and queues available for the preinstalled
             # cooperative channel. Process death cannot substitute for SDK unmap.
@@ -1840,7 +1851,7 @@ class ReplicaEngineCore:
                     input_q.put(encode_command(ShutdownCommand()))
             if not self._reap(process, timeout):
                 self._worker_stranded = True
-                logger.error('Managed pool client retained alive after cooperative shutdown timeout')
+                logger.error('Worker retained alive after cooperative shutdown timeout; no signal escalation')
                 return False
             self._worker_process = None
             self._input_queue = self._output_queue = self._profile_output_queue = None
@@ -1949,7 +1960,11 @@ class AsyncLLMEngine:
         tokenizer,
         *,
         core_factory: Callable[..., ReplicaEngineCore] = ReplicaEngineCore,
+        cooperative_only_stop: bool = False,
     ) -> None:
+        if type(cooperative_only_stop) is not bool:
+            raise ValueError('cooperative_only_stop must be boolean')
+        self._cooperative_only_stop = cooperative_only_stop
         config = replace(config, runtime_config=config.resolve_runtime_config())
         parallel = config.parallel_config
         if parallel is None:
@@ -1987,9 +2002,11 @@ class AsyncLLMEngine:
                 parallel_config=replica_parallel,
                 dp_rank=dp_rank,
             )
+            stop_options = {'cooperative_only_stop': True} if cooperative_only_stop else {}
             core = core_factory(
                 config=replica_config,
                 tokenizer=tokenizer,
+                **stop_options,
             )
             records_metrics = callable(getattr(core, "set_stat_logger", None))
             self._core_records_metrics.append(records_metrics)
@@ -2010,13 +2027,16 @@ class AsyncLLMEngine:
             await self.stop()
             raise
 
-    async def stop(self) -> bool:
+    async def stop(self, *, cooperative_only: bool = False) -> bool:
         """Stop all DP engine cores. False if a worker could not be reaped."""
+        if type(cooperative_only) is not bool:
+            raise ValueError('cooperative_only must be boolean')
+        stop_options = {'cooperative_only': True} if cooperative_only else {}
         # return_exceptions: without it one core's failure propagates before its
         # siblings have finished, leaving their workers unsignalled on their
         # devices -- the opposite of what stopping is for.
         results = await asyncio.gather(
-            *(core.stop() for core in reversed(self._cores)), return_exceptions=True,
+            *(core.stop(**stop_options) for core in reversed(self._cores)), return_exceptions=True,
         )
         failures = [result for result in results if isinstance(result, BaseException)]
         for failure in failures:

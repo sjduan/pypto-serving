@@ -111,6 +111,28 @@ def _assert_owned_tasks_done(core):
     assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
 
 
+def test_constructor_cooperative_policy_also_protects_startup_failure_cleanup():
+    from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
+    async def check():
+        process = _Process(reaps=False)
+        messages = queue.Queue()
+        def factory(config, tokenizer, **options):
+            assert options == {'cooperative_only_stop': True}
+            core = _Core(config, tokenizer, **options, worker_factory=lambda config:
+                (process, messages, queue.Queue(), queue.Queue(), _Event(False), [0]))
+            core._init_timeout = .01
+            return core
+        engine = AsyncLLMEngine(EngineConfig(), SimpleNamespace(eos_token_id=0, bos_token_id=0),
+                              core_factory=factory, cooperative_only_stop=True)
+        with pytest.raises(RuntimeError):await engine.start()
+        core = engine._cores[0]
+        assert core._worker_process is process and core._input_queue is messages
+        assert process.is_alive() and process.signals == []
+        assert await engine.stop(cooperative_only=True) is False
+        assert process.signals == [] and process.joins == 1
+    asyncio.run(check())
+
+
 def test_ready_requires_reliable_success_and_positive_capacity():
     async def check():
         core, process, _, messages = _core(ready=True, capacity=8)
@@ -253,7 +275,8 @@ def test_external_cpu_driver_really_exits_and_joins_owned_threads(tmp_path):
     target = tmp_path / "driver-final.json"
     result = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(target)],
                             capture_output=True, text=True, timeout=30, check=False,
-                            env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[4])})
+                            env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[4])
+                                 + os.pathsep + os.environ.get('PYTHONPATH', '')})
     assert result.returncode == 0, result.stdout + result.stderr
     final = json.loads(target.read_text())
     assert final["stage"] == "after-asyncio-run-before-driver-exit"

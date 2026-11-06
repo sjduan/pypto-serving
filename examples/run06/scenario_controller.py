@@ -66,6 +66,7 @@ async def orchestrate(config, transport):
             'M1_line_retired':False,'pool_destroyed':False}
     prompt=None
     try:
+        if transport.real_runtime:await transport.install_recovery(prepared)
         await transport.admit(config,prepared)
         # Baseline has no SDK client, and is truly stopped before another model
         # is loaded on that same physical device. Never co-load two14B weights.

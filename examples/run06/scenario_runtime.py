@@ -24,6 +24,10 @@ from scenario_contract import digest, save, validate
 from scenario_admission import observe, phase_ledger, validate_admission, validate_release, verify_source_closure
 
 
+class ActorCommandError(RuntimeError):
+    """The original actor failed a command and retained its actual owner."""
+
+
 class ProcessTransport:
     real_runtime=True
 
@@ -33,6 +37,27 @@ class ProcessTransport:
         self.held=ExitStack();self.sequence=0;self.directory=self.observer=None
         self.logs={};self.listeners={};self.owned_births={};self.commands=[];self.reserved=False
         self.manifest=validate(config)[2]
+        self.recovery = None
+        self.observer_pinned = self.directory_ready = False
+        self.failures = []
+        self.recovery_stopping = False
+
+    async def install_recovery(self, prepared):
+        # Pure release/source metadata only. Install before admit, claim or actor creation.
+        from recovery_control import RecoveryControl
+        from pypto_serving.serving.native_ddr.managed_process import process_birth
+        envelope = validate_release(self.config)
+        self.ledger = phase_ledger(self.config, envelope)
+        self.phase = 'two' if self.config['replicas'] == 2 else 'four'
+        source = json.loads(Path(self.config['source_manifest']).read_text())
+        binding = {'uid': os.getuid(), 'controller_pid': os.getpid(), 'controller_birth': process_birth(os.getpid()),
+            'config_sha256': prepared['config_sha256'], 'source_commit': source['serving'],
+            'source_manifest_sha256': self.config['source_manifest_sha256'],
+            'public_manifest_sha256': self.config['manifest_sha256'],
+            'envelope_sha256': self.config['operation_allowance']['sha256'],
+            'claim_path': str(self.ledger.root / (self.phase + '.started.json')), 'root': str(self.root)}
+        self.recovery = RecoveryControl(str(self.root) + '.recovery.sock', binding, self.stop_owned)
+        await self.recovery.install()
 
     async def admit(self, config, prepared):
         envelope=validate_release(config)
@@ -62,10 +87,10 @@ class ProcessTransport:
             'lock_holder_pid':os.getpid(),'lock_holder_birth':self.parent_birth,
             'evidence_path':str(self.root/'admission-before-locks.json')} for d in config['devices']]
         self.reserved=True  # A lost metadata response is not a confirmed release.
-        request(self.manifest,'reserve-devices',line='M1',reservations=reservations)
+        acknowledgement=request(self.manifest,'reserve-devices',line='M1',reservations=reservations)
         self.admission={'parent_pid':os.getpid(),'parent_birth':self.parent_birth,
             'config_sha256':prepared['config_sha256'],'source':source['serving'],'reservations':reservations,
-            'snapshot':locked,'pool_admin':False}
+            'snapshot':locked,'pool_admin':False,'actual_reservation_ACK':acknowledgement}
         save(self.root/'parent-admission.json',self.admission)
 
     async def spawn(self, name, script, args, *, host=False, pass_fds=()):
@@ -144,8 +169,20 @@ class ProcessTransport:
         child.stdin.write(data);await child.stdin.drain()
         raw=await asyncio.wait_for(child.stdout.readline(),timeout=1000)
         if not raw or len(raw)>65536:raise RuntimeError('original actor channel missing/oversized; retain')
-        response=json.loads(raw)
-        if type(response.get('id')) is not int or response.get('id')!=number or response.get('status')!='ok':raise RuntimeError('actor response identity/status differs')
+        from scenario_wire import _unique
+        response=json.loads(raw,object_pairs_hook=_unique)
+        if type(response.get('id')) is not int or response.get('id')!=number:
+            raise RuntimeError('actor response identity differs')
+        if response.get('status')=='error':
+            if (set(response)!={'id','status','error','retained','failure_path'} or response['retained'] is not True
+                    or type(response['error']) is not str or len(response['error'])>2048
+                    or Path(response['failure_path']).resolve()!=(self.root/name/'retained-failure.json').resolve()):
+                raise RuntimeError('actor error response schema/owned failure path differs')
+            save(self.root/f'command-{number}.json',{'actor':name,'request':packet,'response':response,
+                 'response_time_ns':time.monotonic_ns(),'actual_actor_error':True})
+            raise ActorCommandError(f'{name} command {number} {op}: {response["error"]}')
+        if response.get('status')!='ok' or set(response)!={'id','status','result_path'}:
+            raise RuntimeError('actor success response schema differs')
         path=Path(response['result_path'])
         if not path.resolve().is_relative_to((self.root/name).resolve()) or path.stat().st_size>16<<20:
             raise ValueError('actor evidence escaped owned root/bound')
@@ -197,6 +234,7 @@ class ProcessTransport:
         reg=list(self.root.glob('directory-*-registered.json'))
         if len(reg)!=1:raise RuntimeError('directory original SDK identity missing')
         self.sessions.append(json.loads(reg[0].read_text())['identity']['client_session'])
+        self.directory_ready=True
 
     async def wait_file(self,path,child):
         deadline=time.monotonic()+60
@@ -215,14 +253,18 @@ class ProcessTransport:
         if answer.get('status')!='ok':raise RuntimeError('original observer pins unconfirmed')
         pins=json.loads(Path(answer['result_path']).read_text())
         if len(pins['held_R_grants'])!=2 or pins['payload_bytes_read']!=0:raise RuntimeError('observer is not exact real R metadata')
+        self.observer_pinned=True
 
     async def release_original(self):
+        if not self.observer_pinned:raise RuntimeError('observer original pins unconfirmed; retain')
         self.observer.stdin.write(b'{"op":"release"}\n');await self.observer.stdin.drain()
         answer=json.loads(await asyncio.wait_for(self.observer.stdout.readline(),60))
         if answer.get('status')!='ok':raise RuntimeError('observer original release outcome unknown')
         closed=json.loads(Path(answer['result_path']).read_text())
         if not closed['SDK_client_unmapped'] or len(closed['actual_release_ACKs'])!=2:raise RuntimeError('observer not drained')
         if await asyncio.wait_for(self.observer.wait(),30)!=0:raise RuntimeError('observer abnormal exit')
+        self.observer=None
+        self.observer_pinned=False
 
     def capture_bytes(self,row):
         path=Path(row['file'])
@@ -334,18 +376,35 @@ class ProcessTransport:
             listener.close()
 
     async def stop_model(self,name):
+        if name not in self.started:raise RuntimeError('original model startup incomplete; retain')
         result=await self.call(name,'stop')
-        if not result['stop_ok'] or result['shutdown_report']['cleanup_error'] is not None:
+        start=self.started[name];report=result['shutdown_report']
+        if (result['stop_ok'] is not True or report['cleanup_error'] is not None
+                or report['worker_reaped'] is not True or report['native_ddr_obligations']!=0
+                or result['actor_pid']!=start['pid'] or result['worker_pid']!=start['worker_pid']
+                or report['worker_pid']!=start['worker_pid'] or result['shared'] is not start['shared']):
             raise RuntimeError('actual native model stop not proved')
+        if start['shared']:
+            proof=result['native_stop_proof']
+            if (proof['worker_epoch']!=start['startup']['worker_epoch']
+                    or proof['module_drained'] is not True or proof['owner_drained_arguments_released'] is not True
+                    or any(type(proof[k]) is not int or proof[k]!=0 for k in ('jobs','steps','controls','retiring'))):
+                raise RuntimeError('original native drain/owner argument proof absent')
+        elif result['native_stop_proof'] is not None:raise RuntimeError('unexpected native proof for native-off actor')
+        for pid,birth in result['descendant_births_before'].items():
+            if str(pid) in start['descendant_births'] and start['descendant_births'][str(pid)]!=birth:
+                raise RuntimeError('original descendant birth changed before stop')
+            self.owned_births[int(pid)]=birth
         if await asyncio.wait_for(self.models[name].wait(),30)!=0:raise RuntimeError('model actor abnormal exit')
-        self.listeners.pop(name).close()
         from pypto_serving.serving.native_ddr.managed_process import process_birth
-        if any(process_birth(int(pid))==birth for pid,birth in self.started[name]['descendant_births'].items()):
+        births={**start['descendant_births'],**result['descendant_births_before']}
+        if process_birth(start['pid'])==start['birth'] or any(process_birth(int(pid))==birth for pid,birth in births.items()):
             raise RuntimeError('normal model stop left an original descendant birth')
+        from stop_evidence import check_shared_names_gone,check_device_closed
+        check_shared_names_gone(start['private_shared_names']+result['private_shared_names_before'])
         from r_guard import snapshot
         after=snapshot(self.root,'stopped-'+name,self.config['devices'][self.model_index(name)]['physical'])
-        if after['fds']['users'] or after['fds']['denied'] or after['status']['health']!='OK':
-            raise RuntimeError('normal model stop left device obligations')
+        check_device_closed(after)
         save(self.root/(name+'-device-stopped.json'),after)
         from session_protocol import request,pool_record,check_retired
         if self.started[name]['shared']:
@@ -353,15 +412,25 @@ class ProcessTransport:
             session=self.started[name]['startup']['pool_identity']['client_session'];check_retired(pool,[session])
             save(self.root/(name+'-actual-SDK-unmapped.json'),{'session':session,'pool':pool,'worker_stop':result})
         self.models.pop(name)
+        if not getattr(self,'recovery_stopping',False):self.listeners.pop(name).close()
         self.stopped[name]=result
         return result
 
     async def stop_directory(self):
+        if not self.directory_ready:raise RuntimeError('directory startup incomplete; retain')
         save(self.root/'directory/stop.json',{'epoch':'m1-'+self.root.name})
         if await asyncio.wait_for(self.directory.wait(),30)!=0:raise RuntimeError('directory normal close failed')
         if (self.root/'d.sock').exists():raise RuntimeError('own metadata endpoint remains')
+        closed=json.loads((self.root/'directory/closed.json').read_text())
+        if closed['SDK_client_unmapped'] is not True or closed['socket_absent'] is not True:
+            raise RuntimeError('actual directory SDK/socket closure absent')
+        self.directory=None
+        self.directory_ready=False
 
     async def verify_cleanup(self):
+        if (self.models or self.observer or self.directory
+                or self.listeners and not getattr(self,'recovery_stopping',False)):
+            raise RuntimeError('original owned actors/listeners not closed')
         from session_protocol import request,pool_record,check_retired
         from pypto_serving.serving.native_ddr.managed_process import process_birth
         state=request(self.manifest,'describe');pool=pool_record(state['snapshot'],self.manifest['pool_descriptor'])
@@ -374,27 +443,58 @@ class ProcessTransport:
             'directory_socket_absent':not (self.root/'d.sock').exists(),'listeners_closed':not self.listeners,'devices':[],
             'M1_line_retired':False,'common_pool_finalized':False,'B_retained_bytes':134217728,'A_historical_bytes':134217728}
         from r_guard import snapshot
+        from stop_evidence import check_device_closed
         for device in self.config['devices']:
             final=snapshot(self.root,'final-'+str(device['physical']),device['physical'])
-            if final['fds']['users'] or final['fds']['denied'] or final['status']['health']!='OK':
-                raise RuntimeError('own physical device FD/health cleanup not proved')
+            check_device_closed(final)
             save(self.root/('final-device-'+str(device['physical'])+'.json'),final)
             result['devices'].append(final)
-        request(self.manifest,'reserve-devices',line='M1',reservations=[])
+        acknowledgement=request(self.manifest,'reserve-devices',line='M1',reservations=[])
+        save(self.root/'reservation-release-ACK.json',acknowledgement)
         self.reserved=False
+        for listener in self.listeners.values():listener.close()
+        self.listeners.clear()
         self.held.close()
+        result['listeners_closed']=True
         result['reservations_released']=True
+        return result
+
+    async def stop_owned(self):
+        # The endpoint can select only these retained original handles, never a caller PID.
+        self.recovery_stopping=True
+        for name in list(self.models):
+            await self.stop_model(name)
+        if self.observer is not None:await self.release_original()
+        if self.directory is not None:await self.stop_directory()
+        result=await self.verify_cleanup()
+        save(self.root/'recovery-cleanup.json',result)
+        for stream in self.logs.values():stream.close()
         return result
 
     async def publish_closed(self,report):
         report['phase_identity']=self.ledger.identity(self.phase)
         self.ledger.close(self.phase,report,self.root/'phase-evidence.json')
+        await self.recovery.close()
 
     async def retain(self,error,report):
+        self.failures.append(error)  # Retain the original scenario exception and traceback.
         if not (self.models or self.directory or self.observer or self.reserved):
             self.held.close()
+            if self.recovery is not None:await self.recovery.close()
             raise error
-        save(self.root/'retained-controller.json',{'pid':os.getpid(),'error':repr(error),'traceback':traceback.format_exc(),
-            'report':report,'commands':self.commands,'owned_births':self.owned_births,
-            'action':'original domain/locks/processes retained; no force kill/new pool/false SDK ACK'})
-        while True:await asyncio.sleep(30)
+        try:
+            save(self.root/'retained-controller.json',{'pid':os.getpid(),'error':repr(error),
+                'traceback':''.join(traceback.format_exception(error)),
+                'report':report,'commands':self.commands,'owned_births':self.owned_births,
+                'action':'original domain/locks/processes retained; no force kill/new pool/false SDK ACK'})
+            if self.recovery is None:raise RuntimeError('recovery was not installed before admission')
+            self.recovery.activate(self.ledger.root/(self.phase+'.started.json'),self.ledger.identity(self.phase),
+                                   report['plan']['config_sha256'])
+        except BaseException as binding_error:
+            self.failures.append(binding_error)
+            # Preserve all actual handles even when evidence storage or claim
+            # binding fails; no exception here may abandon a retained owner.
+            await asyncio.Event().wait()  # Unknown claim cannot close or abandon its original owner.
+        await self.recovery.completed.wait()
+        await self.recovery.close()
+        raise error  # Recovery closes obligations; the failed campaign stays failed.

@@ -17,15 +17,16 @@ import os
 from pathlib import Path
 import sys
 import time
-import traceback
 
-from scenario_contract import cli, save, validate
+from scenario_contract import cli, validate
 
 
 class ModelActor:
     def __init__(self, config, index, shared, root):
         self.config, self.index, self.shared, self.root = config, index, shared, Path(root)
         self.engine = self.server = self.server_task = None
+        self.retained = False
+        self.start_complete = False
         self.held, self.schedule, self.records = set(), [], []
         self.counter = 0
         self.hbm_guard_before = []
@@ -64,7 +65,8 @@ class ModelActor:
         arguments = cli(self.config, self.device, shared=self.shared)
         engine_config = build_serving_engine_config(build_parser().parse_args(arguments))
         self.engine_config = engine_config
-        self.engine = AsyncLLMEngine(engine_config, load_tokenizer(engine_config.model_dir))
+        self.engine = AsyncLLMEngine(engine_config, load_tokenizer(engine_config.model_dir),
+                                     cooperative_only_stop=True)
         self.core = self.engine._cores[0]
         original = self.core.scheduler.schedule
         def observe(*args, **kwargs):
@@ -76,12 +78,15 @@ class ModelActor:
             return value
         self.core.scheduler.schedule = observe
         self.generation = GenerateConfig(max_new_tokens=2, min_tokens=2, temperature=0.0,
-                                         top_p=1.0, top_k=None, seed=0, stream=True)
+                                         top_p=1.0, top_k=None, seed=0, stream=True, ignore_eos=True)
         await self.engine.start()
         self.coord = self.core._native_ddr
         self.manager = self.core.kv_cache_manager
-        self.server = uvicorn.Server(uvicorn.Config(create_serving_app(self.engine, engine_config.model_id,
-            self.generation), host='127.0.0.1', port=self.device['port'], lifespan='off', log_level='info'))
+        app = create_serving_app(self.engine, engine_config.model_id, self.generation)
+        from actor_control import RetainedHTTPGate
+        self.http_gate = RetainedHTTPGate(app, self)
+        self.server = uvicorn.Server(uvicorn.Config(self.http_gate, host='127.0.0.1', port=self.device['port'],
+            lifespan='off', log_level='info'))
         self.server_task = asyncio.create_task(self.server.serve(sockets=[listener]))
         await self.wait(lambda: self.server.started)
         startup = asdict(self.core._native_ddr_startup) if self.shared else None
@@ -90,7 +95,13 @@ class ModelActor:
             startup['compatibility_json'] = json.loads(self.core._native_ddr_startup.compatibility_json)
         from pypto_serving.serving.native_ddr.managed_process import process_birth
         from pypto_serving.serving.native_ddr.managed_process import descendants
-        return {'descendant_births': descendants(), 'pid': os.getpid(), 'birth': process_birth(os.getpid()), 'device': self.device,
+        births = descendants()
+        from stop_evidence import shared_names
+        private_names = shared_names({os.getpid(): process_birth(os.getpid()), **births},
+                                     self.coord.pool_identity if self.coord is not None else None)
+        self.start_complete = True
+        return {'descendant_births': births, 'pid': os.getpid(), 'birth': process_birth(os.getpid()), 'device': self.device,
+            'private_shared_names': private_names,
             'worker_pid': self.core._worker_process.pid, 'startup': startup, 'shared': self.shared,
             'argv': arguments, 'num_pages': self.manager.num_blocks}
 
@@ -145,13 +156,13 @@ class ModelActor:
 
     async def request(self, text, interface='direct'):
         import httpx
-        from m2_baseline import validate_output
         await self.idle()
         start = time.monotonic_ns();schedule_start = len(self.schedule)
         usage_before=self.usage()
         first_sequence = self.coord._trace_sequence if self.coord is not None else 0
         outputs = []
         if interface == 'direct':
+            from m2_baseline import validate_output
             request_id = self.engine.generate_request_id()
             async for output in self.engine.add_request(request_id, text, self.generation):
                 outputs.append({'time_ns': time.monotonic_ns(), **asdict(output)})
@@ -164,6 +175,7 @@ class ModelActor:
             body = None
         elif interface == 'http':
             chunks = []
+            done = False
             first_token_ns = None
             async with httpx.AsyncClient(trust_env=False, timeout=90) as client:
                 async with client.stream('POST', f"http://127.0.0.1:{self.device['port']}/v1/completions", json={
@@ -172,7 +184,12 @@ class ModelActor:
                     'stream_options': {'include_usage': True}}) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
-                        if not line.startswith('data: ') or line == 'data: [DONE]':continue
+                        if not line.startswith('data: '):continue
+                        if line == 'data: [DONE]':
+                            if done:raise ValueError('duplicate HTTP stream terminator')
+                            done = True
+                            continue
+                        if done:raise ValueError('HTTP data after terminal marker')
                         part = json.loads(line[6:]);now = time.monotonic_ns()
                         chunks.append({'time_ns': now, 'body': part})
                         if first_token_ns is None and any(c.get('text') for c in part.get('choices', [])):
@@ -183,6 +200,11 @@ class ModelActor:
                 raise ValueError('HTTP request identity/terminal token accounting differs')
             if usages[0]['prompt_tokens'] != len(self.engine.tokenizer.encode(text)):
                 raise ValueError('HTTP prompt token accounting differs')
+            finals=[(i,c) for i,x in enumerate(chunks) for c in x['body'].get('choices',[]) if c.get('finish_reason')]
+            if (not done or len(finals)!=1 or finals[0][1]['finish_reason']!='length'
+                    or chunks[-1]['body'].get('usage')!=usages[0] or chunks[-1]['body'].get('choices')!=[]
+                    or finals[0][0]!=len(chunks)-2):
+                raise ValueError('HTTP stream/final/usage contract differs')
             request_id = ids.pop();body={'stream_chunks': chunks, 'usage': usages[0]}
         else:
             raise ValueError('unsupported request interface')
@@ -286,13 +308,26 @@ class ModelActor:
         return {'overwrites': proofs, 'num_pages': self.manager.num_blocks}
 
     async def stop(self):
-        await self.idle()
+        self.retained = True
+        if not self.start_complete or self.engine is None or self.core._worker_process is None:
+            raise RuntimeError('incomplete startup/worker identity; retain original owner')
+        if (self.http_gate.active or self.core.scheduler.has_work() or self.core._batch_queue
+                or self.coord is not None and (self.coord.jobs or self.coord.controls or self.coord.steps
+                                               or self.coord.retiring or self.coord.poisoned)):
+            raise RuntimeError('in-flight/Unknown native or scheduler work; retain original owner')
         if self.held:
             self.manager.release_blocks_by_ids(sorted(self.held));self.held.clear()
         self.server.should_exit = True
-        await self.server_task
+        # Timeout must not cancel the original server/engine or escalate signals.
+        await asyncio.wait_for(asyncio.shield(self.server_task), 30)
+        from pypto_serving.serving.native_ddr.managed_process import descendants
+        births = descendants()
+        from pypto_serving.serving.native_ddr.managed_process import process_birth
+        from stop_evidence import shared_names
+        resources = shared_names({os.getpid(): process_birth(os.getpid()), **births},
+                                 self.coord.pool_identity if self.coord is not None else None)
         worker_pid = self.core._worker_process.pid
-        ok = await self.engine.stop()
+        ok = await self.engine.stop(cooperative_only=True)
         if not ok:raise RuntimeError('normal model stop retained obligations')
         proof=None
         if self.shared:
@@ -305,6 +340,8 @@ class ModelActor:
                 raise RuntimeError('actual native owner/argument closure absent')
         return {'stop_ok': ok, 'shutdown_report': self.core.shutdown_report,
                 'native_stop_proof':proof,
+                'descendant_births_before': births,
+                'private_shared_names_before': resources,
                 'worker_pid': worker_pid, 'actor_pid': os.getpid(), 'shared': self.shared}
 
 
@@ -315,27 +352,8 @@ async def main():
     protocol = os.fdopen(os.dup(sys.stdout.fileno()), 'w', buffering=1)
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     sys.path[:0] = [str(Path(__file__).resolve().parents[1] / 'run02'), str(Path(__file__).resolve().parents[1] / 'run04')]
-    try:
-        while True:
-            line = await asyncio.to_thread(sys.stdin.readline)
-            if not line or len(line)>65536:raise RuntimeError('bounded controller channel lost; retain actor')
-            from scenario_wire import command
-            request=command(line);op=request['op'];values=request['values']
-            if op not in {'start','prompt','reset','request','capture','overwrite','route_observation','stop'}:
-                raise ValueError('unsupported scenario command')
-            method=getattr(actor,op)
-            result=method(**values)
-            if hasattr(result,'__await__'):result=await result
-            path=actor.root / f"result-{request['id']}.json"
-            save(path,result)
-            protocol.write(json.dumps({'id':request['id'],'status':'ok','result_path':str(path)})+'\n')
-            if op=='stop':return
-    except BaseException:
-        # Original engine/native traceback references stay alive on any failure.
-        # No kill, PID-death ACK, replacement actor, or forced Python teardown.
-        actor.root.mkdir(exist_ok=True,parents=True)
-        save(actor.root/'retained-failure.json',{'pid':os.getpid(),'error':traceback.format_exc()})
-        while True:await asyncio.sleep(30)
+    from actor_control import serve_actor
+    await serve_actor(actor, sys.stdin, protocol)
 
 
 if __name__ == '__main__':

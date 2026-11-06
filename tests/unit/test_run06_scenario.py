@@ -395,3 +395,48 @@ def test_cancelled_inflight_transport_preserves_owner_without_cleanup(config):
     transport=Cancelled()
     with pytest.raises(asyncio.CancelledError):asyncio.run(orchestrate(config,transport))
     assert transport.retained and ('cleanup',) not in transport.events
+
+
+@pytest.mark.parametrize('fault', [None, 'final', 'done', 'identity', 'usage'])
+def test_actual_actor_http_with_actual_serving_api_binds_generation_stream_and_final(config,tmp_path,monkeypatch,fault):
+    import httpx
+    from dataclasses import asdict
+    from types import SimpleNamespace
+    from model_actor import ModelActor
+    from pypto_serving.config.types import GenerateConfig
+    from pypto_serving.serving.engine.async_engine import TokenOutput
+    from pypto_serving.serving.server.server import create_serving_app
+    actor=ModelActor(config,0,False,tmp_path)
+    actor.coord=None;actor.device=config['devices'][0]
+    actor.generation=GenerateConfig(max_new_tokens=2,min_tokens=2,temperature=0.0,seed=0,stream=True,ignore_eos=True)
+    actor.engine_config=SimpleNamespace(model_id='CPU-model')
+    actual=[]
+    async def idle():pass
+    actor.idle=idle;actor.usage=lambda:{'CPU_fixture_only':True}
+    async def stream(request_id,text,generation):
+        actual.append(asdict(generation))
+        actor.schedule.append({'request_id':request_id,'is_prefill':True,'tokens':257})
+        yield TokenOutput(token_id=10,text='A',token_ids=(10,),prompt_tokens=257,completion_tokens=1)
+        yield TokenOutput(token_id=11,text='AB',token_ids=(10,11),finished=True,
+                          finish_reason='FINISHED_LENGTH',prompt_tokens=257,completion_tokens=2)
+    actor.engine=SimpleNamespace(add_request=stream,tokenizer=SimpleNamespace(encode=lambda text:list(range(257))))
+    app=create_serving_app(actor.engine,'CPU-model',actor.generation)
+    class Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self,request):
+            response=await httpx.ASGITransport(app=app).handle_async_request(request)
+            data=await response.aread()
+            if fault=='done':data=data.replace(b'data: [DONE]\n\n',b'')
+            if fault=='final':data=data.replace(b'"finish_reason": "length"',b'"finish_reason": null')
+            if fault=='identity':
+                parts=data.split(b'\n\n');row=json.loads(parts[0][6:]);row['id']='another-request'
+                parts[0]=b'data: '+json.dumps(row).encode();data=b'\n\n'.join(parts)
+            if fault=='usage':data=data.replace(b'"completion_tokens": 2',b'"completion_tokens": 1')
+            return httpx.Response(response.status_code,headers=response.headers,content=data)
+    client=httpx.AsyncClient
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kwargs:client(transport=Transport(),**kwargs))
+    if fault:
+        with pytest.raises(ValueError,match='HTTP'):asyncio.run(actor.request('CPU prompt','http'))
+    else:
+        row=asyncio.run(actor.request('CPU prompt','http'))
+        assert row['request_id'].startswith('cmpl-') and row['body']['usage']['completion_tokens']==2
+        assert actual==[row['generate_config']]==[asdict(actor.generation)]

@@ -172,3 +172,41 @@ quota files or an activation service. There is no daemon or polling.
 The local CPU suite checks all204 manager reference vectors and counter,
 source, fake closure, original native/client/child/lease, duplicate phase and
 tampered evidence negatives. This does not establish device/model success.
+
+Retained-owner recovery
+-----------------------
+
+New-source controllers install ``<root>.recovery.sock`` before admission or
+actor creation. It is mode0600 and checks the actual UNIX peer UID. The
+immutable installed descriptor binds the original controller PID/birth,
+configuration, source commit/manifest, public manifest, envelope and fixed
+claim path. Only after failure does the retained descriptor add the actual
+original claim hash/identity and one deterministic operation ID.
+
+The sole accepted request is the exact three-field JSON object ``op``,
+``identity``, ``operation_id`` copied from that retained descriptor, with
+``op="stop-owned"``. There are no PID, argument, code or retry fields.
+Duplicates share one cleanup owner and its actual receipt; a failed stop
+cannot be re-executed by a second request or a new operation ID. A changed
+claim, wrong identity, incomplete startup, in-flight/Unknown work or missing
+proof keeps the original ownership and locks.
+
+Actor command errors return immediately on the original channel, retaining
+the exception/traceback while the controller exits its measurement context.
+The failed actor rejects further generation/reset/STORE/LOAD work, including
+new HTTP admission, but can consume its one original stop command. ModelActor
+uses the optional engine ``cooperative_only_stop=True`` constructor policy and
+explicit ``stop(cooperative_only=True)``. Timeout returns False and retains
+worker handles/queues without terminate/kill. The default engine policy is
+unchanged. Startup failure cleanup also inherits the constructor policy.
+
+Recovery sequentially stops original actors and checks actual worker/native
+proofs, startup and pre-stop descendants, private shared-memory names, driver
+processes/FDs and real SDK unmapping. Original observer R-release and directory
+close are required when those owners exist. Only complete actual closure can
+issue the real empty reservation ACK and close this controller's locks and
+listeners. The separate recovery receipt never writes a normal phase closed
+receipt, never establishes two-stage success or four-stage eligibility, and
+the failed controller ultimately exits with its original scenario error.
+These hooks cannot be injected into older live processes or reopen a failed
+claim. New-source native execution still requires its own valid release.
