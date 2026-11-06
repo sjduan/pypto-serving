@@ -10,12 +10,12 @@
 from dataclasses import asdict, replace
 import copy
 import json
-import os
 from pathlib import Path
 import socket
 import subprocess
 import sys
 import threading
+import tempfile
 
 import pytest
 
@@ -137,36 +137,34 @@ def test_current_version_and_contiguous_token0_chain_are_revalidated_for_each_di
 
 
 @pytest.mark.skipif(not hasattr(socket, 'AF_UNIX'), reason='Windows Python build has no AF_UNIX; run on Linux')
-def test_independent_processes_share_one_directory_and_one_canonical_intent(tmp_path):
-    uf = SyntheticAuthority()
-    endpoint = str(tmp_path / 'd.sock')
-    # Keep Linux sockaddr_un bounds even under a long Windows workspace.
-    if os.name == 'nt':
-        endpoint = str(Path(os.environ.get('TEMP', '.')) / f'm1-{os.getpid()}.sock')
-    directory = SharedPrefixDirectory('epoch', uf.authority())
-    with DirectoryServer(endpoint, directory) as server:
-        thread = threading.Thread(target=server.serve_forever)
-        thread.start()
-        try:
-            code = ('import json,sys;from pypto_serving.serving.native_ddr.shared_directory import DirectoryClient;'
-                    'c=DirectoryClient(sys.argv[1],"epoch");'
-                    'print(json.dumps(c.call("claim",key=json.loads(sys.argv[2]),owner=sys.argv[3])))')
-            children = [subprocess.Popen([sys.executable, '-B', '-c', code, endpoint, json.dumps(key_wire(key(1))),
-                                         f'independent-{n}'], stdout=subprocess.PIPE, stderr=subprocess.PIPE) for n in range(2)]
-            rows = []
-            for child in children:
-                output, error = child.communicate(timeout=15)
-                assert child.returncode == 0, error.decode()
-                rows.append(json.loads(output))
-            assert sorted(row['state'] for row in rows) == ['Busy', 'Intent']
-            description = DirectoryClient(endpoint, 'epoch').call('describe')
-            assert description['intents'] == 1 and description['records'] == 0
-            with pytest.raises(ValueError, match='incarnation'):
-                DirectoryClient(endpoint, 'stale-epoch').call('describe')
-        finally:
-            server.shutdown()
-            thread.join()
-    Path(endpoint).unlink()
+def test_independent_processes_share_one_directory_and_one_canonical_intent():
+    with tempfile.TemporaryDirectory(prefix='m1-', dir='/tmp') as short:
+        uf = SyntheticAuthority()
+        endpoint = str(Path(short) / 'd.sock')
+        directory = SharedPrefixDirectory('epoch', uf.authority())
+        with DirectoryServer(endpoint, directory) as server:
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                code = ('import json,sys;from pypto_serving.serving.native_ddr.shared_directory import DirectoryClient;'
+                        'c=DirectoryClient(sys.argv[1],"epoch");'
+                        'print(json.dumps(c.call("claim",key=json.loads(sys.argv[2]),owner=sys.argv[3])))')
+                children = [subprocess.Popen([sys.executable, '-B', '-c', code, endpoint, json.dumps(key_wire(key(1))),
+                                             f'independent-{n}'], stdout=subprocess.PIPE, stderr=subprocess.PIPE) for n in range(2)]
+                rows = []
+                for child in children:
+                    output, error = child.communicate(timeout=15)
+                    assert child.returncode == 0, error.decode()
+                    rows.append(json.loads(output))
+                assert sorted(row['state'] for row in rows) == ['Busy', 'Intent']
+                description = DirectoryClient(endpoint, 'epoch').call('describe')
+                assert description['intents'] == 1 and description['records'] == 0
+                with pytest.raises(ValueError, match='incarnation'):
+                    DirectoryClient(endpoint, 'stale-epoch').call('describe')
+            finally:
+                server.shutdown()
+                thread.join()
+        Path(endpoint).unlink()
 
 
 def test_shared_stale_version_releases_the_actual_current_reader_before_rejection():
