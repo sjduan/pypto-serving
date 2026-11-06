@@ -128,8 +128,47 @@ The source-derived table is emitted in every plan. Source directories and
 observer each cost registration/mapping plus normal unregistration/unmap.
 All real native LOAD/import/diagnostic/guard/publication readers and writer
 commit paths are counted. Readonly snapshot/describe/query and same-ID replay
-cost no new cached record. At the last captured312 plus proposed O1 maximum
-2888, normal completion would total4084, leaving12 to the admission boundary;
-this arithmetic is a coordination input, not permission. A larger safety
-margin requires an explicit cross-line decision, not a sample reduction,
-new pool/Catalog or changed4096/8192 limit.
+cost no new cached record. The fixed normal caps are O1=2888 and M1=884.
+At the historical312, normal completion would total4084, distance12 from4096
+and strict spare11. That observation is not a fresh activation or permission.
+
+The future manager-issued immutable schema2 envelope binds both final Git
+source SHAs, the original manifest/pool/epoch/provider, one fresh counter
+anchor A, the ordered stage caps, limits4096/8192 and terminal reserve256.
+Its exact participants table uses O1 and M1 keys, each with source_sha, total,
+and ordered stages as objects with exactly id and max. O1 stages are
+calibrate606/run2074/profile206/finalize2; M1 stages are two248/four636.
+Finalizer2 belongs only to O1. No runtime envelope has been issued.
+
+operation_allowance must be exactly an absolute path and sha256 reference to
+that immutable file. device_release must also pin envelope_sha256, alongside
+the existing source/public-manifest identity and runtime-file hashes. Defaults
+remain null. prepare_scenario writes NOT-RELEASED configurations, never grants.
+
+Before either stage, R is a fresh original-Catalog counter while this line has
+no client/child/view/range/native obligation. With C derived only from real
+previously closed stages, U the current and future own caps, and Q=2888:
+
+::
+
+    other_spent_lower = max(0, R - A - C)
+    other_remaining_upper = Q - other_spent_lower
+    worst = R + U + other_remaining_upper
+
+Require strict integers, R>=A, lower<=Q, worst<4096 and worst+256<8192.
+M1 two has C0/U884; four has C248/U636; done has C884/U0. The ledger validates
+the full previous model/native stop, original births, SDK Unmapped/children/
+leases, FD/health and normal endpoint/reservation release evidence. CPU,
+plan-only and shallow status labels cannot supply C. An arithmetic remaining
+zero is no lifecycle completion or Destroy authority.
+
+Once-only started/closed evidence is stored under the fixed M1 campaigns
+directory keyed by envelope SHA. Exclusive creation precedes any reservation,
+SDK mutation or Worker. An incomplete/failed claim blocks another run root or
+attempt; no automatic retry or replacement. Closed receipts seal the original
+start and complete real report. These are append-only evidence, not mutable
+quota files or an activation service. There is no daemon or polling.
+
+The local CPU suite checks all204 manager reference vectors and counter,
+source, fake closure, original native/client/child/lease, duplicate phase and
+tampered evidence negatives. This does not establish device/model success.

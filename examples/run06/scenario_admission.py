@@ -19,37 +19,44 @@ import sys
 import time
 
 from scenario_contract import MIN_FREE_HBM_MIB, digest, validate
+from mutation_envelope import PhaseLedger, check_sessions, sealed, validate_envelope
 
 
 def validate_release(config):
-    document,_,_,budget=validate(config)
+    document,_,_,_=validate(config)
     release=config['device_release'];allowance=config['operation_allowance']
     if (type(release) is not dict or release.get('device_stage_allowed') is not True
             or type(release.get('schema')) is not int or release['schema']!=1
             or release.get('source_manifest_sha256')!=config['source_manifest_sha256']
             or release.get('manifest_sha256')!=config['manifest_sha256']):
         raise PermissionError('host-only: explicit device-stage identity/budget release absent')
-    if (type(allowance) is not dict or type(allowance.get('schema')) is not int or allowance['schema']!=1
-            or allowance.get('pool_id')!=document['pool']['pool_id']
-            or allowance.get('pool_epoch')!=document['pool']['pool_epoch']
-            or allowance.get('source_manifest_sha256')!=config['source_manifest_sha256']):
-        raise PermissionError('unknown shared operation-record reservation')
-    for k in ('M1_records_reserved','O1_remaining_reserved','final_cleanup_reserved'):
-        if type(allowance.get(k)) is not int or allowance[k]<0:raise PermissionError('unknown journal headroom')
-    if allowance['M1_records_reserved']<budget['required_shared_record_allowance'] or allowance['final_cleanup_reserved']<128:
-        raise PermissionError('unknown/insufficient reserved operation-record budget')
-    return allowance
+    try:
+        envelope=sealed(allowance)
+        source=sealed({'path':config['source_manifest'],'sha256':config['source_manifest_sha256']})
+        validate_envelope(envelope,document['pool'],config['manifest_sha256'],source['serving'])
+        if release.get('envelope_sha256')!=allowance['sha256']:
+            raise ValueError('device release must pin the same immutable envelope')
+    except (ValueError,KeyError,TypeError,OSError) as error:
+        raise PermissionError('unknown/drifted immutable shared mutation envelope') from error
+    return envelope
+
+
+def phase_ledger(config,envelope=None):
+    return PhaseLedger('/workspace/uflow/runs/phasef-parallel-20261106/m1/campaigns',
+        config['operation_allowance']['sha256'],envelope or validate_release(config),
+        validate(config)[0]['pool'],config['source_manifest_sha256'])
 
 
 def validate_admission(config, observed):
     document,_,manifest,budget=validate(config)
-    allowance=validate_release(config)
+    envelope=validate_release(config)
     count=observed['operation_records']
-    if (type(count) is not int or count<0 or allowance['M1_records_reserved']<budget['required_shared_record_allowance']
-            or allowance['final_cleanup_reserved']<128
-            or count+allowance['M1_records_reserved']+allowance['O1_remaining_reserved']>=4096
-            or count+allowance['M1_records_reserved']+allowance['O1_remaining_reserved']+allowance['final_cleanup_reserved']>=8192):
-        raise PermissionError('shared4096/8192 record headroom insufficient; preserve Catalog and samples')
+    try:
+        phase_ledger(config,envelope).check('two' if config['replicas']==2 else 'four',count)
+    except (ValueError,KeyError,TypeError,OSError) as error:
+        raise PermissionError('shared phase/counter/real prior closure gate refused') from error
+    if observed.get('own_active_obligations') is not False:
+        raise PermissionError('own prior native/client/child/view/range obligations not closed')
     if observed['host']!=manifest['host'] or observed['unknown_or_frozen'] or observed['M1_retired']:
         raise PermissionError('actual host/domain/line authority differs')
     if (observed['budget_bytes'],observed['charged_bytes'],observed['creation_reserved_bytes'])!=(134217728,134217728,0):
@@ -114,9 +121,13 @@ def observe(config, root):
     if os.environ.get('LD_PRELOAD') or any(os.environ.get(k) for k in ('ASCEND_VISIBLE_DEVICES','ASCEND_RT_VISIBLE_DEVICES')):
         raise PermissionError('controller has host fence or uncalibrated logical device mask')
     sys.path[:0]=[manifest['helper_root'],str(Path(__file__).resolve().parents[1]/'run02')]
-    from session_protocol import request,pool_record
+    from session_protocol import request,pool_record,check_retired
     from r_guard import snapshot
     state=request(manifest,'describe');s=state['snapshot'];pool=pool_record(s,manifest['pool_descriptor'])
+    # The shared service's complete M1 registration history is authoritative;
+    # checking just this process's in-memory clients would miss an older attempt.
+    check_retired(pool,state['lines']['M1']['clients'])
+    check_sessions(s,manifest['pool_descriptor'],state['lines']['M1']['clients'])
     host={'hostname':os.uname().nodename,'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
         'pid_namespace':os.readlink('/proc/self/ns/pid'),'mount_namespace':os.readlink('/proc/self/ns/mnt')}
     mapping=subprocess.check_output(['npu-smi','info','-m'],text=True,timeout=15)
@@ -141,4 +152,5 @@ def observe(config, root):
     return {'host':host,'devices':devices,'operation_records':s['operation_records'],'pool_descriptor':manifest['pool_descriptor'],
         'budget_bytes':s['budget_bytes'],'charged_bytes':s['charged_bytes'],'creation_reserved_bytes':s['creation_reserved_bytes'],
         'unknown_or_frozen':pool['frozen'],'M1_retired':state['lines']['M1']['retired'],
+        'own_active_obligations':any(r['line']=='M1' for r in reservations),
         'other_reservations':[r for r in reservations if r['line']!='M1'],'raw_common_state':state}

@@ -143,6 +143,7 @@ async def orchestrate(config, transport):
         await transport.stop_directory()
         report['cleanup']=await transport.verify_cleanup()
         report['status']='CAPTURED-PENDING-REVIEW' if transport.real_runtime else 'CPU-ORCHESTRATION-ONLY'
+        if transport.real_runtime:await transport.publish_closed(report)
         return report
     except BaseException as error:
         # The transport owns real process/native obligations, and retains them.

@@ -21,6 +21,7 @@ sys.path.insert(0,str(RUN06))
 from scenario_contract import operation_budget,plan
 from scenario_controller import orchestrate,check_request,samples
 from scenario_admission import validate_admission,observe
+from mutation_envelope import CAPS, STAGES, PhaseLedger, bound, digest, validate_envelope
 
 FIXTURE=Path(__file__).resolve().parents[1]/'fixtures/m1'
 
@@ -136,25 +137,153 @@ def test_plan_never_reads_model_or_source_or_opens_network(config,monkeypatch):
     with pytest.raises(PermissionError):observe(config,Path(config['root']))
 
 
-@pytest.mark.parametrize('fault',['unknown','headroom','schema-bool','physical-alias','occupied','frozen'])
-def test_future_admission_fails_before_process_or_SDK_mutation(config,fault):
+def released_config(config,tmp_path):
     p=plan(config);m=json.loads(Path(json.loads(Path(config['bindings']).read_text())['session_manifest']).read_text())
+    source=tmp_path/'source.json';source.write_text(json.dumps({'serving':'f'*40}))
+    config['source_manifest']=str(source);config['source_manifest_sha256']=digest(source.read_bytes())
+    env={'schema':2,'decision_id':'CPU-METADATA-FIXTURE-NOT-A-GRANT','resource_group':'phasef-parallel-20261106',
+        **{k:p['pool'][k] for k in ('pool_id','pool_epoch','provider_session')},
+        'common_manifest_sha256':config['manifest_sha256'],'counter_anchor':312,
+        'admission_limit':4096,'cleanup_limit':8192,'terminal_recovery_reserve':256,
+        'participants':{line:{'source_sha':('f' if line=='M1' else 'e')*40,'total':CAPS[line],
+            'stages':[{'id':s,'max':cap} for s,cap in STAGES[line]]} for line in CAPS}}
+    path=tmp_path/'envelope.json';path.write_text(json.dumps(env))
+    config['operation_allowance']={'path':str(path),'sha256':digest(path.read_bytes())}
     config['device_release']={'schema':1,'device_stage_allowed':True,'source_manifest_sha256':config['source_manifest_sha256'],
-        'manifest_sha256':config['manifest_sha256']}
-    config['operation_allowance']={'schema':1,'pool_id':p['pool']['pool_id'],'pool_epoch':p['pool']['pool_epoch'],
-        'source_manifest_sha256':config['source_manifest_sha256'],'M1_records_reserved':p['budget']['required_shared_record_allowance'],
-        'O1_remaining_reserved':512,'final_cleanup_reserved':128}
+        'manifest_sha256':config['manifest_sha256'],'envelope_sha256':config['operation_allowance']['sha256']}
     state={'host':m['host'],'operation_records':312,'unknown_or_frozen':False,'M1_retired':False,
+        'own_active_obligations':False,
         'budget_bytes':134217728,'charged_bytes':134217728,'creation_reserved_bytes':0,'pool_descriptor':p['pool'],
         'other_reservations':[],'devices':{str(d['physical']):{**d,'health':'OK','hbm_free_mib':60000,
             'fd_users':[],'fd_denied':[],'driver_processes_present':False} for d in config['devices']}}
+    return env,state
+
+
+@pytest.mark.parametrize('fault',['unknown','headroom','schema-bool','physical-alias','occupied','frozen','own-open'])
+def test_future_admission_fails_before_process_or_SDK_mutation(config,tmp_path,monkeypatch,fault):
+    env,state=released_config(config,tmp_path)
+    import scenario_admission
+    ledger=PhaseLedger(tmp_path/'ledger','0'*64,env,plan(config)['pool'],config['source_manifest_sha256'])
+    monkeypatch.setattr(scenario_admission,'phase_ledger',lambda *_:ledger)
     if fault=='unknown':config['operation_allowance']=None
     elif fault=='headroom':state['operation_records']=4000
     elif fault=='schema-bool':config['device_release']['schema']=True
     elif fault=='physical-alias':state['devices']['12']['bdf']='0000:81:00.0'
     elif fault=='occupied':state['devices']['12']['fd_users']=[{'pid':123}]
     elif fault=='frozen':state['unknown_or_frozen']=True
+    elif fault=='own-open':state['own_active_obligations']=True
     with pytest.raises(PermissionError):validate_admission(config,state)
+
+
+@pytest.mark.parametrize('vector',json.loads((FIXTURE/'mutation-vectors.json').read_text()))
+def test_v2_manager_reference_equivalence(vector):
+    assert bound(vector['anchor'],vector['observed'],vector['line'],vector['phase'])==vector['expected']
+
+
+@pytest.mark.parametrize('args',[(324,324,'M1','two'),(312,311,'M1','two'),
+    (312,3201,'M1','two'),(True,312,'M1','two'),(312,True,'M1','two'),(312,312,'M1','skip')])
+def test_v2_invalid_counters_and_phase_rejected(args):
+    with pytest.raises(ValueError):bound(*args)
+
+
+def test_other_line_twelve_spent_is_not_double_counted_and_zero_is_not_drain():
+    assert bound(312,324,'O1','calibrate')['worst']==4084
+    result=bound(312,3200,'M1','two')
+    assert result['other_remaining_upper']==0 and result['not_a_resource_or_lease_grant'] is True
+
+
+@pytest.mark.parametrize('fault',['schema','cap','stage-order','stage-bool','source','manifest','provider','extra','reserve'])
+def test_v2_exact_immutable_envelope(config,tmp_path,fault):
+    env,_=released_config(config,tmp_path);pool=plan(config)['pool']
+    validate_envelope(env,pool,config['manifest_sha256'],'f'*40)
+    if fault=='schema':env['schema']=True
+    elif fault=='cap':env['participants']['M1']['total']=885
+    elif fault=='stage-order':env['participants']['M1']['stages'].reverse()
+    elif fault=='stage-bool':env['participants']['M1']['stages'][0]['max']=True
+    elif fault=='source':env['participants']['M1']['source_sha']='a'*40
+    elif fault=='manifest':env['common_manifest_sha256']='a'*64
+    elif fault=='provider':env['provider_session']='other'
+    elif fault=='extra':env['own_completed_upper']=248
+    elif fault=='reserve':env['terminal_recovery_reserve']=128
+    with pytest.raises(ValueError):validate_envelope(env,pool,config['manifest_sha256'],'f'*40)
+
+
+def test_v2_admission_corrected_interleave_and_once_only_claim(config,tmp_path,monkeypatch):
+    import scenario_admission
+    env,state=released_config(config,tmp_path)
+    ledger=PhaseLedger(tmp_path/'ledger','0'*64,env,plan(config)['pool'],config['source_manifest_sha256'])
+    monkeypatch.setattr(scenario_admission,'phase_ledger',lambda *_:ledger)
+    state['operation_records']=324
+    assert validate_admission(config,state)['normal_records_bound']==248
+    ledger.claim('two',324,'c'*64)
+    with pytest.raises(ValueError,match='already claimed'):ledger.claim('two',324,'d'*64)
+    with pytest.raises(OSError):ledger.check('four',324)
+    with pytest.raises(PermissionError):validate_admission(config,state)
+
+
+@pytest.mark.parametrize('scope',['CPU-ORCHESTRATION-ONLY','NOT-RUN','real-runtime-captured-pending-review'])
+def test_v2_fake_host_or_shallow_report_cannot_advance(config,tmp_path,scope):
+    env,_=released_config(config,tmp_path)
+    ledger=PhaseLedger(tmp_path/'ledger','0'*64,env,plan(config)['pool'],config['source_manifest_sha256'])
+    ledger.claim('two',312,'c'*64)
+    report={'phase_identity':ledger.identity('two'),'scope':scope,'status':'CAPTURED-PENDING-REVIEW',
+        'M1_line_retired':False,'pool_destroyed':False,'plan':plan(config),'cleanup':{'CPU_only':True}}
+    with pytest.raises((ValueError,KeyError)):ledger.close('two',report,tmp_path/'fake.json')
+    assert not (ledger.root/'two.closed.json').exists()
+
+
+def closure_metadata_fixture(config,env):
+    """Synthetic typed metadata ONLY, to exercise the validator without any runtime."""
+    report=asyncio.run(orchestrate(config,FakeTransport()))
+    report['scope']='real-runtime-captured-pending-review';report['status']='CAPTURED-PENDING-REVIEW'
+    snapshot=json.loads((FIXTURE/'uf-snapshot.json').read_text());pool=snapshot['pools'][0]
+    sessions=[row['client_session'] for row in pool['clients'][:4]]
+    starts={};stops={};births={}
+    for index,name in enumerate(['cold0','cold1','shared0','shared1']):
+        pid=7000+index;worker=8000+index;births[str(pid)]=births[str(worker)]=True
+        startup={'worker_epoch':'test-'+name,'pool_identity':{'client_session':sessions[index-2]}} if index>=2 else None
+        starts[name]={'pid':pid,'worker_pid':worker,'birth':'CPU-only-birth','descendant_births':{str(worker):'CPU-only-child'},
+            'startup':startup}
+        stops[name]={'actor_pid':pid,'worker_pid':worker,'stop_ok':True,
+            'shutdown_report':{'cleanup_error':None,'worker_reaped':True},
+            'native_stop_proof':{'worker_epoch':'test-'+name,'module_drained':True,
+                'owner_drained_arguments_released':True,'jobs':0,'steps':0,'controls':0,'retiring':0}}
+    report['cleanup']={'model_startups':starts,'model_stops':stops,'all_own_sessions_actual_Unmapped':sessions,
+        'actual_common_snapshot':snapshot,'original_births_gone':births,'reservations_released':True,
+        'directory_socket_absent':True,'listeners_closed':True,
+        'devices':[{'fds':{'users':[],'denied':[]},'status':{'health':'OK'}} for _ in range(2)]}
+    return report
+
+
+@pytest.mark.parametrize('fault',[None,'source','native','worker','child','lease','fd','birth','counter','config','host-scope'])
+def test_v2_full_closure_validation_and_phase_progression(config,tmp_path,fault):
+    env,_=released_config(config,tmp_path)
+    ledger=PhaseLedger(tmp_path/'ledger','0'*64,env,plan(config)['pool'],config['source_manifest_sha256'])
+    ledger.claim('two',312,plan(config)['config_sha256'])
+    report=closure_metadata_fixture(config,env);report['phase_identity']=ledger.identity('two')
+    cleanup=report['cleanup'];pool=cleanup['actual_common_snapshot']['pools'][0]
+    if fault=='source':report['phase_identity']['source_sha']='a'*40
+    elif fault=='native':cleanup['model_stops']['shared0']['native_stop_proof']['module_drained']=False
+    elif fault=='worker':cleanup['model_stops']['cold0']['shutdown_report']['worker_reaped']=False
+    elif fault=='child':pool['clients'][0]['children']=[{'unknown':False}]
+    elif fault=='lease':pool['ranges']['leases']=[{'client_session':cleanup['all_own_sessions_actual_Unmapped'][0]}]
+    elif fault=='fd':cleanup['devices'][0]['fds']['users']=[{'pid':123}]
+    elif fault=='birth':cleanup['original_births_gone'].pop('8000')
+    elif fault=='counter':cleanup['actual_common_snapshot']['operation_records']=311
+    elif fault=='config':report['plan']['config_sha256']='a'*64
+    elif fault=='host-scope':report['scope']='CPU-ORCHESTRATION-ONLY'
+    if fault:
+        with pytest.raises((ValueError,KeyError)):ledger.close('two',report,tmp_path/'report.json')
+        assert not (ledger.root/'two.closed.json').exists()
+    else:
+        ledger.close('two',report,tmp_path/'report.json')
+        result=ledger.check('four',324)
+        assert result['own_completed_upper']==248 and result['own_remaining_upper']==636
+        ledger.claim('four',324,'c'*64)
+        with pytest.raises(ValueError,match='already claimed'):ledger.check('four',324)
+        # Corrupting a once-sealed original report cannot confer C=248 later.
+        (tmp_path/'report.json').write_text('{}')
+        with pytest.raises(ValueError,match='hash'):ledger.prior('done')
 
 
 def test_missing_reset_or_accepted_only_output_cannot_pass():

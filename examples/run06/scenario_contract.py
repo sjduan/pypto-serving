@@ -54,7 +54,7 @@ def operation_budget(replicas):
     return {'schema': 1, 'replicas': replicas, 'shared_requests': requests,
         'cold_native_disabled_requests': replicas * (WARMUP + MEASURED),
         'new_journal_records_by_path': rows, 'normal_records_bound': total,
-        'normal_cleanup_already_included': True, 'terminal_recovery_headroom_at8192': 128,
+        'normal_cleanup_already_included': True, 'terminal_recovery_headroom_at8192': 256,
         'required_shared_record_allowance': total,
         'first_failure': 'stop all new admissions, retain actual owner/child/lease; no new-ID retry or replacement',
         'admission_stops_at_ALL_record_count': 4096, 'cleanup_stops_at_ALL_record_count': 8192,

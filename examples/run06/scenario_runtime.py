@@ -21,7 +21,7 @@ import time
 import traceback
 
 from scenario_contract import digest, save, validate
-from scenario_admission import observe, validate_admission, validate_release, verify_source_closure
+from scenario_admission import observe, phase_ledger, validate_admission, validate_release, verify_source_closure
 
 
 class ProcessTransport:
@@ -29,15 +29,16 @@ class ProcessTransport:
 
     def __init__(self, config, config_path):
         self.config,self.config_path=config,str(Path(config_path).resolve())
-        self.root=Path(config['root']);self.models={};self.started={};self.sessions=[]
+        self.root=Path(config['root']);self.models={};self.started={};self.stopped={};self.sessions=[]
         self.held=ExitStack();self.sequence=0;self.directory=self.observer=None
         self.logs={};self.listeners={};self.owned_births={};self.commands=[];self.reserved=False
         self.manifest=validate(config)[2]
 
     async def admit(self, config, prepared):
-        validate_release(config)
+        envelope=validate_release(config)
+        self.ledger=phase_ledger(config,envelope);self.phase='two' if config['replicas']==2 else 'four'
+        self.ledger.prior(self.phase)
         import fcntl
-        from scenario_admission import file_hash
         self.root.mkdir();(self.root/'logs').mkdir()
         sys.path[:0]=[self.manifest['helper_root'],str(Path(__file__).resolve().parents[1]/'run02'),
                        str(Path(__file__).resolve().parents[1]/'run04')]
@@ -46,19 +47,13 @@ class ProcessTransport:
             source=await asyncio.to_thread(verify_source_closure,config)
         fresh=await asyncio.to_thread(observe,config,self.root)
         validate_admission(config,fresh);save(self.root/'admission-before-locks.json',fresh)
-        if config['replicas']==4:
-            prior=config['device_release'].get('two_instance_evidence')
-            if not prior or file_hash(prior['path'])!=prior['sha256']:
-                raise PermissionError('four-model stage requires sealed two-instance functional evidence first')
-            previous=json.loads(Path(prior['path']).read_text())
-            if (previous['scope']!='real-runtime-captured-pending-review' or previous['status']!='CAPTURED-PENDING-REVIEW'
-                    or previous['plan']['budget']['replicas']!=2 or previous['plan']['pool']!=prepared['pool']
-                    or previous['plan']['source_manifest_sha256']!=prepared['source_manifest_sha256']):
-                raise PermissionError('two-instance prerequisite is not real completed original-pool evidence')
         for d in config['devices']:
             stream=self.held.enter_context(Path(f"/workspace/uflow/locks/run02-npu-{d['physical']}.lock").open('a+'))
             fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB)
         locked=await asyncio.to_thread(observe,config,self.root);validate_admission(config,locked)
+        # Exclusive immutable marker precedes reservations, SDK registration and
+        # Worker creation. Failure keeps this claim; changing the run root cannot retry it.
+        self.ledger.claim(self.phase,locked['operation_records'],prepared['config_sha256'])
         from pypto_serving.serving.native_ddr.managed_process import process_birth
         from session_protocol import request
         self.parent_birth=process_birth(os.getpid())
@@ -358,6 +353,7 @@ class ProcessTransport:
             session=self.started[name]['startup']['pool_identity']['client_session'];check_retired(pool,[session])
             save(self.root/(name+'-actual-SDK-unmapped.json'),{'session':session,'pool':pool,'worker_stop':result})
         self.models.pop(name)
+        self.stopped[name]=result
         return result
 
     async def stop_directory(self):
@@ -373,6 +369,9 @@ class ProcessTransport:
         if any(process_birth(pid)==birth for pid,birth in self.owned_births.items()):raise RuntimeError('owned actor birth remains')
         save(self.root/'commands.json',self.commands)
         result={'all_own_sessions_actual_Unmapped':self.sessions,'actual_common_snapshot':state['snapshot'],
+            'model_startups':self.started,'model_stops':self.stopped,
+            'original_births_gone':{str(pid):process_birth(pid)!=birth for pid,birth in self.owned_births.items()},
+            'directory_socket_absent':not (self.root/'d.sock').exists(),'listeners_closed':not self.listeners,'devices':[],
             'M1_line_retired':False,'common_pool_finalized':False,'B_retained_bytes':134217728,'A_historical_bytes':134217728}
         from r_guard import snapshot
         for device in self.config['devices']:
@@ -380,10 +379,16 @@ class ProcessTransport:
             if final['fds']['users'] or final['fds']['denied'] or final['status']['health']!='OK':
                 raise RuntimeError('own physical device FD/health cleanup not proved')
             save(self.root/('final-device-'+str(device['physical'])+'.json'),final)
+            result['devices'].append(final)
         request(self.manifest,'reserve-devices',line='M1',reservations=[])
         self.reserved=False
         self.held.close()
+        result['reservations_released']=True
         return result
+
+    async def publish_closed(self,report):
+        report['phase_identity']=self.ledger.identity(self.phase)
+        self.ledger.close(self.phase,report,self.root/'phase-evidence.json')
 
     async def retain(self,error,report):
         if not (self.models or self.directory or self.observer or self.reserved):

@@ -293,7 +293,17 @@ class ModelActor:
         worker_pid = self.core._worker_process.pid
         ok = await self.engine.stop()
         if not ok:raise RuntimeError('normal model stop retained obligations')
+        proof=None
+        if self.shared:
+            proof={'worker_epoch':self.coord.worker_epoch,'module_drained':self.coord.drained,
+                   'owner_drained_arguments_released':self.coord.stopped,
+                   'jobs':len(self.coord.jobs),'steps':len(self.coord.steps),
+                   'controls':len(self.coord.controls),'retiring':len(self.coord.retiring)}
+            if (not proof['module_drained'] or not proof['owner_drained_arguments_released']
+                    or any(proof[k] for k in ('jobs','steps','controls','retiring'))):
+                raise RuntimeError('actual native owner/argument closure absent')
         return {'stop_ok': ok, 'shutdown_report': self.core.shutdown_report,
+                'native_stop_proof':proof,
                 'worker_pid': worker_pid, 'actor_pid': os.getpid(), 'shared': self.shared}
 
 
