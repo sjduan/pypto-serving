@@ -43,10 +43,10 @@ def committed_from_wire(value):
 
 
 class DirectoryAuthority:
-    def __init__(self, descriptor, blocks, snapshot, query):
+    def __init__(self, descriptor, blocks, snapshot, confirm):
         if not 1 <= len(blocks) <= 4 or len(set(blocks)) != len(blocks):
             raise ValueError('shared directory requires one to four actual preallocated blocks')
-        self.descriptor, self.blocks, self.snapshot, self.query = descriptor, tuple(blocks), snapshot, query
+        self.descriptor, self.blocks, self.snapshot, self.confirm = descriptor, tuple(blocks), snapshot, confirm
         intervals = sorted((b.byte_offset, b.byte_offset + b.nbytes) for b in blocks)
         if any(a[1] > b[0] for a, b in zip(intervals, intervals[1:])):
             raise ValueError('shared allocation intervals overlap')
@@ -98,15 +98,15 @@ class DirectoryAuthority:
                    and s['content_version'] == value.content_version for s in block['segments'])
 
     def committed(self, key, value):
+        opaque(value.operation_id, 'original writer operation provenance')
+        opaque(value.writer_lease_id, 'original writer lease provenance')
         pool = self.current()
         if not self.valid(pool, key, value):
             raise ValueError('publication is not the current exact UFlow committed content')
-        receipt = self.query(value.operation_id)
-        expected = {'committed': True, 'content_version': value.content_version,
-                    'content_id': value.content_id, 'lease_id': value.writer_lease_id}
-        if (receipt['state'] != 'Completed' or receipt['response']['operation_id'] != value.operation_id
-                or receipt['response']['status'] != 'ok' or receipt['response']['result'] != expected):
-            raise ValueError('publication lacks the original completed SDK commit receipt')
+        confirmation = self.confirm(key, value)
+        if not self.valid(self.current(), key, value):
+            raise ValueError('committed version changed after the independent SDK reader confirmation')
+        return confirmation
 
 
 class SharedPrefixDirectory:
@@ -164,9 +164,10 @@ class SharedPrefixDirectory:
             intent = self.intents.get(key)
             if intent is None or (intent['owner'], intent['block']) != (owner, content.block):
                 raise ValueError('publication has no exact key/owner/allocation intent')
-            self.authority.committed(key, content)
+            confirmation = self.authority.committed(key, content)
             self.revision += 1
-            self.records[key] = {'owner': owner, 'content': content, 'revision': self.revision}
+            self.records[key] = {'owner': owner, 'content': content, 'revision': self.revision,
+                                 'SDK_confirmation': confirmation}
             del self.intents[key]
             return asdict(content)
 
@@ -190,6 +191,14 @@ class SharedPrefixDirectory:
                 return {'epoch': self.epoch, 'capacity': len(self.authority.blocks),
                         'records': len(self.records), 'intents': len(self.intents), 'revision': self.revision,
                         'descriptor': self.authority.descriptor, 'blocks': [asdict(b) for b in self.authority.blocks]}
+        if op == 'snapshot' and set(request) == {'epoch', 'op'}:
+            with self._lock:
+                self.authority.current()
+                return {'epoch': self.epoch, 'revision': self.revision,
+                    'records': [{'key': key_wire(k), 'content': asdict(r['content']),
+                                 'SDK_confirmation': r['SDK_confirmation']} for k, r in self.records.items()],
+                    'intents': [{'key': key_wire(k), 'owner': r['owner'], 'block': asdict(r['block'])}
+                                for k, r in self.intents.items()]}
         if op == 'discover' and set(request) == {'epoch', 'op', 'keys'}:
             return self.discover([key_from_wire(k) for k in request['keys']])
         if op in ('claim', 'cancel') and set(request) == {'epoch', 'op', 'key', 'owner'}:

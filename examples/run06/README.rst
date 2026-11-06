@@ -8,8 +8,12 @@ authority. The four M1 slots are actual preallocated 22MiB ranges: a 2MiB guard
 and a 20MiB Qwen KV payload each. Each service maps the same 128MiB backing.
 
 The explicitly configured shared directory stores at most four canonical keys
-and four publication intents. A real committed SDK operation receipt and current
-snapshot are required before publication. Discovering a descriptor grants no
+and four publication intents. Current UF snapshot metadata and an independent
+real SDK reader/revalidation/release receipt are required before publication.
+Writer operation IDs are provenance, not cross-process access capabilities;
+the accepted journal scopes their queries to the original peer PID.
+The directory maps the common pool only to obtain these metadata-only read
+promises; it neither reads nor transports KV payloads. Discovering a descriptor grants no
 read access: the worker imports it through the original replay/epoch-controlled
 interface, obtains a current reader, releases that reader, then reacquires and
 revalidates the exact version before native LOAD. Local HBM hits take priority.

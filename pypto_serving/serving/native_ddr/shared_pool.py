@@ -9,10 +9,12 @@
 """Ordinary accepted-SDK validation; no create/destroy/admin capability."""
 import json
 import hashlib
+from dataclasses import asdict
 from pathlib import Path
 import socket
+import uuid
 
-from .managed_pool import PoolBlock
+from .managed_pool import PoolBlock, prefix_content_id
 from .shared_directory import DirectoryAuthority
 
 
@@ -64,11 +66,11 @@ def load_bindings(path, access):
     if any(actual[k] != expected[k] for k in expected):
         raise ValueError('registered access differs from the sealed common pool descriptor')
     DirectoryAuthority(expected, blocks, access.port.client.snapshot,
-                       lambda operation: sdk.query_pool_operation(access.port.client.endpoint, operation))
+                       lambda key, value: None)
     return blocks
 
 
-def sdk_authority(endpoint, document):
+def sdk_authority(endpoint, document, access):
     from .managed_pool_sdk import accepted_sdk
     sdk = accepted_sdk()
     expected, blocks = bindings_document(document)
@@ -76,7 +78,19 @@ def sdk_authority(endpoint, document):
     fresh = sdk.describe_pool(endpoint, descriptor['pool_id'], descriptor['pool_epoch'])
     if fresh != descriptor:
         raise ValueError('common pool description changed before directory startup')
+    def confirm(key, content):
+        # Operation IDs are peer/PID scoped in the accepted UF journal. A
+        # different directory PID must not pretend that a NotFound query is a
+        # missing commit. Independently acquire the current real reader instead.
+        content.validate(access.identity, content_id=prefix_content_id(key))
+        lease = access.acquire(content.block, 'r', committed=content, reject_stale=True)
+        access.port.revalidate(lease)
+        ack = access.complete_read(lease, uuid.uuid4().hex)
+        return {'lease_id': lease.lease_id, 'lease_generation': lease.lease_generation,
+                'byte_offset': lease.byte_offset, 'nbytes': lease.nbytes,
+                'content_version': lease.content_version, 'content_id': lease.content_id,
+                'release_ack': asdict(ack), 'payload_read_or_transferred': False}
     return DirectoryAuthority(descriptor, blocks,
         lambda: sdk._exchange(endpoint, 'GetManagedPoolSnapshot',
                              {k: descriptor[k] for k in ('pool_id', 'pool_epoch', 'provider_session')})[0],
-        lambda operation: sdk.query_pool_operation(endpoint, operation))
+        confirm)

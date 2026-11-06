@@ -45,7 +45,12 @@ class SyntheticAuthority:
                               'creation_reserved_bytes': 0, 'pools': [self.pool]})
 
     def authority(self):
-        return DirectoryAuthority(self.descriptor, self.blocks, self.snapshot, lambda op: self.operations[op])
+        def confirm(key, value):
+            result = self.operations[value.operation_id]
+            if result['state'] != 'Completed':
+                raise ValueError('synthetic reader confirmation unavailable')
+            return {'synthetic_control_only': True}
+        return DirectoryAuthority(self.descriptor, self.blocks, self.snapshot, confirm)
 
     def commit(self, key, block, version=1):
         value = CommittedRange('pool', 'epoch', 'provider', block, block.byte_offset + GUARD_BYTES,
@@ -77,7 +82,7 @@ def test_commit_is_invisible_until_atomic_validated_publication_and_survives_pro
     assert directory.claim(key(1), 'another-producer')['state'] == 'Committed'
 
 
-@pytest.mark.parametrize('fault', ['half-write', 'version', 'writer', 'receipt', 'range', 'provider', 'allocation'])
+@pytest.mark.parametrize('fault', ['half-write', 'version', 'empty-writer', 'receipt', 'range', 'provider', 'allocation'])
 def test_forged_or_half_written_publication_never_becomes_discoverable(fault):
     uf = SyntheticAuthority()
     directory = SharedPrefixDirectory('directory-epoch', uf.authority())
@@ -87,8 +92,8 @@ def test_forged_or_half_written_publication_never_becomes_discoverable(fault):
         uf.pool['ranges']['allocations'][0]['segments'][0]['state'] = 'Writing'
     elif fault == 'version':
         content = replace(content, content_version=2)
-    elif fault == 'writer':
-        content = replace(content, writer_lease_id='not-the-original-writer')
+    elif fault == 'empty-writer':
+        content = replace(content, writer_lease_id='')
     elif fault == 'receipt':
         uf.operations[content.operation_id]['state'] = 'Unknown'
     elif fault == 'range':

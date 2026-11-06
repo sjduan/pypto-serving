@@ -87,7 +87,8 @@ def write_prefix(access, directory, index, byte):
     assert directory.publish(k, owner, committed) == committed
     access.host_intents.remove((k, owner))
     return {'key': [k.namespace_digest.hex(), k.block_hash.hex()], 'content': asdict(committed),
-            'sha256': hashlib.sha256(data).hexdigest(), 'byte': byte}
+            'sha256': hashlib.sha256(data).hexdigest(), 'byte': byte,
+            'original_peer_query': access.port.client.query_operation(committed.operation_id)}
 
 
 def guards(access, bindings):
@@ -174,6 +175,11 @@ def controller(args):
                 assert producer.wait(timeout=60) == 0
             producer_result = json.loads((root / 'producer-result.json').read_text())
             assert producer_result['sdk_unmapped']  # actual producer is already gone before consumer registration
+            from pypto_serving.serving.native_ddr.managed_pool_sdk import accepted_sdk
+            first_op = producer_result['prefixes'][0]['content']['operation_id']
+            cross_peer_query = accepted_sdk().query_pool_operation(manifest['endpoint'], first_op)
+            assert producer_result['prefixes'][0]['original_peer_query']['state'] == 'Completed'
+            assert cross_peer_query == {'state': 'NotFound', 'response': None}
             for index in range(2):
                 output = (root / f'reader-{index}.stderr').open('xb')
                 reader_logs.append(output)
@@ -197,7 +203,9 @@ def controller(args):
             third = write_prefix(access, DirectoryClient(args.endpoint, args.epoch), 3, 173)
             save(root / 'concurrent-real-authority.json', {'two_same_version_readers': ready,
                  'snapshot_with_two_real_readers': pool, 'overlapping_writer_rejected': conflict,
-                 'different_range_write_committed_while_readers_live': third, 'producer_exited_before_readers': True})
+                 'different_range_write_committed_while_readers_live': third, 'producer_exited_before_readers': True,
+                 'different_peer_cannot_query_original_operation': cross_peer_query,
+                 'directory_independent_SDK_reader_confirmations': DirectoryClient(args.endpoint, args.epoch).call('snapshot')})
         finally:
             for reader in readers:
                 if reader.poll() is None:
