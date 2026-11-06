@@ -155,7 +155,8 @@ class ModelActor:
             request_id = self.engine.generate_request_id()
             async for output in self.engine.add_request(request_id, text, self.generation):
                 outputs.append({'time_ns': time.monotonic_ns(), **asdict(output)})
-            record = {'prompt_token_ids': self.engine.tokenizer.encode(text), 'outputs': outputs}
+            record = {'name': request_id, 'generate_config': asdict(self.generation),
+                      'prompt_token_ids': self.engine.tokenizer.encode(text), 'outputs': outputs}
             ids = validate_output(record)
             if self.engine.tokenizer.decode(ids) != outputs[-1]['text']:
                 raise ValueError('decoded output differs from emitted token IDs')

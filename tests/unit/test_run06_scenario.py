@@ -342,6 +342,51 @@ def test_actor_start_without_release_does_not_import_runtime_or_register(config,
     assert not (tmp_path/'not-created').exists()
 
 
+@pytest.mark.parametrize('mismatched_stream', [False, True])
+def test_actual_actor_direct_request_passes_complete_record_to_real_output_validator(config,tmp_path,monkeypatch,mismatched_stream):
+    """CPU stream fixture exercises the real actor and Run02 validator contract."""
+    import ast
+    from dataclasses import dataclass
+    from types import ModuleType,SimpleNamespace
+    from model_actor import ModelActor
+    from pypto_serving.config.types import GenerateConfig
+    # Execute the actual pure validator definition without the harness's Linux
+    # fcntl import. Its source/body is unchanged on Windows and Linux.
+    validator_path=RUN06.parent/'run02/m2_baseline.py'
+    tree=ast.parse(validator_path.read_text());function=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='validate_output')
+    module=ModuleType('m2_baseline')
+    exec(compile(ast.Module(body=[function],type_ignores=[]),str(validator_path),'exec'),module.__dict__)
+    monkeypatch.setitem(sys.modules,'m2_baseline',module)
+    actor=ModelActor(config,0,False,tmp_path/'not-started')
+    actor.generation=GenerateConfig(max_new_tokens=2,min_tokens=2,temperature=0.0,seed=0,stream=True)
+    actor.coord=None;actor.device=config['devices'][0]
+    async def idle():pass
+    actor.idle=idle;actor.usage=lambda:{'CPU_fixture_only':True}
+    @dataclass
+    class Output:
+        finished:bool
+        finish_reason:str|None
+        token_ids:tuple[int,...]
+        token_id:int|None
+        text:str
+        text_delta:str
+        completion_tokens:int
+        prompt_tokens:int=257
+    async def stream(request_id,text,generation):
+        actor.schedule.append({'request_id':request_id,'is_prefill':True,'tokens':257})
+        yield Output(False,None,(10,),10,'A','A',1)
+        yield Output(True,'FINISHED_LENGTH',(10,11),12 if mismatched_stream else 11,'AB','B',2)
+    actor.engine=SimpleNamespace(generate_request_id=lambda:'CPU-only-request',add_request=stream,
+        tokenizer=SimpleNamespace(encode=lambda text:list(range(257)),decode=lambda ids:'AB'))
+    if mismatched_stream:
+        with pytest.raises(AssertionError,match='Stream/final token data mismatch: CPU-only-request'):
+            asyncio.run(actor.request('CPU-only prompt'))
+    else:
+        row=asyncio.run(actor.request('CPU-only prompt'))
+        assert row['generate_config']['max_new_tokens']==2 and row['prefill_tokens']==257
+        assert row['outputs'][-1]['token_ids']==(10,11) and row['loads']==row['stores']==[]
+
+
 def test_cancelled_inflight_transport_preserves_owner_without_cleanup(config):
     class Cancelled(FakeTransport):
         async def call(self,name,op,**values):
