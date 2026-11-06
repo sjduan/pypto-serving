@@ -40,9 +40,13 @@ def load(path):
 
 
 def save(path, value):
+    def encode(item):
+        if isinstance(item, Path):
+            return str(item)
+        raise TypeError(f'unsupported evidence value type: {type(item).__qualname__}')
+    encoded = json.dumps(value, indent=2, sort_keys=True, default=encode) + '\n'
     with Path(path).open('x', encoding='utf-8') as stream:
-        json.dump(value, stream, indent=2, sort_keys=True)
-        stream.write('\n')
+        stream.write(encoded)
 
 
 def digest(value):
@@ -60,6 +64,12 @@ def validate_config(config):
     files = config['assets']
     if set(files) != ASSETS or any(not re.fullmatch('[0-9a-f]{64}', value) for value in files.values()):
         raise ValueError('exactly twelve complete model asset hashes are required')
+    extra = config.get('additional_assets', {})
+    if (type(extra) is not dict or len(extra) > 32 or set(extra) & ASSETS
+            or any(not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(json|txt|model)', name)
+                or not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value)
+                for name, value in extra.items())):
+        raise ValueError('additional model assets must be separately sealed bounded file hashes')
     deployment = config['expected_deployment']
     if set(deployment) != DEPLOYMENT:
         raise ValueError('incomplete source/binary/loaded deployment manifest')
@@ -183,9 +193,10 @@ def check_startup(config, startup, descriptor):
             or compat['deployment'] != config['expected_deployment']):
         raise ValueError('actual loaded source/binary/owner compatibility differs from sealed config')
     files = compat['assets']['files']
-    if (set(files) != ASSETS or any(row.get('sha256') != config['assets'][name]
+    expected_assets = {**config['assets'], **config.get('additional_assets', {})}
+    if (set(files) != set(expected_assets) or any(row.get('sha256') != expected_assets[name]
             or row.get('evidence') != 'full-asset-content-at-startup' for name, row in files.items())):
-        raise ValueError('model startup did not fully verify the twelve sealed assets')
+        raise ValueError('model startup assets differ from the twelve mandatory plus sealed additional assets')
     pool = startup['pool_identity']
     if any(pool[key] != descriptor[key] for key in ('pool_id', 'pool_epoch', 'provider_session', 'nbytes')):
         raise ValueError('loaded owner mapped a different UFlow resource')
@@ -193,7 +204,7 @@ def check_startup(config, startup, descriptor):
         raise ValueError('loaded physical UFlow mapping changed')
     # Recompute the production content namespace without importing production.
     layout = {key: value for key, value in compat['layout'].items() if key != 'num_pages'}
-    data = {'schema': 1, 'model': compat['model'], 'asset_content': config['assets'],
+    data = {'schema': 1, 'model': compat['model'], 'asset_content': expected_assets,
             'tokenizer_type': compat['tokenizer_type'], 'adapter': compat['adapter'],
             'position': compat['position'], 'layout': layout, 'tensor_parallel': compat['tensor_parallel'],
             'deployment': compat['deployment']}

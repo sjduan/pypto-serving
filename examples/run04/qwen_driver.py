@@ -16,6 +16,16 @@ from qwen_contract import (CASES, cli_arguments, execution_identity, load, plan,
                            require_B_execution, require_release, save, validate_config)
 
 
+def record_first_failure(path, report):
+    """Never replace the original failure with a rich-report serialization error."""
+    try:
+        save(path, report)
+    except (TypeError, ValueError) as error:
+        save(path, {'original_error': str(report.get('error', 'unknown original failure')),
+                    'report_serialization_error': repr(error), 'rich_report_saved': False,
+                    'scope': 'first exception retained; not a stopped/native/SDK receipt'})
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('plan', 'check', 'run', 'consumer'))
@@ -399,7 +409,7 @@ def consumer(args, config):
         report['passed'], report['error'] = False, traceback.format_exc()
         # Legacy report writer is mutable progress; the first failure is sealed
         # separately before another assertion or shutdown-report interpretation.
-        save(args.output.parent / 'first-failure.json', report)
+        record_first_failure(args.output.parent / 'first-failure.json', report)
         live = [p for p in multiprocessing.active_children() if p.is_alive()]
         if live:
             save(args.output.parent / 'retained-live-failure.json', {'pid': os.getpid(),

@@ -14,6 +14,9 @@ Inputs and host commands
 
 The B sealed configuration has schema 2, the twelve full Qwen3-14B asset
 hashes, exact source/binary deployment expectations, frozen dependency pins,
+and separately sealed hashes for any additional model configuration/vocabulary
+files present. All of them remain part of the actual loaded content namespace;
+unlisted additions, missing assets or changed hashes fail startup. There are
 five 20MiB logical slots, B10, and two normal rounds. It binds B's hostname,
 boot ID and PID namespace to the independent human release record. No A snapshot
 is required. B has at most four pool-history records. Original schema 1 plans

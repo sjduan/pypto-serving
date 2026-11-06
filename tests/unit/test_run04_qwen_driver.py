@@ -363,6 +363,37 @@ def test_loaded_startup_binds_full_assets_deployment_pool_and_namespace():
     contract.check_startup(config, startup, descriptor)
 
 
+def test_extra_model_files_must_be_sealed_and_remain_part_of_the_loaded_namespace():
+    config, startup, descriptor = startup_fixture()
+    extra = {'generation_config.json': 'e' * 64, 'vocab.json': 'f' * 64}
+    config['additional_assets'] = extra
+    for name, digest in extra.items():
+        startup['compatibility_json']['assets']['files'][name] = {
+            'sha256': digest, 'evidence': 'full-asset-content-at-startup'}
+    with pytest.raises(ValueError, match='namespace'):
+        contract.check_startup(config, startup, descriptor)
+    compat = startup['compatibility_json']
+    data = {'schema': 1, 'model': compat['model'], 'asset_content': {**config['assets'], **extra},
+            'tokenizer_type': compat['tokenizer_type'], 'adapter': None, 'position': compat['position'],
+            'layout': {k: v for k, v in compat['layout'].items() if k != 'num_pages'}, 'tensor_parallel': 1,
+            'deployment': config['expected_deployment']}
+    startup['namespace_digest'] = contract.digest(data)
+    contract.check_startup(config, startup, descriptor)
+    del config['additional_assets']
+    with pytest.raises(ValueError, match='additional assets'):
+        contract.check_startup(config, startup, descriptor)
+
+
+def test_evidence_serializes_paths_and_rejects_unknown_values_before_creating_partial_files(tmp_path):
+    target = tmp_path / 'failure.json'
+    contract.save(target, {'engine': {'output': tmp_path / 'profile'}, 'original_error': 'startup asset mismatch'})
+    assert contract.load(target)['engine']['output'] == str(tmp_path / 'profile')
+    other = tmp_path / 'must-not-be-partial.json'
+    with pytest.raises(TypeError):
+        contract.save(other, {'unsupported': object()})
+    assert not other.exists()
+
+
 @pytest.mark.parametrize('fault', ['asset-payload', 'header-only', 'binary', 'pool', 'epoch', 'namespace'])
 def test_loaded_compatibility_refuses_changed_or_weaker_evidence(fault):
     config, startup, descriptor = startup_fixture()

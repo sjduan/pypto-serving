@@ -49,6 +49,14 @@ def test_B_plan_uses_no_A_snapshot_and_keeps_historical_charge_floor():
     contract.require_B_execution(b_configuration(), b_release(), B_ID)
 
 
+def test_first_error_record_survives_unexpected_rich_report_value(tmp_path):
+    path = tmp_path / 'first-error.json'
+    driver.record_first_failure(path, {'error': 'original submit exception and traceback', 'unsupported': object()})
+    result = contract.load(path)
+    assert result['original_error'] == 'original submit exception and traceback'
+    assert result['rich_report_saved'] is False and 'TypeError' in result['report_serialization_error']
+
+
 def test_B_plan_and_wrong_actual_host_run_tripwire_before_any_runtime_or_service(tmp_path):
     contract.save(tmp_path / 'config.json', b_configuration())
     release = {**b_release(), 'state': 'released_by_explicit_human', 'supersedes': contract.HOLD_ID,
