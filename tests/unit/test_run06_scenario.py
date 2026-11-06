@@ -192,6 +192,23 @@ def test_other_line_twelve_spent_is_not_double_counted_and_zero_is_not_drain():
     assert result['other_remaining_upper']==0 and result['not_a_resource_or_lease_grant'] is True
 
 
+def test_synthetic_manifest_v2_cannot_reuse_v1_runtime_envelope(config,tmp_path):
+    from scenario_admission import validate_release
+    released_config(config,tmp_path)
+    validate_release(config)
+    bindings=Path(config['bindings']);document=json.loads(bindings.read_text())
+    mf=Path(document['session_manifest']);manifest=json.loads(mf.read_text())
+    manifest['manifest_version']=2
+    manifest['controller_birth']={'pid':90000001,'starttime_ticks':90000002}
+    mf.write_text(json.dumps(manifest));new_sha=digest(mf.read_bytes())
+    document['source_manifest_sha256']=new_sha;bindings.write_text(json.dumps(document))
+    config['manifest_sha256']=new_sha;config['device_release']['manifest_sha256']=new_sha
+    # The new metadata itself is accepted, but the original immutable grant
+    # remains bound to the old public manifest and cannot authorize this domain.
+    assert plan(config)['status']=='NOT-RUN'
+    with pytest.raises(PermissionError,match='immutable shared mutation envelope'):validate_release(config)
+
+
 @pytest.mark.parametrize('fault',['schema','cap','stage-order','stage-bool','source','manifest','provider','extra','reserve'])
 def test_v2_exact_immutable_envelope(config,tmp_path,fault):
     env,_=released_config(config,tmp_path);pool=plan(config)['pool']

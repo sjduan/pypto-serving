@@ -59,7 +59,7 @@ def validate_partition(value, manifest):
         'controller_birth coordination coordination_root endpoint frozen_inputs group helper_root host host_alias '
         'manifest_version owner_births owner_root partitions pool_descriptor protocol provider_loaded schema state')
     if (type(manifest['schema']) is not int or manifest['schema'] != 1
-            or type(manifest['manifest_version']) is not int or manifest['manifest_version'] != 1
+            or type(manifest['manifest_version']) is not int or manifest['manifest_version'] not in (1, 2)
             or manifest['state'] != 'ready' or manifest['group'] != 'phasef-parallel-20261106'
             or manifest['group'] != value['resource_group']
             or manifest['host_alias'] != 'serving-b-sj' or manifest['container'] != 'openeuler-2403-DS'):
