@@ -157,12 +157,26 @@ def negatives(access, directory, old, root):
     assert directory.discover([cancel_key]) == ()
     fresh = write_prefix(access, directory, 6, 176)
     assert fresh['content']['block']['block_id'] == old.block.block_id
+    stale_releases = []
+    original_release = access.port.release
+    def observe_release(lease, operation):
+        result = original_release(lease, operation)
+        stale_releases.append({'original_R_grant': asdict(lease), 'original_SDK_release_ACK': asdict(result)})
+        return result
+    access.port.release = observe_release
     try:
         access.acquire(old.block, 'r', committed=old, reject_stale=True)
     except StaleCommittedRange as error:
         stale_rejection = str(error)
     else:
         raise AssertionError('a cached old content version admitted native access')
+    finally:
+        access.port.release = original_release
+    assert len(stale_releases) == 1
+    released = stale_releases[0]
+    assert released['original_R_grant']['content_version'] == fresh['content']['content_version']
+    assert released['original_SDK_release_ACK']['applied']
+    assert released['original_SDK_release_ACK']['lease_id'] == released['original_R_grant']['lease_id']
     assert not access.leases and not access.unknown
     assert directory.discover([PrefixKey(b'incompatible-namespace!!!!!!!!!!'[:32], key(6).block_hash)]) == ()
     intents = []
@@ -172,6 +186,7 @@ def negatives(access, directory, old, root):
         intents.append(candidate)
         access.host_intents.append(candidate)
     assert directory.claim(key(11), 'one-too-many')['state'] == 'Busy'
+    pressure_snapshot = directory.call('snapshot')
     for candidate in intents:
         directory.cancel(*candidate)
         access.host_intents.remove(candidate)
@@ -179,6 +194,8 @@ def negatives(access, directory, old, root):
         'half_write_snapshot': writing_snapshot, 'half_write_publication_rejected': half_rejection,
         'inflight_intent_cancel_rejected': inflight_rejection, 'not_started_W_actual_release_ACK': asdict(ack),
         'old_committed_version_rejected_after_real_current_R_release': stale_rejection,
+        'stale_current_R_grant_and_exact_original_release_ACK': stale_releases,
+        'cached_old_content': asdict(old), 'four_intent_pressure_snapshot': pressure_snapshot,
         'pressure_four_intents_then_Busy': True, 'incompatible_namespace_missed': True,
         'current_fresh_content': fresh})
 
