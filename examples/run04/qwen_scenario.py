@@ -186,7 +186,8 @@ async def normal(engine, core, collect, collect_trace, args, report, cold, warm)
                 'pool_after': after['pool'], 'sentinel_before': sentinel_before['pages'],
                 'sentinel_after': sentinel_after['pages']})
             from qwen_evidence import check_round
-            check_round(report['rounds'][-1], report, Path(args.output).parent, inspect_bytes=True)
+            check_round(report['rounds'][-1], report, Path(args.output).parent, inspect_bytes=True,
+                         raw_log=(args.output.parent.parent / 'logs/probe.log').read_text())
         finally:
             if held:
                 release(tuple(held))

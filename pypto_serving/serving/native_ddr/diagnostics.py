@@ -30,6 +30,20 @@ def capture_idle_pool(slots, root, label):
         raise RuntimeError('pool guard observation requires already idle managed access')
     if set(slots.child_registrations.items()) != set(access.children):
         raise RuntimeError('pool guard observation lost the actual inherited child registry')
+    retained = getattr(access.port, '_children', None)
+    sdk_retained = getattr(access.port.client, '_children', None)
+    birth_fields = {'pid', 'starttime_ticks', 'uid', 'gid', 'pid_namespace_dev', 'pid_namespace_ino'}
+    if (type(retained) is not dict or type(sdk_retained) is not dict or set(retained) != set(access.children)
+            or sdk_retained != {pid: birth for (pid, _), birth in retained.items()}):
+        raise RuntimeError('original SDK child birth registry differs from serving obligations')
+    def birth_identity(birth):
+        if (type(birth) is not dict or set(birth) != birth_fields
+                or any(type(v) is not int or v < 0 for v in birth.values())
+                or any(birth[k] <= 0 for k in ('pid', 'starttime_ticks', 'pid_namespace_dev', 'pid_namespace_ino'))):
+            raise RuntimeError('invalid original SDK process birth schema')
+        return birth['pid'], birth['starttime_ticks']
+    if any(birth_identity(birth) != key for key, birth in retained.items()):
+        raise RuntimeError('original SDK child birth key differs from retained registry')
     def snapshot():
         value = access.port.client.snapshot()
         pools = [p for p in value['pools'] if p['pool_id'] == access.identity.pool_id]
@@ -44,6 +58,23 @@ def capture_idle_pool(slots, root, label):
                 or not any(c['client_session'] == access.identity.client_session and c['state'] == 'Mapped'
                            for c in pool['clients'])):
             raise RuntimeError('pool guard observation has competing/unknown physical access')
+        clients = [c for c in pool['clients'] if c['client_session'] == access.identity.client_session]
+        if (len(clients) != 1 or clients[0]['closing'] is not False or clients[0]['access'] != 'rw'
+                or clients[0]['access_generation'] != access.identity.access_generation):
+            raise RuntimeError('current SDK client is closing or changed registered ownership')
+        client = clients[0]
+        birth_identity(client['birth'])
+        children = {}
+        for child in client['children']:
+            if set(child) != {'birth', 'unknown'} or child['unknown'] is not False:
+                raise RuntimeError('actual SDK child is Unknown or has an unexpected schema')
+            key = birth_identity(child['birth'])
+            if key in children or any(child['birth'][k] != client['birth'][k]
+                    for k in ('uid', 'gid', 'pid_namespace_dev', 'pid_namespace_ino')):
+                raise RuntimeError('duplicate child or foreign process namespace/credentials')
+            children[key] = child['birth']
+        if children != retained:
+            raise RuntimeError('actual public SDK children/births differ from original retained registry')
         return pool
     before = snapshot()
     path = Path(root) / (label + '-pool.bin')
@@ -62,6 +93,7 @@ def capture_idle_pool(slots, root, label):
             'scope': 'idle guard-only physical observation; not Committed prefix consumption',
             'child_registry_matches_sdk': set(slots.child_registrations.items()) == set(access.children),
             'registered_children': [list(key) for key in slots.child_registrations.items()],
+            'registered_child_births': [dict(birth) for birth in retained.values()],
             'helper_pids': list(slots.child_helpers)}
 
 

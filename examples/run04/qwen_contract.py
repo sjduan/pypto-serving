@@ -50,11 +50,13 @@ def digest(value):
 
 
 def validate_config(config):
-    if (config.get('schema') != 1 or config.get('pins') != PINS or config.get('sdk_sha256') != SDK_SHA
+    if (config.get('schema') not in (1, 2) or config.get('pins') != PINS or config.get('sdk_sha256') != SDK_SHA
             or config.get('cases') != list(CASES) or config.get('rounds') != 2
             or config.get('slots') != 5 or config.get('device') != 10
             or config.get('utilization') != .8 or config.get('model_dir') != '/data/models/Qwen/Qwen3-14B'):
         raise ValueError('configuration differs from sealed single-card Run04 contract')
+    if config['schema'] == 2:
+        validate_B_domain(config)
     files = config['assets']
     if set(files) != ASSETS or any(not re.fullmatch('[0-9a-f]{64}', value) for value in files.values()):
         raise ValueError('exactly twelve complete model asset hashes are required')
@@ -69,6 +71,19 @@ def validate_config(config):
     if set(deployment['native_backend']) != {'host_path', 'aicpu_path', 'aicore_path'}:
         raise ValueError('native binary identity missing')
     return config
+
+
+def validate_B_domain(config):
+    if (config.get('target_host') != 'serving-b-sj' or config.get('container') != 'openeuler-2403-DS'
+            or config.get('budget') != {'task_total_cap_bytes': 268435456,
+                'retained_A_charge_floor_bytes': 134217728, 'B_Catalog_hard_budget_cap_bytes': 134217728,
+                'B_normal_pool_bytes': 134217728, 'concurrent_new_B_pools_max': 1}
+            or config.get('pool_history_cap') != 4):
+        raise ValueError('B-only domain must retain A responsibility and a real 128MiB B hard cap')
+    identity = config.get('expected_execution_identity', {})
+    if set(identity) != {'hostname', 'boot_id', 'pid_namespace'} or any(not isinstance(s, str) or not s
+            for s in identity.values()):
+        raise ValueError('sealed B hostname/boot/pid namespace required')
 
 
 def cli_arguments(config, endpoint, pool_id, pool_epoch):
@@ -87,17 +102,24 @@ def cli_arguments(config, endpoint, pool_id, pool_epoch):
             '--native-ddr-sdk-sha256', SDK_SHA]
 
 
-def plan(config, snapshot):
+def plan(config, snapshot=None):
     validate_config(config)
-    check_catalog(snapshot, retained_pool(snapshot))
-    if len(snapshot['pools']) + len(CASES) > 8:
-        raise ValueError('four sequential normal pools would exceed retained Catalog history cap eight')
+    if config['schema'] == 1:
+        check_catalog(snapshot, retained_pool(snapshot))
+        if len(snapshot['pools']) + len(CASES) > 8:
+            raise ValueError('four sequential normal pools would exceed retained Catalog history cap eight')
+    elif snapshot is not None:
+        from b_session import check_b_catalog
+        check_b_catalog(snapshot, normal_id=None)
     return {'schema': 1, 'mode': 'plan', 'status': 'NOT-RUN', 'config_sha256': digest(config),
             'runtime_imported': False, 'device_admission': False, 'D1_acceptance': False,
             'layout': {'pool_bytes': POOL_BYTES, 'quarantine_charged_bytes': POOL_BYTES,
                        'global_cap_bytes': 2 * POOL_BYTES, 'slot_bytes': BLOCK_BYTES,
                        'guard_bytes_per_allocation': 2097152, 'slots': 5,
                        'token_starts': [0, 128], 'tokens_per_block': 128, 'layer_sides': 80},
+            'domain': ('new single B Catalog, A retained floor is historical responsibility only'
+                       if config['schema'] == 2 else 'original retained A Catalog (historical plan only)'),
+            'B_Catalog_cap_bytes': 134217728 if config['schema'] == 2 else None,
             'argv': cli_arguments(config, '<same-Catalog-endpoint>', '<normal-pool-id>', '<normal-pool-epoch>'),
             'cases': [{'name': name, 'status': 'NOT-RUN', 'depends_on': list(CASES[:index]),
                        'expected': ['catalog/normal-descriptor.json', 'resource-before.json',
@@ -125,6 +147,30 @@ def require_release(hold, release):
     if datetime.fromisoformat(release['recorded_at_utc'].replace('Z', '+00:00')) <= datetime.fromisoformat(
             hold['recorded_at_utc'].replace('Z', '+00:00')):
         raise PermissionError('historical release cannot supersede the current hold')
+
+
+def require_B_execution(config, release, actual):
+    validate_config(config)
+    if config['schema'] != 2:
+        raise PermissionError('historical A configuration cannot execute under B-only release')
+    expected = release.get('expected_B_execution_identity', {})
+    identity = {k: expected.get(k) for k in ('hostname', 'boot_id', 'pid_namespace')}
+    if (release.get('allowed_hosts') != ['serving-b-sj'] or release.get('forbidden_hosts') != ['serving-a-sj']
+            or release.get('A_device_and_remote_work_allowed') is not False
+            or release.get('container') != config['container'] or release.get('budget') != config['budget']
+            or config['expected_execution_identity'] != identity or actual != identity
+            or release.get('original_A_quarantine', {}).get('retained_charged_bytes') != 134217728
+            or release.get('original_A_quarantine', {}).get('fresh_A_status_not_queried') is not True):
+        raise PermissionError('actual machine/namespace or B-only release/budget differs; do not use A')
+
+
+def execution_identity():
+    """Local OS metadata only; called in run/consumer before any execution imports."""
+    import os
+    import socket
+    return {'hostname': socket.gethostname(),
+            'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'pid_namespace': os.readlink('/proc/self/ns/pid')}
 
 
 def check_startup(config, startup, descriptor):

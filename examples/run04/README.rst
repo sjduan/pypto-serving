@@ -1,9 +1,10 @@
 Run04 managed Qwen evidence driver
 =================================
 
-Current status: host preparation only. All new A/B Worker, native transfer,
-model, device reservation and pool cases are NOT-RUN under the 2026-11-05
-human resource hold. ``plan`` and ``check`` use only the Python standard
+Current admission: the 2026-11-06 explicit human release resumes D1 on B only.
+A is neither contacted nor queried. Its historical 128MiB responsibility remains
+charged conservatively; B's one new Catalog has a real 128MiB hard cap. Actual
+device results are separate from this code and host tests. ``plan`` and ``check`` use only the Python standard
 library. Neither imports the production package, loads weights, connects to
 UFlow, starts a process, nor reserves a device. A successful offline check
 is labelled HOST-EVIDENCE-CHECKED and never grants D1 acceptance.
@@ -11,18 +12,19 @@ is labelled HOST-EVIDENCE-CHECKED and never grants D1 acceptance.
 Inputs and host commands
 -----------------------
 
-The sealed configuration has schema 1, the twelve full Qwen3-14B asset
+The B sealed configuration has schema 2, the twelve full Qwen3-14B asset
 hashes, exact source/binary deployment expectations, frozen dependency pins,
-five 20MiB logical slots, A10, and two normal rounds. The snapshot is a
-sealed observation after actual n005 release: four pool-history records,
-old quarantine charged 128MiB, no normal live pool, total cap 256MiB.
+five 20MiB logical slots, B10, and two normal rounds. It binds B's hostname,
+boot ID and PID namespace to the independent human release record. No A snapshot
+is required. B has at most four pool-history records. Original schema 1 plans
+remain readable as history; they cannot execute under this B-only release.
 Historical module/binary hashes are expectations to check against the new
 loaded owner; they are not a fresh runtime result.
 
 From this source tree::
 
     python examples/run04/qwen_driver.py plan \
-      --config /sealed/config.json --snapshot /sealed/retained-snapshot.json \
+      --config /sealed/config.json \
       --output /new/plan.json
 
     python examples/run04/qwen_driver.py check \
@@ -36,16 +38,18 @@ Raw byte files may be reviewed in their original location or in the report's
 ``diagnostics`` sibling, preserving filenames and hashes. Missing captures,
 old leases, incomplete rounds, reordered blocks and early publication fail.
 
-Future execution, only after explicit human environment release
---------------------------------------------------------------
+Execution under the explicit B-only human release
+------------------------------------------------
 
-No execution command is authorized by this document. The driver requires
-the current hold plus a newer human release record explicitly superseding
+The driver requires the historical hold plus the newer human release record explicitly superseding
 ``serving-ab-npu-hold-20261105``. An older release or a plan cannot resume it.
 The release record must identify the actual human message and chat, state
 ``released_by_explicit_human``, carry a later UTC timestamp and set the
 full device-admission field true. The operator must verify that source;
 the JSON is an admission record, not an independent source of permission.
+Both run and consumer read actual local OS identities before execution imports;
+changing a config host label cannot authorize another machine/container. The
+release also fixes the conservative A floor, B hard budget and forbidden A host.
 
 In the existing fixed container, prepare the normal reviewed source/runtime
 environment, never the host API fence. Put this new serving source first on
@@ -56,19 +60,19 @@ settings. Use a fresh task build/cache/tmp/log root, not a prior failure
 domain. Before running, reconcile deployed source hashes with the sealed
 configuration. Runtime startup independently compares all loaded fingerprints.
 
-The actual executable entry, after that separate release, is::
+The executable entry in the fixed B container is::
 
     python -u examples/run04/qwen_driver.py run \
-      --config /sealed/config.json --snapshot /sealed/retained-snapshot.json \
+      --config /sealed/config.json \
       --hold /current/hold.json --release /new/human-release.json \
-      --existing-state /workspace/uflow/runs/d1-managed-ddr-20261105/serving/a002/n001/state \
-      --root /workspace/uflow/runs/d1-managed-ddr-20261105/serving/host-prep-20261106/device-r001 \
+      --daemon /workspace/uflow/runs/d1-managed-ddr-20261105/serving/b006/uf-daemon \
+      --root /workspace/uflow/runs/d1-managed-ddr-20261105/serving/b006/matrix001 \
       --output /new/execution-summary.json
 
 Case sequence and real interfaces
 --------------------------------
 
-1. ``small-native`` calls the existing same-Catalog native fixture, including
+1. ``small-native`` calls the existing native consumer on this B service's first pool, including
    compilation/assembly before registration, strict helper classification,
    actual child registry, same-whole-Buffer native parameters, byte guards,
    normal owner close, SDK detach/unmap and UF Destroy. Its synchronous
@@ -94,9 +98,13 @@ Case sequence and real interfaces
    unmap/release remain necessary.
 
 One normal pool is created for each consumer session, never per HTTP request.
-Each must really release before the next one. Four initial records plus four
-new records exhaust the cap of eight. The original Unknown pool, three original
-UF owners and their responsibility remain untouched and charged. Any owner,
+Each must really release before the next one. B's daemon/provider is started
+once with --pool-budget-bytes 134217728. A real second allocation is required to
+be rejected by UFlow's hard cap. All four cases reuse that same B authority;
+normal SDK unmap, UF Destroy, physical close/unlink and FD/name checks precede
+the next pool. B then shuts down normally and proves owner births absent. The
+original A Unknown pool, three original UF owners and their responsibility
+remain untouched and charged. Any owner,
 epoch, pin, budget or resource discrepancy stops without another authority/card.
 
 Failure and evidence boundaries
@@ -114,10 +122,15 @@ Entry byte readback uses a real SDK R lease on Committed content. Full pool
 snapshots are a separate opt-in guard-only physical observation of the existing
 mapping, including unallocated guards. They require an already idle native
 owner, no local or SDK range obligations, one mapped client, matching inherited
-child registry and identical before/after SDK projections. They neither acquire
+child registry and identical before/after SDK projections. The public current
+client's exact child birth/UID/GID/PID namespace and Unknown/closing state must
+match the original SDK and serving registries before reading any bytes. They neither acquire
 prefix-consumption authority nor write/initialize/allocate guards.
 
-The checker correlates typed STORE/LOAD receipts, page/range leases, model
+The checker binds each normal terminal and publication uniquely and completely
+to the original coordinator trace, raw coordinator log and original producer
+typed event/request (including delivery, content/allocation/range/page identity).
+Missing, duplicate, conflicting or substituted original records fail. It correlates typed STORE/LOAD receipts, page/range leases, model
 schedules, SDK commit/read-release, publication ordering, raw native submit/
 outcome-zero completion and native cleanup. External PID/FD/lock/port/provider
 release and capture origin still require review. Outputs must be reasonable

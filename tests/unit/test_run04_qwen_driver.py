@@ -40,13 +40,23 @@ def recorded_snapshot():
 def metadata():
     """Independent hand-written two-block control history, no driver invocation."""
     pool = {'pool_id': 'normal', 'pool_epoch': 'epoch', 'provider_session': 'provider',
-            'client_session': 'client', 'device': 1, 'inode': 2, 'nbytes': 134217728}
-    allocations = [{'offset': i * 23068672, 'nbytes': 23068672} for i in range(2)]
+            'client_session': 'client', 'device': 25, 'inode': 100, 'nbytes': 134217728,
+            'resource_id': '1', 'placement_id': '2', 'binding_id': '3', 'access_generation': 5,
+            'simpler_owner': 'owner', 'simpler_buffer_id': 1, 'simpler_generation': 1,
+            'resource_generation': 1, 'provider_kind': 'posix_shm_simpler'}
+    allocations = [{'offset': i * 23068672, 'nbytes': 23068672, 'block_id': i + 1, 'generation': 1}
+                   for i in range(2)]
+    birth = {'pid': 99, 'starttime_ticks': 1234, 'uid': 0, 'gid': 0,
+             'pid_namespace_dev': 4, 'pid_namespace_ino': 123}
     guard = {'identity': pool, 'bytes': 134217728, 'child_registry_matches_sdk': True,
-             'registered_children': [[99, 1234]], 'write_ranges': [[a['offset'] + 2097152, 20971520]
+             'registered_children': [[99, 1234]], 'registered_child_births': [copy.deepcopy(birth)],
+             'write_ranges': [[a['offset'] + 2097152, 20971520]
                                                                    for a in allocations],
-             'snapshot': {'pool_epoch': 'epoch', 'ranges': {'leases': [], 'allocations': allocations}}}
-    report = {'startup': {'worker_epoch': 'worker', 'pool_identity': pool}, 'actual_pages': 16,
+             'snapshot': {'pool_epoch': 'epoch', 'ranges': {'leases': [], 'allocations': allocations},
+                          'clients': [{'client_session': 'client', 'state': 'Mapped', 'closing': False,
+                              'birth': {**birth, 'pid': 90},
+                              'children': [{'birth': copy.deepcopy(birth), 'unknown': False}]}]}}
+    report = {'startup': {'worker_epoch': 'worker', 'pool_identity': pool, 'namespace_digest': 'a' * 64}, 'actual_pages': 16,
               'schedule_events': [], 'requests': []}
     round_ = {'number': 0, 'interface': 'direct', 'prompt_tokens': 257, 'blocks': [],
               'pool_before': guard, 'pool_after': copy.deepcopy(guard),
@@ -60,9 +70,12 @@ def metadata():
         ref = {'entry_id': f'entry{i}', 'worker_epoch': 'worker', 'slot_generation': i + 1}
         content = {'pool_id': 'normal', 'pool_epoch': 'epoch', 'provider_session': 'provider',
                    'nbytes': 20971520, 'byte_offset': allocations[i]['offset'] + 2097152,
-                   'content_version': 1, 'writer_lease_id': f'w{i}', 'content_id': f'prefix{i}'}
+                   'content_version': 1, 'writer_lease_id': f'w{i}',
+                   'content_id': 'qwen3-prefix-v1:' + 'a' * 64 + ':' + str(i + 1) * 64,
+                   'operation_id': f'commit{i}', 'block': {'pool_id': 'normal', 'pool_epoch': 'epoch',
+                       'block_id': i + 1, 'generation': 1, 'byte_offset': allocations[i]['offset'], 'nbytes': 23068672}}
         terminals = []
-        for op, page, lease, ns in [('STORE', i, f'w{i}', 1), ('LOAD', i + 4, f'r{i}', 5)]:
+        for op, page, lease, ns in [('STORE', i, f'w{i}', 10), ('LOAD', i + 4, f'r{i}', 50)]:
             receipt = {'pool': pool, 'operation': op, 'page_lease_id': op + str(i),
                        'lease_id': lease, 'lease_generation': 2, 'content': content, 'release_ack': None}
             if op == 'LOAD':
@@ -71,10 +84,12 @@ def metadata():
             terminals.append({'operation': op, 'entry_refs': [ref], 'worker_epoch': 'worker',
                 'status': 'SUCCEEDED', 'native_completed': True, 'stopped': True, 'bytes': 20971520,
                 'error': None, 'pool_receipt': receipt, 'page_lease_id': op + str(i),
-                'pages': [page], 'time_ns': ns, 'job': op + str(i)})
+                'pages': [page], 'time_ns': ns, 'job': op + str(i), 'event': 'transfer_terminal',
+                'sequence': i * 2 + (1 if op == 'STORE' else 2),
+                'delivery_sequence': i * 2 + (1 if op == 'STORE' else 2)})
         overwrite = f'overwrite{i}'
         report['requests'].append({'request_id': overwrite, 'prompt_token_ids': list(range(127)),
-                                    'begin_ns': 2, 'completed_ns': 4})
+                                    'begin_ns': 20, 'completed_ns': 40})
         report['schedule_events'].append({'requests': [
             {'request_id': overwrite, 'is_prefill': True, 'computed_before': 0, 'tokens': 127, 'pages': [i]},
             {'request_id': overwrite, 'is_prefill': False, 'computed_before': 127, 'tokens': 1, 'pages': [i]}]})
@@ -83,7 +98,10 @@ def metadata():
             'source': {'page': i}, 'overwritten': {'page': i}, 'restored': {'page': i + 4},
             'overwrite_request': overwrite,
             'committed': {'pool_identity': pool, 'committed': content, 'generation': i + 1, 'entry_id': ref['entry_id']},
-            'valid': {'event': 'restored_page_valid', 'job': 'LOAD' + str(i), 'time_ns': 6, 'page': i + 4}})
+            'valid': {'event': 'restored_page_valid', 'job': 'LOAD' + str(i), 'time_ns': 60,
+                      'sequence': 5 + i, 'page': i + 4}})
+    report['coordinator_trace'] = [copy.deepcopy(event) for block in round_['blocks']
+                                   for event in (block['store'], block['load'], block['valid'])]
     return round_, report
 
 
@@ -322,8 +340,7 @@ def test_historical_release_cannot_resume_current_hold(release):
 
 def startup_fixture():
     config = configuration()
-    pool = {'pool_id': 'normal', 'pool_epoch': 'epoch', 'provider_session': 'provider',
-            'device': 25, 'inode': 100, 'nbytes': 134217728}
+    pool = metadata()[1]['startup']['pool_identity']
     descriptor = {**pool, 'canonical': {'dev': 25, 'inode': 100}}
     layout = {'num_layers': 40, 'num_pages': 16, 'page_size': 128}
     compat = {'scope': 'managed-pool-compatible-data-local-owner', 'worker_epoch': 'worker',

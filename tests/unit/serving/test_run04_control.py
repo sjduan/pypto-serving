@@ -132,19 +132,24 @@ def pool():
     size = 65536
     buffer = mmap.mmap(-1, size)
     identity = SimpleNamespace(pool_id='pool', pool_epoch='epoch', client_session='client',
-                               nbytes=size, device=1, inode=2)
+                               nbytes=size, device=1, inode=2, access_generation=5)
     from dataclasses import make_dataclass
     Identity = make_dataclass('CpuGuardIdentity', [(key, type(value)) for key, value in vars(identity).items()])
     identity = Identity(**vars(identity))
+    birth = {'pid': 99, 'starttime_ticks': 1234, 'uid': 0, 'gid': 0,
+             'pid_namespace_dev': 4, 'pid_namespace_ino': 123}
     row = {'pool_id': 'pool', 'pool_epoch': 'epoch', 'nbytes': size, 'frozen': False,
            'canonical': {'dev': 1, 'inode': 2}, 'ranges': {'leases': []},
-           'clients': [{'client_session': 'client', 'state': 'Mapped'}]}
+           'clients': [{'client_session': 'client', 'state': 'Mapped', 'closing': False,
+                        'access': 'rw', 'access_generation': 5, 'birth': {**birth, 'pid': 90},
+                        'children': [{'birth': copy.deepcopy(birth), 'unknown': False}]}]}
     snapshots = []
     def snapshot():
         snapshots.append(1)
         return {'pools': [copy.deepcopy(row)]}
     access = SimpleNamespace(identity=identity, buffer=buffer, leases={}, unknown={}, closed=False,
-                             children={(99, 1234): object()}, port=SimpleNamespace(client=SimpleNamespace(snapshot=snapshot)))
+        children={(99, 1234): object()}, port=SimpleNamespace(_children={(99, 1234): copy.deepcopy(birth)},
+            client=SimpleNamespace(snapshot=snapshot, _children={99: copy.deepcopy(birth)})))
     slots = SimpleNamespace(access=access, busy=None, child_registrations={99: 1234}, child_helpers={}, _blocks={})
     yield slots, row, snapshots
     buffer.close()
@@ -160,7 +165,9 @@ def test_idle_guard_observer_reads_exact_existing_mmap_without_acquire_commit_or
     assert 'not Committed prefix consumption' in result['scope']
 
 
-@pytest.mark.parametrize('fault', ['busy', 'unknown', 'lease', 'child', 'competing-client', 'physical', 'remote-lease'])
+@pytest.mark.parametrize('fault', ['busy', 'unknown', 'lease', 'child', 'competing-client', 'physical', 'remote-lease',
+    'missing-sdk-child', 'extra-sdk-child', 'wrong-birth', 'wrong-namespace', 'sdk-child-unknown', 'closing',
+    'old-generation', 'duplicate-sdk-child', 'sdk-local-mismatch'])
 def test_guard_observer_refuses_live_or_mismatched_obligations_before_read(pool, tmp_path, fault):
     slots, row, _ = pool
     if fault == 'busy':
@@ -175,8 +182,28 @@ def test_guard_observer_refuses_live_or_mismatched_obligations_before_read(pool,
         row['clients'].append({'client_session': 'other', 'state': 'Mapped'})
     elif fault == 'physical':
         row['canonical']['inode'] = 3
-    else:
+    elif fault == 'remote-lease':
         row['ranges']['leases'].append({'state': 'Writing'})
+    elif fault == 'missing-sdk-child':
+        row['clients'][0]['children'].clear()
+    elif fault == 'extra-sdk-child':
+        extra = copy.deepcopy(row['clients'][0]['children'][0])
+        extra['birth']['pid'] = 100
+        row['clients'][0]['children'].append(extra)
+    elif fault == 'wrong-birth':
+        row['clients'][0]['children'][0]['birth']['starttime_ticks'] += 1
+    elif fault == 'wrong-namespace':
+        row['clients'][0]['children'][0]['birth']['pid_namespace_ino'] += 1
+    elif fault == 'sdk-child-unknown':
+        row['clients'][0]['children'][0]['unknown'] = True
+    elif fault == 'closing':
+        row['clients'][0]['closing'] = True
+    elif fault == 'old-generation':
+        row['clients'][0]['access_generation'] -= 1
+    elif fault == 'duplicate-sdk-child':
+        row['clients'][0]['children'].append(copy.deepcopy(row['clients'][0]['children'][0]))
+    else:
+        slots.access.port.client._children[99]['pid_namespace_ino'] += 1
     with pytest.raises(RuntimeError):
         capture_idle_pool(slots, tmp_path, 'r04-rejected')
     assert not (tmp_path / 'r04-rejected-pool.bin').exists()

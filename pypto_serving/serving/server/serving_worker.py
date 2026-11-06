@@ -1564,12 +1564,21 @@ class WorkerProcess:
         if message.kind in ("transfer", "control"):
             event = message.event if message.kind == "transfer" else message.control
             pending = self._native_ddr_worker.pending
+            request = None
+            if message.kind == 'transfer':
+                record = self._native_ddr_worker.transfer_replay.records.get(event.delivery_sequence)
+                if record is not None:
+                    request = asdict(record.identity)
+                    request['entry_keys'] = [{'namespace_digest': key.namespace_digest.hex(),
+                                              'block_hash': key.block_hash.hex()} for key in record.identity.entry_keys]
             logger.info("native_ddr_receipt %s", json.dumps({
+                "time_ns": time.monotonic_ns(),
                 "kind": message.kind, "identity": getattr(event, "job_id", getattr(event, "command_id", "")),
                 "delivery_sequence": event.delivery_sequence,
                 "status": event.status.value if message.kind == "transfer" else "control",
                 "error": event.error,
                 "event": asdict(event) if message.kind == 'transfer' else None,
+                "request": request,
                 "first_nonterminal_failure": pending.first_failure_detail if pending is not None else None,
                 "pending_owner": ({'has_handle': pending.handle is not None,
                     'quarantined': pending.quarantined, 'cancelled': pending.cancelled,

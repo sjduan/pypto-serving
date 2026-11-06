@@ -47,7 +47,59 @@ def capture_path(root, row):
     return path
 
 
-def check_round(round_, report, root, *, inspect_bytes):
+def log_records(raw, marker):
+    return [json.loads(line.split(marker, 1)[1]) for line in raw.splitlines() if marker + '{' in line]
+
+
+def bind_round_event(summary, report, raw_log=None):
+    """Bind full original records, never a projection of a self-consistent summary."""
+    event = summary['event']
+    originals = [row for row in report['coordinator_trace']
+                 if row['event'] == event and row.get('job') == summary['job']]
+    require(originals == [summary], 'normal summary differs from unique original coordinator event')
+    if raw_log is None:
+        return
+    coordinators = log_records(raw_log, 'native_ddr_coordinator ')
+    require([row for row in coordinators if row['event'] == event
+             and row.get('job') == summary['job']] == [summary],
+            'normal summary differs from unique raw coordinator log')
+    if event != 'transfer_terminal':
+        return
+    producers = [row for row in log_records(raw_log, 'native_ddr_receipt ')
+                 if row['kind'] == 'transfer' and row['identity'] == summary['job']
+                 and row['status'] != 'ACCEPTED']
+    require(len(producers) == 1, 'normal terminal has missing/duplicate/conflicting producer receipts')
+    producer = producers[0]
+    expected = {'job_id': summary['job'], 'worker_epoch': summary['worker_epoch'],
+        'operation': summary['operation'], 'status': summary['status'], 'entry_refs': summary['entry_refs'],
+        'transferred_bytes': summary['bytes'], 'native_completed': summary['native_completed'],
+        'stopped': summary['stopped'], 'error': summary['error'],
+        'delivery_sequence': summary['delivery_sequence'], 'pool_receipt': summary['pool_receipt']}
+    require(producer['event'] == expected and producer['error'] == summary['error']
+            and producer['delivery_sequence'] == summary['delivery_sequence']
+            and producer['status'] == summary['status'] and producer['time_ns'] <= summary['time_ns'],
+            'producer typed event differs from coordinator terminal identity/content/order')
+    request = producer['request']
+    for key, value in {'job_id': summary['job'], 'worker_epoch': summary['worker_epoch'],
+            'operation': summary['operation'], 'entry_refs': summary['entry_refs'],
+            'page_ids': summary['pages'], 'page_lease_id': summary['page_lease_id'],
+            'delivery_sequence': summary['delivery_sequence']}.items():
+        require(request[key] == value, 'producer original request differs from normal terminal lease/pages')
+    keys = request['entry_keys']
+    require(len(keys) == 1 and keys[0]['namespace_digest'] == report['startup']['namespace_digest']
+            and re.fullmatch('[0-9a-f]{64}', keys[0]['block_hash'])
+            and summary['pool_receipt']['content']['content_id'] ==
+                'qwen3-prefix-v1:' + keys[0]['namespace_digest'] + ':' + keys[0]['block_hash']
+            and type(request['delivery_sequence']) is int and request['delivery_sequence'] > 0
+            and type(request['retire_through']) is int and 0 <= request['retire_through'] < request['delivery_sequence'],
+            'producer content namespace or delivery generation is stale')
+    require((request['operation'] == 'STORE' and type(request['source_step_id']) is int
+             and request['source_step_id'] > 0) or
+            (request['operation'] == 'LOAD' and request['source_step_id'] is None),
+            'producer request has no valid source step identity')
+
+
+def check_round(round_, report, root, *, inspect_bytes, raw_log=None):
     require(round_['number'] in (0, 1) and round_['prompt_tokens'] == 257, 'wrong normal round/prefix length')
     require(round_['interface'] == ('direct' if round_['number'] == 0 else 'http'), 'wrong request interface')
     require(len(round_['blocks']) == 2, 'token-zero contiguous two-block evidence is incomplete')
@@ -57,6 +109,18 @@ def check_round(round_, report, root, *, inspect_bytes):
                 'guard observation belongs to a different physical pool/client')
         require(pool['child_registry_matches_sdk'] is True and pool['registered_children'],
                 'actual child registry must match SDK inherited mapping obligations')
+        snapshot = pool['snapshot']
+        clients = [c for c in snapshot['clients'] if c['client_session'] == identity['client_session']]
+        require(len(clients) == 1 and clients[0]['state'] == 'Mapped' and clients[0]['closing'] is False,
+                'guard capture lacks unique current non-closing SDK client')
+        births = {b['pid']: b for b in pool['registered_child_births']}
+        require(len(births) == len(pool['registered_children']) == len(clients[0]['children'])
+                and sorted([[b['pid'], b['starttime_ticks']] for b in births.values()])
+                    == sorted(pool['registered_children'])
+                and all(c['unknown'] is False and c['birth'] == births.get(c['birth']['pid'])
+                    and all(c['birth'][k] == clients[0]['birth'][k]
+                            for k in ('uid', 'gid', 'pid_namespace_dev', 'pid_namespace_ino'))
+                    for c in clients[0]['children']), 'guard child evidence differs from actual SDK snapshot')
         allocations = pool['snapshot']['ranges']['allocations']
         require(pool['snapshot']['ranges']['leases'] == []
                 and pool['write_ranges'] == [[a['offset'] + 2097152, BLOCK_BYTES] for a in allocations]
@@ -80,6 +144,7 @@ def check_round(round_, report, root, *, inspect_bytes):
         ref, store, load = block['entry_ref'], block['store'], block['load']
         require(ref['worker_epoch'] == report['startup']['worker_epoch'], 'stale worker epoch')
         for operation, terminal in (('STORE', store), ('LOAD', load)):
+            bind_round_event(terminal, report, raw_log)
             require(terminal['operation'] == operation and terminal['entry_refs'] == [ref]
                     and terminal['worker_epoch'] == ref['worker_epoch'] and terminal['status'] == 'SUCCEEDED'
                     and terminal['native_completed'] is True and terminal['stopped'] is True
@@ -91,6 +156,18 @@ def check_round(round_, report, root, *, inspect_bytes):
                     and receipt['lease_id'] and type(receipt['lease_generation']) is int
                     and receipt['lease_generation'] > 0, 'stale pool/page/range lease receipt')
         committed = block['committed']['committed']
+        require(set(committed) == {'pool_id', 'pool_epoch', 'provider_session', 'block', 'byte_offset',
+                'nbytes', 'content_version', 'content_id', 'operation_id', 'writer_lease_id'},
+                'complete typed committed allocation/content identity is required')
+        allocation = committed['block']
+        require(allocation['pool_id'] == identity['pool_id'] and allocation['pool_epoch'] == identity['pool_epoch']
+                and type(allocation['generation']) is int and allocation['generation'] > 0
+                and committed['operation_id'] and any(
+                    (a['block_id'], a['generation'], a['offset'], a['nbytes']) == (
+                        allocation['block_id'], allocation['generation'], allocation['byte_offset'], allocation['nbytes'])
+                    for a in round_['pool_after']['snapshot']['ranges']['allocations'])
+                and committed['byte_offset'] == allocation['byte_offset'] + 2097152,
+                'Committed allocation differs from real pool range generation/layout')
         require(store['pool_receipt']['content'] == committed == load['pool_receipt']['content'],
                 'LOAD changed the Committed content identity/version/allocation')
         require(committed['pool_id'] == identity['pool_id'] and committed['pool_epoch'] == identity['pool_epoch']
@@ -124,6 +201,7 @@ def check_round(round_, report, root, *, inspect_bytes):
                 and load['time_ns'] <= block['valid']['time_ns']
                 and block['valid']['event'] == 'restored_page_valid' and block['valid']['job'] == load['job']
                 and block['valid']['page'] == target, 'STORE/real model overwrite/LOAD/publication order is invalid')
+        bind_round_event(block['valid'], report, raw_log)
         if inspect_bytes:
             from contextlib import ExitStack
             with ExitStack() as stack:
@@ -212,7 +290,7 @@ def check(config, report, descriptor, root, raw_log):
             'plan/replay metadata cannot be accepted as execution evidence')
     check_startup(config, report['startup'], descriptor)
     require([r['number'] for r in report['rounds']] == [0, 1], 'both normal rounds are required')
-    result = [check_round(r, report, root, inspect_bytes=True) for r in report['rounds']]
+    result = [check_round(r, report, root, inspect_bytes=True, raw_log=raw_log) for r in report['rounds']]
     correlate_native(report, raw_log)
     for key in ('load_cancellation', 'store_cancellation', 'postsubmit_load_failure',
                 'postsubmit_store_failure', 'stale_original_transfer', 'http_pool_hit'):
