@@ -370,6 +370,9 @@ def consumer(args, config):
     from qwen_contract import check_startup
     if os.environ.get('LD_PRELOAD') or any(k.startswith('UFLOW_POOL_TEST_') for k in os.environ):
         raise RuntimeError('host fence must never reach model/native worker')
+    # Serving defaults to WARNING, which suppresses the original TIMING-level
+    # node.submit/node.complete records required by this evidence contract.
+    os.environ['PYPTO_SIMPLER_LOG_LEVEL'] = 'INFO'
     if args.case == CASES[0]:
         import pool_native_probe as probe
         descriptor = load(args.descriptor)
