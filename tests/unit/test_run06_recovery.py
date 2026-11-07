@@ -198,14 +198,15 @@ def test_http_gate_tracks_stream_body_and_rejects_new_admission_after_retain():
 
 @pytest.mark.skipif(os.name != 'posix', reason='Linux independent original actor/Worker and process birth proof')
 @pytest.mark.parametrize('sdk_unknown', [False, True])
-def test_actual_stop_owned_closes_original_cpu_workers_then_requires_mock_sdk_unmap_before_release(tmp_path,monkeypatch,sdk_unknown):
+@pytest.mark.parametrize('late_tracker', [False, True])
+def test_actual_stop_owned_closes_original_cpu_workers_then_requires_mock_sdk_unmap_before_release(tmp_path,monkeypatch,sdk_unknown,late_tracker):
     """Exercise real stop_model/verify_cleanup, not a fake transport success flag."""
     from types import ModuleType
     from pypto_serving.serving.native_ddr.managed_process import process_birth
     async def scenario():
         root=tmp_path/'cold0';release=tmp_path/'cpu-test-release'
         process=await asyncio.create_subprocess_exec(sys.executable,'-B',str(ROOT/'tests/fixtures/m1/cpu_actor.py'),
-            str(root),'normal',str(release),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+            str(root),'late-tracker' if late_tracker else 'normal',str(release),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
         transport=ProcessTransport.__new__(ProcessTransport)
         transport.root=tmp_path;transport.sequence=0;transport.models={'cold0':process}
         transport.started={};transport.stopped={};transport.sessions=['mock-session']
@@ -235,6 +236,17 @@ def test_actual_stop_owned_closes_original_cpu_workers_then_requires_mock_sdk_un
         try:
             start=await transport.call('cold0','start');transport.started['cold0']=start
             transport.owned_births.update({int(pid):birth for pid,birth in start['descendant_births'].items()})
+            tail_alive_after_actor_exit=[]
+            if late_tracker:
+                from pypto_serving.serving.native_ddr import managed_process
+                tail=set(map(int,start['descendant_births']))-{start['worker_pid']}
+                assert len(tail)==1
+                def observe_birth(pid):
+                    value=process_birth(pid)
+                    if pid in tail and value is not None and process_birth(process.pid)!=start['birth']:
+                        tail_alive_after_actor_exit.append(pid)
+                    return value
+                monkeypatch.setattr(managed_process,'process_birth',observe_birth)
             with pytest.raises(ActorCommandError):await transport.call('cold0','request',text='CPU prompt')
             if sdk_unknown:
                 with pytest.raises(RuntimeError,match='SDK client Unknown'):await transport.stop_owned()
@@ -247,6 +259,7 @@ def test_actual_stop_owned_closes_original_cpu_workers_then_requires_mock_sdk_un
                 assert closed==['listener-closed','actual-lock-stack-closed']
                 assert operations[-1]==('reserve-devices',{'line':'M1','reservations':[]})
             assert await asyncio.wait_for(process.wait(),10)==0
+            if late_tracker:assert tail_alive_after_actor_exit
             assert not (tmp_path/'two.closed.json').exists()
         finally:
             release.touch();process.stdin.close()

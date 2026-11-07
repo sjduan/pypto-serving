@@ -53,10 +53,14 @@ async def main():
         actor.schedule.append({'request_id': request_id, 'is_prefill': True, 'tokens': 257})
         yield Output(False, None, (10,), 10, 'A', 'A', 1)
         yield Output(True, 'FINISHED_LENGTH', (10, 11), 12, 'AB', 'B', 2)
-    worker = None
+    worker = tracker = None
     async def start():
-        nonlocal worker
+        nonlocal worker, tracker
         worker = subprocess.Popen([sys.executable, '-B', '-c', 'import sys; assert sys.stdin.readline()=="stop\\n"'], stdin=subprocess.PIPE)
+        if sys.argv[2] == 'late-tracker':
+            tracker = subprocess.Popen([sys.executable, '-B', '-c',
+                'import sys,time; assert sys.stdin.readline()=="close\\n"; time.sleep(.4)'], stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         actor.core = SimpleNamespace(_worker_process=worker, scheduler=SimpleNamespace(has_work=lambda: sys.argv[2] == 'unknown'),
                                      _batch_queue=[], shutdown_report={})
         actor.manager = SimpleNamespace(release_blocks_by_ids=lambda values: None)
@@ -75,6 +79,8 @@ async def main():
         if sys.argv[2] == 'stop-fails':return False
         worker.stdin.write(b'stop\n');worker.stdin.flush()
         code = await asyncio.to_thread(worker.wait, 10)
+        if tracker is not None:
+            tracker.stdin.write(b'close\n');tracker.stdin.flush();tracker.stdin.close()
         actor.core.shutdown_report = {'worker_reaped': code == 0, 'cleanup_error': None,
                                      'worker_pid': worker.pid, 'native_ddr_obligations': 0}
         return code == 0
@@ -89,6 +95,10 @@ async def main():
         if worker is not None and worker.poll() is None:
             worker.stdin.write(b'stop\n');worker.stdin.flush()
             assert await asyncio.to_thread(worker.wait, 10) == 0
+        if tracker is not None and tracker.poll() is None:
+            if not tracker.stdin.closed:
+                tracker.stdin.write(b'close\n');tracker.stdin.flush();tracker.stdin.close()
+            assert await asyncio.to_thread(tracker.wait, 10) == 0
         if actor.server is not None:actor.server.should_exit = True
         task.cancel()
         await asyncio.sleep(.01)

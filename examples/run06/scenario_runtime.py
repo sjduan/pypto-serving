@@ -194,12 +194,9 @@ class ProcessTransport:
     async def call(self,name,op,**values):
         value=await self.rpc(self.models[name],name,op,values)
         if op=='request':
-            from qwen_evidence import correlate_native,bind_round_event
+            from request_evidence import correlate_request
             raw=(self.root/'logs'/f'{name}.log').read_text(errors='replace')
-            proof={'coordinator_trace':value['coordinator_trace']}
-            correlate_native(proof,raw)
-            for event in value['coordinator_trace']:
-                if event['event']=='transfer_terminal':bind_round_event(event,proof,raw)
+            value['native_log_bindings']=correlate_request(value,self.started[name]['startup'],raw)
         return value
 
     def model_index(self,name):return int(name.removeprefix('shared').removeprefix('cold'))
@@ -398,6 +395,13 @@ class ProcessTransport:
         if await asyncio.wait_for(self.models[name].wait(),30)!=0:raise RuntimeError('model actor abnormal exit')
         from pypto_serving.serving.native_ddr.managed_process import process_birth
         births={**start['descendant_births'],**result['descendant_births_before']}
+        # The interpreter may exit a few milliseconds before its stdlib tracker
+        # finishes normal EOF cleanup. Wait for actual birth disappearance;
+        # never treat actor exit as proof, signal descendants or clear a flag.
+        deadline=time.monotonic()+30
+        while (process_birth(start['pid'])==start['birth']
+               or any(process_birth(int(pid))==birth for pid,birth in births.items())) and time.monotonic()<deadline:
+            await asyncio.sleep(.02)
         if process_birth(start['pid'])==start['birth'] or any(process_birth(int(pid))==birth for pid,birth in births.items()):
             raise RuntimeError('normal model stop left an original descendant birth')
         from stop_evidence import check_shared_names_gone,check_device_closed
