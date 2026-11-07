@@ -320,6 +320,111 @@ def test_sdk_operation_budget_counts_cleanup_against_admission_gate():
     assert 'Release' in ' '.join(b['new_journal_records_by_path'])
 
 
+def m1_only_config(config,tmp_path):
+    env,state=released_config(config,tmp_path)
+    env['schema']=3;env['participants'].pop('O1')
+    path=Path(config['operation_allowance']['path']);path.write_text(json.dumps(env))
+    config['operation_allowance']['sha256']=digest(path.read_bytes())
+    config['device_release']['envelope_sha256']=config['operation_allowance']['sha256']
+    return env,state
+
+
+def test_v3_m1_only_release_keeps_actual_cap_and_finalizer_reserve(config,tmp_path,monkeypatch):
+    import scenario_admission
+    from scenario_admission import validate_release
+    env,state=m1_only_config(config,tmp_path)
+    assert validate_release(config)==env
+    ledger=PhaseLedger(tmp_path/'ledger','3'*64,env,plan(config)['pool'],config['source_manifest_sha256'])
+    monkeypatch.setattr(scenario_admission,'phase_ledger',lambda *_:ledger)
+    assert validate_admission(config,state)['normal_records_bound']==248
+    budget=ledger.claim('two',312,plan(config)['config_sha256'])
+    assert budget=={'participants':['M1'],'own_completed_upper':0,'own_remaining_upper':884,
+                    'finalizer_records_reserved':2,'worst':1198,'strict_admission_spare':2897,
+                    'not_a_resource_or_lease_grant':True}
+    assert ledger.identity('two')['schema']==3
+    assert CAPS=={'O1':2888,'M1':884}  # Schema2 tables and reference vectors remain unchanged.
+    with pytest.raises(ValueError,match='already claimed'):ledger.claim('two',312,'a'*64)
+    with pytest.raises(OSError):ledger.check('four',312)
+
+
+@pytest.mark.parametrize('fault',['schema-bool','schema-float','extra-O1','missing-M1','cap','stage-order',
+    'stage-bool','extra-stage','source','manifest','provider','epoch','pool','anchor-bool','headroom',
+    'admission','cleanup','terminal','extra-field','missing-field','extra-participant-field'])
+def test_v3_exact_m1_only_envelope(config,tmp_path,fault):
+    env,_=m1_only_config(config,tmp_path);pool=plan(config)['pool']
+    validate_envelope(env,pool,config['manifest_sha256'],'f'*40)
+    if fault=='schema-bool':env['schema']=True
+    elif fault=='schema-float':env['schema']=3.0
+    elif fault=='extra-O1':env['participants']['O1']={'source_sha':'e'*40,'total':2888,'stages':[]}
+    elif fault=='missing-M1':env['participants']={}
+    elif fault=='cap':env['participants']['M1']['total']=886
+    elif fault=='stage-order':env['participants']['M1']['stages'].reverse()
+    elif fault=='stage-bool':env['participants']['M1']['stages'][0]['max']=True
+    elif fault=='extra-stage':env['participants']['M1']['stages'].append({'id':'finalize','max':2})
+    elif fault=='source':env['participants']['M1']['source_sha']='a'*40
+    elif fault=='manifest':env['common_manifest_sha256']='a'*64
+    elif fault=='provider':env['provider_session']='different'
+    elif fault=='epoch':env['pool_epoch']='different'
+    elif fault=='pool':env['pool_id']='different'
+    elif fault=='anchor-bool':env['counter_anchor']=True
+    elif fault=='headroom':env['counter_anchor']=3210
+    elif fault=='admission':env['admission_limit']=4097
+    elif fault=='cleanup':env['cleanup_limit']=8193
+    elif fault=='terminal':env['terminal_recovery_reserve']=255
+    elif fault=='extra-field':env['finalizer']=0
+    elif fault=='missing-field':env.pop('terminal_recovery_reserve')
+    elif fault=='extra-participant-field':env['participants']['M1']['other_spent']=0
+    with pytest.raises((ValueError,KeyError)):validate_envelope(env,pool,config['manifest_sha256'],'f'*40)
+
+
+@pytest.mark.parametrize('args',[(312,311,'M1','two'),(312,313,'M1','two'),(312,561,'M1','four'),
+    (312,1197,'M1','done'),(312,312,'O1','calibrate'),(312,312,'M1','skip'),
+    (True,312,'M1','two'),(312,True,'M1','two'),(3210,3210,'M1','two')])
+def test_v3_no_other_participant_spend_or_unproven_counter_credit(args):
+    with pytest.raises(ValueError):bound(*args,schema=3)
+
+
+def test_v3_strict_boundary_reserves_finalizer_without_adding_to_normal_cap():
+    assert bound(3209,3209,'M1','two',schema=3)['worst']==4095
+    assert bound(3209,3457,'M1','four',schema=3)['own_remaining_upper']==636
+    assert bound(3209,4093,'M1','done',schema=3)['finalizer_records_reserved']==2
+    for schema in (True,3.0,4):
+        with pytest.raises(ValueError):bound(312,312,'M1','two',schema=schema)
+
+
+@pytest.mark.parametrize('fault',[None,'over-cap','legacy-identity','counter-regressed','open-child','host-closure'])
+def test_v3_real_prior_phase_evidence_still_required(config,tmp_path,fault):
+    env,_=m1_only_config(config,tmp_path)
+    ledger=PhaseLedger(tmp_path/'ledger','3'*64,env,plan(config)['pool'],config['source_manifest_sha256'])
+    ledger.claim('two',312,plan(config)['config_sha256'])
+    report=closure_metadata_fixture(config,env);report['phase_identity']=ledger.identity('two')
+    report['cleanup']['actual_common_snapshot']['operation_records']=336
+    if fault=='over-cap':report['cleanup']['actual_common_snapshot']['operation_records']=561
+    elif fault=='legacy-identity':report['phase_identity']['schema']=2
+    elif fault=='counter-regressed':report['cleanup']['actual_common_snapshot']['operation_records']=311
+    elif fault=='open-child':report['cleanup']['actual_common_snapshot']['pools'][0]['clients'][0]['children']=[{'open':True}]
+    elif fault=='host-closure':report['scope']='CPU-ORCHESTRATION-ONLY'
+    if fault:
+        with pytest.raises((ValueError,KeyError)):ledger.close('two',report,tmp_path/'report.json')
+        assert not (ledger.root/'two.closed.json').exists()
+    else:
+        ledger.close('two',report,tmp_path/'report.json')
+        assert ledger.check('four',336)['worst']==974
+        with pytest.raises(ValueError,match='regressed'):ledger.check('four',335)
+        ledger.claim('four',336,'c'*64)
+        with pytest.raises(ValueError,match='already claimed'):ledger.check('four',336)
+
+
+def test_v3_duplicate_json_fields_fail_before_release(config,tmp_path):
+    from scenario_admission import validate_release
+    m1_only_config(config,tmp_path)
+    path=Path(config['operation_allowance']['path'])
+    path.write_text(path.read_text().replace('"schema": 3','"schema": 2, "schema": 3'))
+    config['operation_allowance']['sha256']=digest(path.read_bytes())
+    config['device_release']['envelope_sha256']=config['operation_allowance']['sha256']
+    with pytest.raises(PermissionError,match='immutable'):validate_release(config)
+
+
 @pytest.mark.parametrize('packet',[
     {'id':True,'op':'start','values':{}},
     {'id':1,'op':'exec','values':{}},

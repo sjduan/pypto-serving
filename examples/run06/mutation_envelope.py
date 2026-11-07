@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Immutable schema2 budget and once-only M1 phase receipts. No SDK/device imports."""
+"""Immutable schema2/shared and schema3/M1-only phase budgets. No SDK/device imports."""
 from __future__ import annotations
 
 import json
@@ -31,9 +31,23 @@ def integer(value):
     return value
 
 
-def bound(anchor, observed, line, phase):
+def bound(anchor, observed, line, phase, *, schema=2):
     """Arithmetic only: the caller must prove the prior real phases closed."""
     anchor, observed = integer(anchor), integer(observed)
+    if type(schema) is not int or schema not in (2,3):raise ValueError('strict envelope schema2 or3 required')
+    if schema==3:
+        if line!='M1' or phase not in PROGRESS['M1']:raise ValueError('schema3 admits only ordered M1 phases')
+        completed=PROGRESS['M1'][phase];remaining=CAPS['M1']-completed
+        if observed<anchor or observed-anchor>completed:
+            raise ValueError('M1-only counter exceeds proven prior phase cap or regressed')
+        # Finalizer is outside the normal M1 stages; retain its two actual
+        # future mutations without inventing an absent O1 participant/spend.
+        worst=observed+remaining+2
+        if anchor+CAPS['M1']+2>=4096 or worst>=4096 or worst+256>=8192:
+            raise ValueError('M1-only envelope lacks normal/terminal/finalizer headroom')
+        return {'participants':['M1'],'own_completed_upper':completed,'own_remaining_upper':remaining,
+                'finalizer_records_reserved':2,'worst':worst,'strict_admission_spare':4095-worst,
+                'not_a_resource_or_lease_grant':True}
     if anchor + sum(CAPS.values()) >= 4096 or anchor + sum(CAPS.values()) + 256 >= 8192:
         raise ValueError('initial immutable envelope does not fit')
     if line not in PROGRESS or phase not in PROGRESS[line]:
@@ -80,9 +94,9 @@ def sealed(reference):
 
 def validate_envelope(value, pool, manifest_sha, source_sha):
     if type(value) is not dict or set(value) != FIELDS:
-        raise ValueError('exact immutable schema2 fields required')
-    if type(value['schema']) is not int or value['schema'] != 2:
-        raise ValueError('schema2 strict integer required')
+        raise ValueError('exact immutable envelope fields required')
+    if type(value['schema']) is not int or value['schema'] not in (2,3):
+        raise ValueError('schema2 or schema3 strict integer required')
     if type(value['decision_id']) is not str or not value['decision_id'].strip():
         raise ValueError('manager decision identity required')
     if value['resource_group'] != 'phasef-parallel-20261106':
@@ -94,9 +108,10 @@ def validate_envelope(value, pool, manifest_sha, source_sha):
     for key, expected in [('admission_limit', 4096), ('cleanup_limit', 8192), ('terminal_recovery_reserve', 256)]:
         if integer(value[key]) != expected:raise ValueError('fixed Catalog limits/reserve differ')
     participants = value['participants']
-    if type(participants) is not dict or set(participants) != set(CAPS):
-        raise ValueError('both final source participants required')
-    for line in CAPS:
+    expected_lines=set(CAPS) if value['schema']==2 else {'M1'}
+    if type(participants) is not dict or set(participants) != expected_lines:
+        raise ValueError('exact final source participants required for envelope schema')
+    for line in expected_lines:
         row = participants[line]
         if type(row) is not dict or set(row) != {'source_sha', 'total', 'stages'}:
             raise ValueError('exact participant fields required')
@@ -112,7 +127,7 @@ def validate_envelope(value, pool, manifest_sha, source_sha):
             if integer(stage['max']) != want['max']:raise ValueError('fixed stage cap differs')
     if participants['M1']['source_sha'] != source_sha:
         raise ValueError('final M1 source differs from deployment')
-    bound(value['counter_anchor'], value['counter_anchor'], 'M1', 'two')
+    bound(value['counter_anchor'], value['counter_anchor'], 'M1', 'two',schema=value['schema'])
     return value
 
 
@@ -143,10 +158,16 @@ class PhaseLedger:
         self.source_manifest_sha = source_manifest_sha
 
     def identity(self, phase):
-        return {'schema': 2, 'phase': phase, 'envelope_sha256': self.envelope_sha,
+        return {'schema': self.envelope['schema'], 'phase': phase, 'envelope_sha256': self.envelope_sha,
                 'source_sha': self.envelope['participants']['M1']['source_sha'],
                 'source_manifest_sha256': self.source_manifest_sha,
                 'common_manifest_sha256': self.envelope['common_manifest_sha256'], 'pool': self.pool}
+
+    def budget(self,observed,phase):
+        return bound(self.envelope['counter_anchor'],observed,'M1',phase,schema=self.envelope['schema'])
+
+    def other_cap(self):
+        return CAPS['O1'] if self.envelope['schema']==2 else 0
 
     def prior(self, phase):
         if phase not in ('two', 'four', 'done'):raise ValueError('unknown M1 phase')
@@ -166,9 +187,9 @@ class PhaseLedger:
                 raise ValueError('original admitted phase configuration differs')
             end = self.validate_closed_report(prior, report)
             begin = integer(start['observed_records'])
-            if start['budget'] != bound(self.envelope['counter_anchor'], begin, 'M1', prior):
+            if start['budget'] != self.budget(begin,prior):
                 raise ValueError('original phase budget differs from immutable envelope')
-            if begin < previous_end or end < begin or end - begin > dict(STAGES['M1'])[prior] + CAPS['O1']:
+            if begin < previous_end or end < begin or end - begin > dict(STAGES['M1'])[prior] + self.other_cap():
                 raise ValueError('phase counter chronology/cap differs')
             previous_end = end
         if phase != 'done' and any((self.root / (phase + '.' + suffix + '.json')).exists() for suffix in ('started', 'closed')):
@@ -237,7 +258,7 @@ class PhaseLedger:
 
     def check(self, phase, observed):
         if integer(observed) < self.prior(phase):raise ValueError('counter regressed from prior actual closure')
-        return bound(self.envelope['counter_anchor'], observed, 'M1', phase)
+        return self.budget(observed,phase)
 
     def claim(self, phase, observed, config_sha):
         result = self.check(phase, observed)
@@ -253,9 +274,9 @@ class PhaseLedger:
         claim = read(start)
         if claim['identity'] != self.identity(phase) or claim['config_sha256'] != report['plan']['config_sha256']:
             raise ValueError('original phase claim/source/configuration differs')
-        if end < begin or end - begin > dict(STAGES['M1'])[phase] + CAPS['O1']:
+        if end < begin or end - begin > dict(STAGES['M1'])[phase] + self.other_cap():
             raise ValueError('actual campaign exceeds fixed mutation envelope')
-        bound(self.envelope['counter_anchor'], end, 'M1', 'four' if phase == 'two' else 'done')
+        self.budget(end,'four' if phase == 'two' else 'done')
         save(evidence_path, report)
         save(self.root / (phase + '.closed.json'), {'identity': self.identity(phase),
              'start_sha256': digest(start.read_bytes()),

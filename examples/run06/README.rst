@@ -176,6 +176,17 @@ tampered evidence negatives. This does not establish device/model success.
 Retained-owner recovery
 -----------------------
 
+The schema3 M1-only campaign uses the same exact top-level field set, original
+pool/provider/epoch and source/manifest seals. Schema is strict integer3 and
+participants is exactly M1, total884 with ordered two248/four636. It cannot
+admit an O1 phase. Schema2 and its two-participant cap table are unchanged.
+The pure schema3 bound is R + own_remaining_upper +2, reserving two additional
+finalizer mutations while keeping terminal reserve256 and strict limits
+4096/8192. R-A cannot exceed the cap of actually proved prior closed M1 phases;
+there is no inferred other-line spending or assumed O1 normal participation.
+All prior phase evidence, exclusive claims and actual closure guards remain.
+Finalizer reservation is not authority for this line to Destroy the pool.
+
 New-source controllers install ``<root>.recovery.sock`` before admission or
 actor creation. It is mode0600 and checks the actual UNIX peer UID. The
 immutable installed descriptor binds the original controller PID/birth,
