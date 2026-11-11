@@ -43,6 +43,8 @@ jobs:
             tests/unit/serving/test_existing_pool.py \
             tests/unit/serving/test_shared_partition.py \
             tests/unit/serving/test_shared_prefix_directory.py \
+            tests/unit/serving/test_shared_exchange*.py \
+            tests/unit/serving/test_shared_prefix_record.py \
             tests/unit/serving/test_cooperative_close.py \
             tests/unit/serving/test_terminal_unmap.py \
             tests/unit/test_task_supervisor.py tests/unit/test_task_lifecycle.py \
