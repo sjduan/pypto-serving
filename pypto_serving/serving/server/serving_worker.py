@@ -10,12 +10,14 @@
 from __future__ import annotations
 
 import logging
+import json
 import multiprocessing as mp
 import os
 import queue
 import sys
 import threading
-from dataclasses import dataclass, replace
+import time
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -32,19 +34,26 @@ from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import ConstraintState, XGrammarProvider
 from pypto_serving.serving.sampling.capabilities import SamplingCapabilities
 from pypto_serving.serving.sampling.stop_rules import blocked_token_ids
+from pypto_serving.observability.decode_metrics import DecodeStepRecorder
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
 from pypto_serving.serving.utils.env import configure_runtime_logging
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
+    ControlCommand,
+    ControlResult,
     PrefillRequest,
     ProfileCommand,
     ProfileResult,
     ShutdownCommand,
     StepCommand,
     StepResult,
+    NativeDdrCommand,
+    NativeDdrMessage,
+    encode_native_ddr_message,
     decode_command,
+    encode_control_result,
     encode_profile_result,
     encode_result,
 )
@@ -53,6 +62,7 @@ from pypto_serving.tools.profile import configure_profiler, get_profiler, profil
 
 if TYPE_CHECKING:
     from pypto_serving.serving.engine.async_engine import EngineConfig
+    from pypto_serving.serving.native_ddr.worker import DdrPrefixWorker
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +97,7 @@ class _PendingDecodeOutput:
     pending: object
     buffer_slot: int
     batch: DecodeBatch
+    started_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -120,6 +131,14 @@ class _ProfileBarrier:
     completed: threading.Event
 
 
+@dataclass(frozen=True)
+class _ControlBarrier:
+    """FIFO barrier for owner/cache control relative to device dispatch."""
+
+    command: ControlCommand
+    completed: threading.Event
+
+
 class WorkerProcess:
     """Dedicated process that owns a single NPU device and executes model inference.
 
@@ -127,19 +146,36 @@ class WorkerProcess:
       Main Process  --[input_queue]--> WorkerProcess --[output_queue]--> Main Process
     """
 
+    _decode_metrics: DecodeStepRecorder | None = None
+
     def __init__(
         self,
         config: EngineConfig,
         input_queue: mp.Queue,
         output_queue: mp.Queue,
         profile_output_queue: mp.Queue | None = None,
+        services_factory=None,
+        native_ddr_output_queue=None,
     ):
         self.config = config
         self._sampling_capabilities = config.sampling_capabilities()
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.profile_output_queue = profile_output_queue
+        self.native_ddr_output_queue = native_ddr_output_queue
+        self._native_ddr_worker: DdrPrefixWorker | None = None
+        self._native_ddr_backend = None
+        self._native_ddr_pool_access = None
+        self._native_ddr_startup = None
+        self._native_ddr_stop_sent = False
+        self._native_ddr_controls = {}
+        self._native_ddr_control_replay = None
+        self._native_ddr_drain_commands = {}
+        self._decode_metrics = DecodeStepRecorder.from_env()
 
+        self._services_factory = services_factory
+        self._services = None
+        self._batch_builder = self._make_decode_batch
         self.executor = None
         self.sampler = None
         self.model_record = None
@@ -156,6 +192,12 @@ class WorkerProcess:
         self._xgrammar_provider: XGrammarProvider | None = None
 
     def init_device_and_model(self) -> int:
+        native_config = self.config.resolve_runtime_config().native_ddr
+        if native_config.enabled and getattr(self, "native_ddr_output_queue", None) is None:
+            # A direct caller without the enabled auxiliary channel cannot
+            # install a partial assembly or fall back to host execution.
+            from pypto_serving.model.qwen.native_ddr_kv import require_native_ddr_backend
+            require_native_ddr_backend()
         from pypto_serving.config.types import ModelRecord
         from pypto_serving.model.common.executor.sampler import Sampler
         from pypto_serving.model.model_loader import ModelLoader
@@ -188,11 +230,26 @@ class WorkerProcess:
             self.sampler = Sampler()
 
             executor_cls = self._resolve_executor_cls()
+            executor_kwargs = dict(self.config.executor_kwargs)
+            if native_config.enabled:
+                from pypto_serving.serving.native_ddr.compatibility import capture_full_assets
+                from pypto_serving.serving.native_ddr.managed_pool_sdk import register_managed_pool
+                from pypto_serving.serving.native_ddr.cooperative_close import CooperativePoolClose
+                recovery_root = Path(pypto_build_dir or '.pypto_build') / f'managed-close-{os.getpid()}'
+                self._native_ddr_recovery = CooperativePoolClose(recovery_root)
+                self._native_ddr_pool_access = register_managed_pool(native_config)
+                self._native_ddr_recovery.bind_access(self._native_ddr_pool_access)
+                assets = capture_full_assets(self.config.model_dir)
+                if any(key in executor_kwargs for key in (
+                        'native_ddr_config', 'native_ddr_probe_slots', 'native_ddr_pool_access')):
+                    raise ValueError("native DDR startup owns the executor configuration")
+                executor_kwargs["native_ddr_config"] = native_config
+                executor_kwargs['native_ddr_pool_access'] = self._native_ddr_pool_access
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_ids=device_ids,
                 pypto_build_dir=str(pypto_build_dir) if pypto_build_dir is not None else None,
-                **self.config.executor_kwargs,
+                **executor_kwargs,
             )
 
             loaded = ModelLoader().load(
@@ -217,10 +274,45 @@ class WorkerProcess:
             else:
                 raise RuntimeError("Executor has no register_model method")
 
+            if native_config.enabled:
+                import uuid
+                from pypto_serving.serving.native_ddr.compatibility import build_compatibility, verify_loaded_assets
+                from pypto_serving.serving.native_ddr.types import DdrStartup
+                from pypto_serving.serving.native_ddr.worker import DdrPrefixWorker
+
+                verify_loaded_assets(self.config.model_dir, assets)
+                epoch = uuid.uuid4().hex
+                runner = self.executor._runners[self.config.model_id]
+                backend = runner.create_native_ddr_backend(loaded.runtime_model, epoch,
+                                                          observer=self._trace_native_ddr)
+                self._native_ddr_backend = backend
+                namespace, descriptor = build_compatibility(loaded, assets, epoch, backend.layout)
+                if native_config.shared_directory_endpoint:
+                    from pypto_serving.serving.native_ddr.shared_directory import DirectoryClient
+                    backend.slots.shared_directory = DirectoryClient(native_config.shared_directory_endpoint,
+                                                                      native_config.shared_directory_epoch)
+                    backend.slots.shared_directory.call('describe')
+                self._native_ddr_worker = DdrPrefixWorker(native_config, backend.layout, epoch, backend,
+                                                        namespace_digest=namespace)
+                count = backend.slots.capacity
+                self._native_ddr_startup = DdrStartup(epoch, namespace, backend.layout,
+                    count * backend.layout.block_bytes, count, descriptor, backend.slots.access.identity,
+                    backend.slots.control_metadata_bytes, backend.slots.control_metadata_mapped_bytes)
+                self._emit_native_ddr(NativeDdrMessage("startup", startup=self._native_ddr_startup))
+
+            if self._services_factory is not None:
+                self._services = self._services_factory(
+                    self.executor.runtime_extensions(), self._req_cache.__getitem__,
+                )
+                self._batch_builder = self._services.wrap_batch(self._make_decode_batch)
             logger.info("Worker model loaded and ready")
             return num_pages
 
     def _resolve_executor_cls(self):
+        if self.config.executor_cls == "PyptoDeepSeekV41Executor":
+            from pypto_serving.model.deepseek_v41.npu_executor import DeepSeekV41PyptoExecutor
+
+            return DeepSeekV41PyptoExecutor
         if self.config.executor_cls == "PyptoQwen14BExecutor":
             from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
 
@@ -267,7 +359,17 @@ class WorkerProcess:
         """Original one-command-at-a-time worker path."""
         while True:
             try:
-                raw: bytes = self.input_queue.get()
+                module = getattr(self, "_native_ddr_worker", None)
+                if module is not None and module.pending is not None:
+                    self._poll_native_ddr()
+                    raw: bytes = (
+                        self.input_queue.get(timeout=0.02) if module.pending is not None
+                        else self.input_queue.get()
+                    )
+                else:
+                    raw: bytes = self.input_queue.get()
+            except queue.Empty:
+                continue
             except Exception:
                 break
 
@@ -284,6 +386,14 @@ class WorkerProcess:
 
             if isinstance(cmd, ProfileCommand):
                 self._handle_profile_command(cmd)
+                continue
+
+            if isinstance(cmd, ControlCommand):
+                self._handle_control_command(cmd)
+                continue
+
+            if isinstance(cmd, NativeDdrCommand):
+                self._handle_native_ddr_command(cmd)
                 continue
 
             self._handle_step_command(cmd)
@@ -393,7 +503,21 @@ class WorkerProcess:
     ) -> None:
         """Dispatch FIFO device work without reclaiming host outputs."""
         while True:
-            cmd, prepared, release_cache_entries = work_queue.get()
+            module = getattr(self, "_native_ddr_worker", None)
+            if module is not None and module.pending is not None:
+                self._poll_native_ddr()
+                try:
+                    cmd, prepared, release_cache_entries = (
+                        work_queue.get(timeout=0.02) if module.pending is not None
+                        else work_queue.get()
+                    )
+                except queue.Empty:
+                    continue
+            else:
+                cmd, prepared, release_cache_entries = work_queue.get()
+            if isinstance(cmd, NativeDdrCommand):
+                self._handle_native_ddr_command(cmd)
+                continue
             if isinstance(cmd, ShutdownCommand):
                 output_work_queue.put(cmd)
                 return
@@ -402,6 +526,11 @@ class WorkerProcess:
                 continue
             if isinstance(cmd, ProfileCommand):
                 barrier = _ProfileBarrier(command=cmd, completed=threading.Event())
+                output_work_queue.put(barrier)
+                barrier.completed.wait()
+                continue
+            if isinstance(cmd, ControlCommand):
+                barrier = _ControlBarrier(command=cmd, completed=threading.Event())
                 output_work_queue.put(barrier)
                 barrier.completed.wait()
                 continue
@@ -480,6 +609,7 @@ class WorkerProcess:
                             prepared,
                             tuple(cmd.decode_requests),
                         )
+                        started_ns = self._decode_metrics.start() if self._decode_metrics else 0
                         pending = self.executor.dispatch_prepared_decode(
                             self.model_record.runtime_model,
                             dispatch_batch,
@@ -493,6 +623,7 @@ class WorkerProcess:
                             pending=pending,
                             buffer_slot=prepared.buffer_slot,
                             batch=dispatch_batch,
+                            started_ns=started_ns,
                         )
                     )
                 except Exception as exc:
@@ -529,6 +660,12 @@ class WorkerProcess:
             if isinstance(work, _ProfileBarrier):
                 try:
                     self._handle_profile_command(work.command)
+                finally:
+                    work.completed.set()
+                continue
+            if isinstance(work, _ControlBarrier):
+                try:
+                    self._handle_control_command(work.command)
                 finally:
                     work.completed.set()
                 continue
@@ -666,6 +803,12 @@ class WorkerProcess:
                 for req_id, tokens in new_tokens.items():
                     if tokens:
                         self._record_last_tokens(req_id, tokens)
+            if self._decode_metrics:
+                self._decode_metrics.record(
+                    step_id=work.cmd.step_id, started_ns=work.started_ns,
+                    request_ids=[r.request_id for r in work.scheduled], new_tokens=new_tokens,
+                    num_draft_tokens=num_draft_tokens, mode="async",
+                )
             return StepResult(
                 new_tokens=new_tokens, step_id=work.cmd.step_id, num_draft_tokens=num_draft_tokens
             )
@@ -714,20 +857,53 @@ class WorkerProcess:
         """Apply a profile command and acknowledge it after the file is flushed."""
         profiler = get_profiler(initially_active=False)
         error = None
+        transfer_profile = self._services.set_profile_active if self._services is not None else None
         try:
             if cmd.active:
                 profiler.start()
+                if callable(transfer_profile):
+                    transfer_profile(True)
             else:
-                profiler.stop()
+                try:
+                    if callable(transfer_profile):
+                        transfer_profile(False)
+                finally:
+                    profiler.stop()
             if profiler.active != cmd.active:
                 error = "SA profiling is not configured in the worker process"
         except Exception as exc:
+            if cmd.active:
+                profiler.stop()
             error = str(exc)
             logger.error("Worker profile command failed: %s", exc, exc_info=True)
 
         if self.profile_output_queue is not None:
             self.profile_output_queue.put(
-                encode_profile_result(ProfileResult(active=profiler.active, error=error))
+                encode_profile_result(ProfileResult(active=profiler.active, error=error, command_id=cmd.command_id))
+            )
+
+    def _handle_control_command(self, cmd: ControlCommand) -> None:
+        """Run a worker-owned PD operation after all older device work settles."""
+        error = None
+        payload = b""
+        try:
+            if self._services is None:
+                raise RuntimeError("worker extension control is not configured")
+            payload = self._services.handle_command(cmd.operation, cmd.payload)
+            if not isinstance(payload, bytes):
+                raise TypeError("worker control handler must return bytes")
+        except Exception as exc:
+            error = str(exc)
+            logger.error("Worker control failed: %s", exc, exc_info=True)
+        if self.profile_output_queue is not None:
+            self.profile_output_queue.put(
+                encode_control_result(
+                    ControlResult(
+                        command_id=cmd.command_id,
+                        payload=payload,
+                        error=error,
+                    )
+                )
             )
 
     def _handle_step_command(self, cmd: StepCommand) -> None:
@@ -781,7 +957,14 @@ class WorkerProcess:
                         self.model_record.tokenizer, self.model_record.config.vocab_size
                     )
                 with profile_span("WorkerProcess.constraint_compile", cat="constraints"):
-                    self._constraint_states[new_request.request_id] = self._xgrammar_provider.compile(spec)
+                    state = self._xgrammar_provider.compile(spec)
+                try:
+                    if new_request.initial_output_token_ids:
+                        state.accept(new_request.initial_output_token_ids)
+                except BaseException:
+                    state.close()
+                    raise
+                self._constraint_states[new_request.request_id] = state
             self._req_cache[new_request.request_id] = new_request
 
     def _release_finished_request_state(
@@ -808,7 +991,11 @@ class WorkerProcess:
             if constraint_state is not None:
                 constraint_state.close()
             getattr(self, "_accepted_output_lengths", {}).pop(req_id, None)
-            release_sampler = getattr(self.sampler, "release_requests", None)
+            release_sampler = getattr(
+                getattr(self, "sampler", None),
+                "release_requests",
+                None,
+            )
             if callable(release_sampler):
                 release_sampler([req_id])
 
@@ -859,6 +1046,8 @@ class WorkerProcess:
                     runtime_model,
                     new_tokens,
                     prepared_decode=prepared_decode,
+                    step_id=cmd.step_id,
+                    prefill_requests=len(cmd.prefill_requests),
                 )
 
         # Retain the tokens just sampled so a following pipelined decode step can
@@ -1095,7 +1284,7 @@ class WorkerProcess:
         # Tokens remain placeholders during early preparation. Executors with a
         # host-token dependency may patch them on the device lane; fused MTP
         # consumes persistent state finalized by the terminal-prefill command.
-        batch = self._make_decode_batch(
+        batch = self._batch_builder(
             cmd.decode_requests,
             runtime_model,
             resolve_tokens=False,
@@ -1176,6 +1365,8 @@ class WorkerProcess:
         runtime_model,
         new_tokens: dict[str, list[int]],
         prepared_decode: _PreparedDecodeWork | None = None,
+        step_id: int = 0,
+        prefill_requests: int = 0,
     ) -> dict[str, int]:
         with profile_span(
             "WorkerProcess.batch_decode",
@@ -1185,7 +1376,7 @@ class WorkerProcess:
             allow_device_greedy_sampling = self._allow_device_sampled_ids(scheduled, phase="decode")
             allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled, phase="decode")
 
-            batch = self._make_decode_batch(
+            batch = self._batch_builder(
                 scheduled,
                 runtime_model,
                 resolve_tokens=True,
@@ -1193,6 +1384,7 @@ class WorkerProcess:
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )
             if prepared_decode is None:
+                started_ns = self._decode_metrics.start() if self._decode_metrics else 0
                 decode_result = self.executor.run_decode(runtime_model, batch)
             else:
                 if prepared_decode.error is not None:
@@ -1207,12 +1399,22 @@ class WorkerProcess:
                         batch,
                         buffer_slot=prepared_decode.buffer_slot,
                     )
+                started_ns = self._decode_metrics.start() if self._decode_metrics else 0
                 decode_result = self.executor.run_prepared_decode(
                     runtime_model,
                     batch,
                     prepared,
                 )
-            return self._consume_decode_result(scheduled, decode_result, new_tokens, batch=batch)
+            num_draft_tokens = self._consume_decode_result(scheduled, decode_result, new_tokens, batch=batch)
+            if self._decode_metrics:
+                self._decode_metrics.record(
+                    step_id=step_id, started_ns=started_ns,
+                    request_ids=[r.request_id for r in scheduled], new_tokens=new_tokens,
+                    num_draft_tokens=num_draft_tokens,
+                    mode="sync_prepared" if prepared_decode is not None else "sync_unprepared",
+                    prefill_requests=prefill_requests,
+                )
+            return num_draft_tokens
 
     def _consume_decode_result(
         self,
@@ -1268,6 +1470,30 @@ class WorkerProcess:
 
     def close(self) -> None:
         """Release executor-owned runtime and device resources."""
+        if getattr(self, "_native_ddr_worker", None) is not None:
+            module = self._native_ddr_worker
+            module.closed = True
+            if module.pending is not None:
+                module.cancel(module.pending.request.job_id)
+            deadline = time.monotonic() + 65
+            while module.pending is not None and not module.poisoned and time.monotonic() < deadline:
+                self._poll_native_ddr()
+                if module.pending is not None:
+                    time.sleep(0.002)
+            if module.pending is not None or module.poisoned:
+                backend = self._native_ddr_backend
+                if getattr(backend, 'is_managed', False):
+                    # A UF control ACK can be unknown after real native cleanup.
+                    # Stop our physical device domain while retaining the UF
+                    # lease/view/unknown charge. This never emits StopProof.
+                    backend.drain_native_domain()
+                    self.executor.close_native_ddr_domain_preserving_pool(self.config.model_id)
+                    backend.owner_stopped_preserving_pool()
+                raise RuntimeError("native DDR shutdown retains unresolved native/pool obligations")
+            self._finish_native_ddr_drain()
+        elif getattr(self, "_native_ddr_backend", None) is not None:
+            # Startup failed between backend retention and handshake assembly.
+            self._native_ddr_backend.close()
         for constraint_state in getattr(self, "_constraint_states", {}).values():
             constraint_state.close()
         if hasattr(self, "_constraint_states"):
@@ -1275,13 +1501,35 @@ class WorkerProcess:
         if hasattr(self, "_accepted_output_lengths"):
             self._accepted_output_lengths.clear()
         executor = self.executor
-        self.executor = None
         if executor is None:
+            access = getattr(self, '_native_ddr_pool_access', None)
+            if access is not None and not access.closed:
+                access.close()
+            recovery = getattr(self, '_native_ddr_recovery', None)
+            if recovery is not None and access is not None and access.closed:
+                recovery.restore_after_normal_close()
             return
 
         close = getattr(executor, "close", None)
+        if (getattr(self, "_native_ddr_backend", None) is not None
+                or getattr(self, '_native_ddr_pool_access', None) is not None):
+            # This strict path propagates owner-close errors; the generic
+            # executor.close logger must not turn them into a stop proof.
+            executor.close_native_ddr_owner(self.config.model_id)
         if callable(close):
             close()
+        self.executor = None
+        access = getattr(self, '_native_ddr_pool_access', None)
+        if access is not None and not access.closed:
+            access.close()
+        recovery = getattr(self, '_native_ddr_recovery', None)
+        if recovery is not None and access is not None and access.closed:
+            recovery.restore_after_normal_close()
+        if getattr(self, "_native_ddr_worker", None) is not None and not self._native_ddr_stop_sent:
+            from pypto_serving.serving.native_ddr.worker import NativeStopProof
+            proof = NativeStopProof(self._native_ddr_worker.worker_epoch, True, True)
+            self._emit_native_ddr(NativeDdrMessage("stopped", proof=proof))
+            self._native_ddr_stop_sent = True
 
     def _sample_result_row(
         self,
@@ -1313,6 +1561,168 @@ class WorkerProcess:
         if logits is None or logits.numel() == 0:
             raise ValueError("host sampling requires logits when device sampling is unavailable")
         return self.sampler.sample(logits, params, request_id)
+
+    def _trace_native_ddr(self, item):
+        logger.info("native_ddr_trace %s", json.dumps(item, sort_keys=True))
+
+    def _emit_native_ddr(self, message):
+        if message.kind in ("transfer", "control"):
+            event = message.event if message.kind == "transfer" else message.control
+            pending = self._native_ddr_worker.pending
+            request = None
+            if message.kind == 'transfer':
+                record = self._native_ddr_worker.transfer_replay.records.get(event.delivery_sequence)
+                if record is not None:
+                    request = asdict(record.identity)
+                    request['entry_keys'] = [{'namespace_digest': key.namespace_digest.hex(),
+                                              'block_hash': key.block_hash.hex()} for key in record.identity.entry_keys]
+            logger.info("native_ddr_receipt %s", json.dumps({
+                "time_ns": time.monotonic_ns(),
+                "kind": message.kind, "identity": getattr(event, "job_id", getattr(event, "command_id", "")),
+                "delivery_sequence": event.delivery_sequence,
+                "status": event.status.value if message.kind == "transfer" else "control",
+                "error": event.error,
+                "event": asdict(event) if message.kind == 'transfer' else None,
+                "request": request,
+                "first_nonterminal_failure": pending.first_failure_detail if pending is not None else None,
+                "pending_owner": ({'has_handle': pending.handle is not None,
+                    'quarantined': pending.quarantined, 'cancelled': pending.cancelled,
+                    'entry_state': pending.entry.state.value, 'readers': pending.entry.readers}
+                    if pending is not None else None),
+                "transfer_replay": self._native_ddr_worker.transfer_replay.stats(),
+                "control_replay": (self._native_ddr_control_replay.stats()
+                                   if getattr(self, "_native_ddr_control_replay", None) is not None else None),
+            }, sort_keys=True))
+        self.native_ddr_output_queue.put(encode_native_ddr_message(message))
+
+    def _complete_native_ddr_control(self, cmd, event):
+        from dataclasses import replace
+        event = replace(event, delivery_sequence=cmd.delivery_sequence)
+        access = getattr(getattr(self._native_ddr_backend, 'slots', None), 'access', None)
+        self._native_ddr_control_replay.finish(cmd, event,
+            protected=self._native_ddr_worker.poisoned or bool(access is not None and access.unknown))
+        self._emit_native_ddr(NativeDdrMessage("control", control=event))
+
+    def _finish_native_ddr_drain(self):
+        module = self._native_ddr_worker
+        module.close()
+        backend = self._native_ddr_backend
+        backend.close()
+        self._poll_native_ddr_controls()
+        from pypto_serving.serving.native_ddr.types import DdrControlEvent
+        for command_id, cmd in tuple(self._native_ddr_drain_commands.items()):
+            event = DdrControlEvent(command_id, module.worker_epoch, "drain", released=True)
+            self._complete_native_ddr_control(cmd, event)
+            del self._native_ddr_drain_commands[command_id]
+
+    def _poll_native_ddr_controls(self):
+        from pypto_serving.serving.native_ddr.types import DdrControlEvent
+        module = self._native_ddr_worker
+        for command_id, cmd in tuple(getattr(self, "_native_ddr_controls", {}).items()):
+            entry = module.entries.get(cmd.entry_ref.entry_id)
+            if entry is None:
+                event = DdrControlEvent(command_id, module.worker_epoch, "evict", cmd.entry_ref, True)
+                self._complete_native_ddr_control(cmd, event)
+                del self._native_ddr_controls[command_id]
+
+    def _poll_native_ddr(self):
+        for event in self._native_ddr_worker.poll_completed():
+            self._emit_native_ddr(NativeDdrMessage("transfer", event=event))
+        self._poll_native_ddr_controls()
+        module = self._native_ddr_worker
+        if module.closed and module.pending is None and not module.poisoned:
+            self._finish_native_ddr_drain()
+
+    def _handle_native_ddr_command(self, cmd):
+        module = self._native_ddr_worker
+        if module is None or self.native_ddr_output_queue is None:
+            raise RuntimeError("native DDR command on a disabled/unavailable worker")
+        if cmd.operation == "submit":
+            if cmd.request is None:
+                raise ValueError("native DDR submit requires a request")
+            event = module.submit_transfer(cmd.request)
+            self._emit_native_ddr(NativeDdrMessage("transfer", event=event))
+        else:
+            from pypto_serving.serving.native_ddr.types import DdrControlEvent, DdrControlRequest
+            from pypto_serving.serving.native_ddr.replay import ReplayError, ReplayLedger
+            cmd = DdrControlRequest(cmd.command_id, cmd.worker_epoch, cmd.operation, cmd.job_id,
+                                    cmd.entry_ref, cmd.page_ids, cmd.diagnostic_label, cmd.fault,
+                                    cmd.delivery_sequence, cmd.retire_through, cmd.imported, cmd.imported_key)
+            if cmd.worker_epoch != module.worker_epoch or not cmd.command_id:
+                event = DdrControlEvent(cmd.command_id, cmd.worker_epoch, cmd.operation,
+                                        cmd.entry_ref, error="invalid control epoch/identity",
+                                        delivery_sequence=cmd.delivery_sequence)
+                self._emit_native_ddr(NativeDdrMessage("control", control=event))
+                return
+            if self._native_ddr_control_replay is None:
+                self._native_ddr_control_replay = ReplayLedger()
+            try:
+                receipt, fresh = self._native_ddr_control_replay.begin(cmd, cmd.command_id)
+            except ReplayError as error:
+                event = DdrControlEvent(cmd.command_id, module.worker_epoch, cmd.operation,
+                    cmd.entry_ref, error=str(error), delivery_sequence=cmd.delivery_sequence)
+                self._emit_native_ddr(NativeDdrMessage("control", control=event))
+                return
+            if not fresh:
+                if receipt.response is not None:
+                    self._emit_native_ddr(NativeDdrMessage("control", control=receipt.response))
+                return
+            if cmd.operation == "cancel":
+                module.cancel(cmd.job_id)
+                event = DdrControlEvent(cmd.command_id, module.worker_epoch, "cancel")
+                self._complete_native_ddr_control(cmd, event)
+            elif cmd.operation == 'import':
+                try:
+                    if cmd.entry_ref is None or cmd.imported_key is None or cmd.imported is None:
+                        raise ValueError('typed managed import requires exact ref/key/committed metadata')
+                    backing = module.import_committed(cmd.entry_ref, cmd.imported_key, cmd.imported)
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, 'import', cmd.entry_ref,
+                                            imported=cmd.imported, pool_ack=backing.import_ack)
+                except (ValueError, RuntimeError) as error:
+                    from pypto_serving.serving.native_ddr.managed_pool import SharedImportUnavailable
+                    detail = ('shared-import-unavailable:' + str(error)
+                              if isinstance(error, SharedImportUnavailable) and not module.poisoned else str(error))
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, 'import', cmd.entry_ref,
+                                            error=detail)
+                self._complete_native_ddr_control(cmd, event)
+            elif cmd.operation == "evict":
+                if cmd.entry_ref is None:
+                    raise ValueError("native DDR evict requires an entry ref")
+                try:
+                    module.evict(cmd.entry_ref)
+                except ValueError as error:
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, "evict",
+                                            cmd.entry_ref, error=str(error))
+                    self._complete_native_ddr_control(cmd, event)
+                    return
+                self._native_ddr_controls[cmd.command_id] = cmd
+                self._poll_native_ddr_controls()
+            elif cmd.operation == "diagnostic":
+                from pypto_serving.serving.native_ddr.diagnostics import inspect_idle_pages
+                try:
+                    payload = inspect_idle_pages(self._native_ddr_backend, module, cmd)
+                    details = json.loads(payload)
+                    details["control_replay"] = self._native_ddr_control_replay.stats()
+                    payload = json.dumps(details, sort_keys=True).encode()
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, "diagnostic", payload=payload)
+                except (ValueError, RuntimeError, OSError) as error:
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, "diagnostic", error=str(error))
+                self._complete_native_ddr_control(cmd, event)
+            elif cmd.operation == "fault":
+                from pypto_serving.serving.native_ddr.diagnostics import arm_short_receipt
+                try:
+                    arm_short_receipt(self._native_ddr_backend, module, cmd.fault)
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, "fault",
+                                            payload=json.dumps({"armed": cmd.fault}).encode())
+                except (ValueError, RuntimeError) as error:
+                    event = DdrControlEvent(cmd.command_id, module.worker_epoch, "fault", error=str(error))
+                self._complete_native_ddr_control(cmd, event)
+            else:
+                self._native_ddr_drain_commands[cmd.command_id] = cmd
+                module.closed = True
+                if module.pending is not None:
+                    module.cancel(module.pending.request.job_id)
+                self._poll_native_ddr()
 
     def _accept_output_tokens(self, request_id: str, count: int) -> None:
         lengths = getattr(self, "_accepted_output_lengths", {})
@@ -1401,8 +1811,11 @@ def _worker_entry(
     input_queue: mp.Queue,
     output_queue: mp.Queue,
     ready_event,
-    num_pages_value,
+    cache_capacity,
     profile_output_queue: mp.Queue | None = None,
+    services_factory=None,
+    native_ddr_output_queue=None,
+    startup_status=None,
 ):
     """Entry point for the worker subprocess."""
     import signal
@@ -1420,35 +1833,59 @@ def _worker_entry(
     )
     configure_runtime_logging()
 
-    worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue)
+    worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue, services_factory)
+    retained_error = None
+    if native_ddr_output_queue is not None:
+        worker.native_ddr_output_queue = native_ddr_output_queue
     try:
         num_pages = worker.init_device_and_model()
-        num_pages_value.value = num_pages
+        sizes = worker.executor.cache_group_sizes(config.model_id)
+        groups = config.resolve_runtime_config().kv_cache_groups
+        if sizes and set(sizes) != {group.name for group in groups}:
+            raise ValueError("executor must report capacity for every cache group")
+        if sizes and (any(type(size) is not int or size <= 0 for size in sizes.values())
+                      or sizes[groups[0].name] != num_pages):
+            raise ValueError("invalid executor cache group capacities")
+        for index, group in enumerate(groups, 1):
+            cache_capacity[index] = sizes.get(group.name, 0)
+        cache_capacity[0] = num_pages
         # Model weights, compiled kernels and KV-cache objects are now resident.
         # Freeze them so the GC won't rescan them during decode (avoids
         # multi-ms gen2 pauses landing mid-step). Must happen in this process:
         # gc.freeze() does not cross the spawn boundary.
         freeze_gc_heap()
+        if startup_status is not None:
+            startup_status[0] = 1
         ready_event.set()
         worker.busy_loop()
     except Exception as e:
+        retained_error = e
         logger.error(f"Worker process failed: {e}", exc_info=True)
+        if startup_status is not None:
+            error = f"{type(e).__name__}: {e}".encode("utf-8")[:4095]
+            startup_status[1:1 + len(error)] = error
+            startup_status[0] = 2
         ready_event.set()
     finally:
         try:
             worker.close()
-        except Exception:
+        except Exception as close_error:
+            if retained_error is None:
+                retained_error = close_error
             logger.exception("Worker process cleanup failed")
         get_profiler(initially_active=False).stop()
+        recovery = getattr(worker, '_native_ddr_recovery', None)
+        access = getattr(worker, '_native_ddr_pool_access', None)
+        if recovery is not None and (access is None or not access.closed):
+            recovery.retain_failure(retained_error or RuntimeError('managed client remains after normal close'))
 
 
-def spawn_worker(config: EngineConfig):
+def spawn_worker(config: EngineConfig, *, services_factory=None):
     """Spawn a worker process and return its process, queues, and ready state.
 
-    ``num_pages_value`` is a shared ``multiprocessing.Value('i')`` that the
-    worker writes after ``init_device_and_model()`` completes.  The main
-    process reads it to synchronise the ``KvCacheManager`` block metadata with
-    the actual device-side KV cache size. Profile acknowledgements use a
+    ``cache_capacity`` reports primary and optional per-group physical counts
+    through one shared array after model initialization. The main process
+    initializes allocator metadata from these exact sizes. Profile replies use a
     dedicated output queue so they cannot be mistaken for inference results.
     """
     ctx = mp.get_context("spawn")
@@ -1456,7 +1893,10 @@ def spawn_worker(config: EngineConfig):
     output_queue = ctx.Queue()
     profile_output_queue = ctx.Queue()
     ready_event = ctx.Event()
-    num_pages_value = ctx.Value("i", 0)
+    startup_status = ctx.Array("B", 4097)
+    cache_capacity = ctx.Array("q", 1 + len(config.resolve_runtime_config().kv_cache_groups))
+    native_ddr_output_queue = (ctx.Queue(maxsize=16)
+                               if config.resolve_runtime_config().native_ddr.enabled else None)
 
     process = ctx.Process(
         target=_worker_entry,
@@ -1465,17 +1905,23 @@ def spawn_worker(config: EngineConfig):
             input_queue,
             output_queue,
             ready_event,
-            num_pages_value,
+            cache_capacity,
             profile_output_queue,
+            services_factory,
+            native_ddr_output_queue,
+            startup_status,
         ),
         daemon=False,
     )
     process.start()
+    process.startup_status = startup_status
+    if native_ddr_output_queue is not None:
+        process.native_ddr_output_queue = native_ddr_output_queue
     return (
         process,
         input_queue,
         output_queue,
         profile_output_queue,
         ready_event,
-        num_pages_value,
+        cache_capacity,
     )

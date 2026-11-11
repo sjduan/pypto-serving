@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "resource_group": "phasef-parallel-20261106",
+  "partition": "M1",
+  "pool": {
+    "binding_id": 40000,
+    "canonical": {
+      "access": 2,
+      "address_space": 0,
+      "backend_kind": 1,
+      "body_hex": "70736d5f6333613366363833",
+      "buffer_id": 100,
+      "dev": 25,
+      "generation": 1,
+      "inode": 1445696,
+      "kind": "posix_shm_simpler",
+      "native_descriptor": "validated-Simpler-Buffer-ABI-v1",
+      "nbytes": 134217728,
+      "owner_instance_id": "6bafc76a4b9ef44c",
+      "owner_worker_path_id": 0
+    },
+    "nbytes": 134217728,
+    "placement_id": 10000,
+    "pool_epoch": "bdf1cb60-a8a0-49ea-82a1-1b83a9db630b",
+    "pool_id": "c4870d27-084c-404d-a8f7-8be92c8073ff",
+    "provider_kind": "posix_shm_simpler",
+    "provider_session": "0ab9dca4-a781-459d-ac24-1a78201916a8",
+    "resource_generation": 1,
+    "resource_id": 100,
+    "schema": 1,
+    "state": "Allocated"
+  },
+  "blocks": [
+    {
+      "pool_id": "c4870d27-084c-404d-a8f7-8be92c8073ff",
+      "pool_epoch": "bdf1cb60-a8a0-49ea-82a1-1b83a9db630b",
+      "block_id": 2,
+      "generation": 1,
+      "nbytes": 23068672,
+      "byte_offset": 23068672
+    },
+    {
+      "pool_id": "c4870d27-084c-404d-a8f7-8be92c8073ff",
+      "pool_epoch": "bdf1cb60-a8a0-49ea-82a1-1b83a9db630b",
+      "block_id": 3,
+      "generation": 1,
+      "nbytes": 23068672,
+      "byte_offset": 46137344
+    },
+    {
+      "pool_id": "c4870d27-084c-404d-a8f7-8be92c8073ff",
+      "pool_epoch": "bdf1cb60-a8a0-49ea-82a1-1b83a9db630b",
+      "block_id": 4,
+      "generation": 1,
+      "nbytes": 23068672,
+      "byte_offset": 69206016
+    },
+    {
+      "pool_id": "c4870d27-084c-404d-a8f7-8be92c8073ff",
+      "pool_epoch": "bdf1cb60-a8a0-49ea-82a1-1b83a9db630b",
+      "block_id": 5,
+      "generation": 1,
+      "nbytes": 23068672,
+      "byte_offset": 92274688
+    }
+  ],
+  "source_manifest_sha256": "f4f69367a7c2a38b61262469b9b996bf4e26caebc27a9de21ba00636749a8b72",
+  "session_manifest": "/workspace/uflow/runs/phasef-parallel-20261106/p/manifest.json"
+}

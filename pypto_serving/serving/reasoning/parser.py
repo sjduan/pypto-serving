@@ -33,7 +33,7 @@ class OutputParserSpec:
     tool_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.parser_id != "deepseek_v4":
+        if self.parser_id not in ("deepseek_v4", "deepseek_v41"):
             raise ValueError(f"unsupported output parser {self.parser_id!r}")
         if self.initial_state not in ("content", "reasoning"):
             raise ValueError("output parser initial_state must be content or reasoning")
@@ -380,6 +380,8 @@ def create_output_parser(spec: OutputParserSpec | None, tokenizer) -> OutputPars
     """Create one request-local parser from a normalized Serving contract."""
     if spec is None:
         return None
+    if spec.parser_id == "deepseek_v41":
+        return DeepSeekV4ReasoningParser(tokenizer, spec)
     if spec.parser_id == "deepseek_v4":
         if spec.tool_names:
             from .deepseek_v4_tools import DeepSeekV4ToolParser

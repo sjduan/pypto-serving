@@ -1,0 +1,78 @@
+name: UFlow host contracts
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TORCH_DEVICE_BACKEND_AUTOLOAD: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Read fixed UFlow revision
+        id: uflow
+        run: |
+          python -c 'import json,os; p=json.load(open("dependencies/uflow-sdk.json")); open(os.environ["GITHUB_OUTPUT"],"a").write("ref="+p["commit"]+"\n")'
+      - uses: actions/checkout@v4
+        with:
+          repository: sjduan/UFlow
+          ref: ${{ steps.uflow.outputs.ref }}
+          path: uflow-checkout
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest pyyaml -r pypto_serving/requirements-runtime.txt
+          python -m pip install --no-deps -e .
+          python -m pip install --no-deps ./uflow-checkout/sdk/python
+      - name: Run host contracts and lifecycle checks
+        run: |
+          python -m pytest -q --junitxml="$RUNNER_TEMP/uflow-host.xml" \
+            tests/unit/serving/test_managed_pool_*.py \
+            tests/unit/serving/test_existing_pool.py \
+            tests/unit/serving/test_shared_partition.py \
+            tests/unit/serving/test_shared_prefix_directory.py \
+            tests/unit/serving/test_shared_exchange*.py \
+            tests/unit/serving/test_shared_prefix_record.py \
+            tests/unit/serving/test_cooperative_close.py \
+            tests/unit/serving/test_terminal_unmap.py \
+            tests/unit/test_task_supervisor.py \
+            tests/unit/test_task_entry_imports.py \
+            tests/unit/test_locked_lib.py
+      - name: Validate private SHM closure in an isolated CPU container
+        # The runtime retains SHM when another UID's FD/VMA cannot be inspected.
+        # Keep that fail-closed rule; test full closure and real UID-denial cases
+        # in a private PID/SHM namespace. The hosted service has only partial
+        # cgroup delegation; a read-only container uses the supported subreaper
+        # path, as on the validated B container. No device is passed through.
+        run: |
+          set -o pipefail
+          docker pull python:3.11-slim
+          docker image inspect python:3.11-slim --format '{{index .RepoDigests 0}}'
+          timeout --signal=TERM --kill-after=10s 180s \
+            docker run --rm --init --network none --read-only --cpus=2 --memory=512m \
+              --pids-limit=256 --shm-size=64m --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+              -e PYTHONPATH=/src -e PYTHONDONTWRITEBYTECODE=1 -e TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+              -v "$GITHUB_WORKSPACE:/src:ro" -w /src python:3.11-slim \
+              python -B -m unittest tests.unit.test_task_lifecycle 2>&1 \
+            | tee "$RUNNER_TEMP/uflow-lifecycle.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uflow-host-contracts
+          path: |
+            ${{ runner.temp }}/uflow-host.xml
+            ${{ runner.temp }}/uflow-lifecycle.log
