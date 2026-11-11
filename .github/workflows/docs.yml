@@ -86,14 +86,14 @@ jobs:
         run: mkdocs build --strict
 
       - name: Upload artifact
-        if: github.repository == 'hw-native-sys/pypto-serving' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   deploy:
     # Only main publishes; a pull request builds to prove the docs still compile.
-    if: github.repository == 'hw-native-sys/pypto-serving' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     permissions:

@@ -95,7 +95,6 @@ nav:
           - Offline Inference: user-guide/offline-inference.md
           - Online Serving: user-guide/online-serving.md
           - Tool Calling: user-guide/tool-calling.md
-          - PD Disaggregation: user-guide/pd-disaggregation.md
           - Parallelism and Scaling: user-guide/parallel.md
           - Multi-Node Routing: user-guide/multi-node-routing.md
           - Troubleshooting: user-guide/troubleshooting.md
@@ -116,7 +115,6 @@ nav:
       - Router CLI: cli-reference/pypto-serving-router.md
   - Developer Guide:
       - Architecture: developer-guide/architecture.md
-      - UFlow Shared DDR Baseline: development/uflow-baseline.md
       - Profiling: developer-guide/profile.md
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md

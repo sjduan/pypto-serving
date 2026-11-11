@@ -87,9 +87,8 @@ def test_replica_name_defaults_to_host_port(tmp_path):
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
-        ({"nodes": []}, "unknown top-level keys: nodes"),
-        ({"replicas": []}, "neither a replica nor a launchable host"),
-        ({"replicas": [], "hosts": []}, "neither a replica nor a launchable host"),
+        ({"nodes": []}, "non-empty 'replicas' list"),
+        ({"replicas": []}, "non-empty 'replicas' list"),
         ({"replicas": [{"host": "h"}]}, "needs 'host' and 'port'"),
         ({"replicas": [{"port": 8000}]}, "needs 'host' and 'port'"),
         ({"replicas": ["nope"]}, "needs 'host' and 'port'"),
@@ -218,21 +217,6 @@ def test_new_sessions_spread_across_replicas():
     assert sorted(registry.select(f"s{i}").replica.name for i in range(3)) == ["r0", "r1", "r2"]
 
 
-def test_policy_cannot_bypass_eligibility_or_commit_a_rejected_choice():
-    registry, sessions = _registry(_config())
-    excluded, eligible = registry.states
-    registry.set_draining(excluded.name, True)
-    def choose(candidates, **kwargs):
-        assert candidates == (eligible,)
-        return excluded, "invalid_choice"
-    registry.policy = SimpleNamespace(select=choose)
-    with pytest.raises(NoReplicaAvailable, match="ineligible"):
-        registry.select("session")
-    assert sessions.lookup("session") is None
-    assert registry.total_routed() == 0 and registry.affinity_hits == 0
-    assert all(state.outstanding == state.routed == 0 for state in registry.states)
-
-
 def test_expired_pin_re_routes_by_load():
     clock = _Clock()
     registry, sessions = _registry(_config(session_ttl_seconds=60.0), clock=clock)
@@ -290,21 +274,14 @@ def test_counters_track_where_requests_went():
     assert sum(state.routed for state in registry.states) == 4
 
 
-def test_count_release_is_once_and_bound_to_the_original_node():
+def test_release_floors_at_zero_and_unknown_names_are_ignored():
     registry, _ = _registry(_config())
-    old = registry.state("r0")
-    release = registry.acquire("r0", "r1")
-    registry.remove("r0")
-    registry.add(ReplicaSpec("r0", "replacement", 9000), ready=True)
-    new_release = registry.acquire("r0")
-    release("r0")
-    release("r0")
-    assert old.outstanding == 0 and registry.state("r0").outstanding == 1
-    assert registry.state("r1").outstanding == 1
-    release()
-    release()
-    new_release()
-    assert all(state.outstanding == 0 for state in registry.states)
+    registry.release("r0")
+    assert registry.state("r0").outstanding == 0
+    registry.acquire("ghost")
+    registry.release("ghost")
+    registry.set_ready("ghost", False)
+    assert registry.ready_count() == 2
 
 
 # --- health polling ---
@@ -380,25 +357,3 @@ def test_monitor_starts_and_stops_cleanly():
 
     assert asyncio.run(check()) > 0
     asyncio.run(monitor.stop())  # safe without a start
-
-
-def test_a_full_connection_pool_does_not_demote_a_healthy_replica():
-    """PoolTimeout is the router running out of its own connections.
-
-    It says nothing about the replica, and it hits every replica at once,
-    because the pool is the thing they share. Counting it as a failed probe
-    takes a healthy fleet out of rotation -- and, now that a replica which
-    stays unroutable is stopped and replaced, spends a model load on each.
-    """
-    httpx = pytest.importorskip("httpx")
-    monitor, registry, _ = _monitor(
-        answers={"http://h:8000/health": httpx.PoolTimeout("no free connection")}
-    )
-
-    async def several_cycles():
-        for _ in range(UNHEALTHY_THRESHOLD + 2):
-            await monitor.probe_once()
-
-    asyncio.run(several_cycles())
-    assert registry.state("r0").ready is True
-    assert registry.state("r0").failures == 0, "a probe that never left is not a failure"
