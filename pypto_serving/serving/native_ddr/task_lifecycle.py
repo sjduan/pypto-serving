@@ -12,6 +12,15 @@ This is part of the normal Python launcher, installed before the task runs. It
 does not attach to a live interpreter or replace any frozen runtime function.
 Python audit hooks observe trusted cooperative code; they are not a sandbox.
 """
+import sys
+
+if __name__ == '__main__' and not __package__:
+    _entry_directory = sys.path.pop(0)
+    try:
+        __import__('types')
+    finally:
+        sys.path.insert(0, _entry_directory)
+
 import array
 import hashlib
 import json
@@ -21,7 +30,6 @@ import re
 import runpy
 import socket
 import struct
-import sys
 
 ENV = 'UFLOW_TASK_LIFECYCLE'
 WORKER_SHA256 = 'f28dbd43ff747080eec171d774e0934a3b19bbf7b153c7a0f5880117d4144a1f'

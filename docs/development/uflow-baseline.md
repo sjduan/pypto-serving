@@ -30,7 +30,10 @@ Generate a new configuration and partition contract for a later device run.
 ## Bounded task lifecycle
 
 The generic `task_supervisor.py`, `task_lifecycle.py` and `task_resources.py`
-are copied unchanged from separately accepted safe-teardown commit `567be28`.
+come from separately accepted safe-teardown commit `567be28`. Their standalone
+entry now loads standard-library `types` before exposing the script directory,
+preventing the sibling `types.py` from shadowing it in a clean interpreter.
+Ownership, signal, resource and accounting checks remain unchanged.
 Its pure physical-versus-logical classifier is available as `closure_report.py`;
 generic tests no longer import the O1 experiment directory. The O1 entry and
 its three entry-specific CPU tests remain on that separate branch. Use the supervisor for new native

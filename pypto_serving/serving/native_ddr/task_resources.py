@@ -12,6 +12,15 @@ Only exclusive creations observed by the static launcher are eligible. Naming
 conventions alone confer no authority. UF/provider/shared/unknown allocations
 are never unlinked. Missing creation evidence is a retained cleanup failure.
 """
+import sys
+
+if __name__ == '__main__' and not __package__:
+    _entry_directory = sys.path.pop(0)
+    try:
+        __import__('types')
+    finally:
+        sys.path.insert(0, _entry_directory)
+
 import array
 import ctypes
 import hashlib
@@ -24,7 +33,6 @@ import socket
 import stat
 import struct
 import subprocess
-import sys
 import time
 import uuid
 

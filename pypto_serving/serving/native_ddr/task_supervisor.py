@@ -12,6 +12,17 @@ Run in a dedicated supervisor process, never a native-owning Python thread.
 The only children it creates are a gated task entry and that entry's descendants.
 It exports physical process evidence, never an SDK unmap/native-drain ACK.
 """
+import sys
+
+# Literal script entry otherwise lets the sibling types.py shadow the stdlib
+# before argparse/enum load. Preserve standalone use and Python 3.10 support.
+if __name__ == '__main__' and not __package__:
+    _entry_directory = sys.path.pop(0)
+    try:
+        __import__('types')
+    finally:
+        sys.path.insert(0, _entry_directory)
+
 import argparse
 import ctypes
 import json
@@ -21,7 +32,6 @@ from pathlib import Path
 import signal
 import stat
 import subprocess
-import sys
 import time
 import uuid
 

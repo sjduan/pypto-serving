@@ -50,6 +50,7 @@ jobs:
             tests/unit/serving/test_cooperative_close.py \
             tests/unit/serving/test_terminal_unmap.py \
             tests/unit/test_task_supervisor.py \
+            tests/unit/test_task_entry_imports.py \
             tests/unit/test_locked_lib.py
       - name: Validate private SHM closure in an isolated CPU container
         # The runtime retains SHM when another UID's FD/VMA cannot be inspected.
