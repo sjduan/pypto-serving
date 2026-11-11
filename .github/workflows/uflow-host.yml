@@ -56,7 +56,8 @@ jobs:
         # Keep that fail-closed rule; test full closure and real UID-denial cases
         # as root only on this disposable hosted VM, with no device present.
         run: |
-          sudo --preserve-env=PYTHONPATH,TORCH_DEVICE_BACKEND_AUTOLOAD,PYTHONDONTWRITEBYTECODE,LD_LIBRARY_PATH \
+          sudo env PYTHONPATH="$PYTHONPATH" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+            PYTHONDONTWRITEBYTECODE=1 LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
             "$(command -v python)" -B -m pytest -q --junitxml="$RUNNER_TEMP/uflow-lifecycle.xml" \
             tests/unit/test_task_lifecycle.py
       - uses: actions/upload-artifact@v4

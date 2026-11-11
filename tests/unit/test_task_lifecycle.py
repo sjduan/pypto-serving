@@ -142,9 +142,14 @@ class TaskLifecycleTests(unittest.TestCase):
                     foreign = (p, fd)
                     (root / 'foreign.json').write_text(json.dumps({'name': p.name}))
                 start = time.monotonic()
-                result = supervisor.run_external([sys.executable, '-B', '-s', str(Path(__file__).resolve()), '--actor', mode, str(root)],
-                    root / 'monitor', run_seconds=120, grace_seconds=.2, close_seconds=.15, term_seconds=.15,
-                    kill_seconds=.8, private_shm=True, private_cleanup_seconds=cleanup_seconds)
+                try:
+                    result = supervisor.run_external([sys.executable, '-B', '-s', str(Path(__file__).resolve()), '--actor', mode, str(root)],
+                        root / 'monitor', run_seconds=120, grace_seconds=.2, close_seconds=.15, term_seconds=.15,
+                        kill_seconds=.8, private_shm=True, private_cleanup_seconds=cleanup_seconds)
+                except RuntimeError as error:
+                    with (root / 'monitor/supervisor.log').open('rb') as stream:
+                        diagnostic = stream.read(8192).decode(errors='replace')
+                    raise AssertionError(f'CPU fixture monitor failed: {diagnostic}') from error
                 proof = {'case': mode, 'result': result, 'wall_seconds': time.monotonic() - start,
                          'log': (root / 'monitor/task.log').read_text(errors='replace')}
                 PROOFS.append(proof)
