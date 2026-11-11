@@ -32,6 +32,7 @@ from pypto_serving.model.qwen.npu_runner import (
     _L3Callable,
     Qwen314BModelRunner,
 )
+from pypto_serving.model.qwen.source_guard import reject_unpatched_uflow_base
 
 
 _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
@@ -76,6 +77,7 @@ def _find_pypto_lib_qwen14b_dir(pypto_lib_root: str | None = None) -> Path:
     if pypto_lib_root:
         candidate = Path(pypto_lib_root) / "models" / "qwen3_14b"
         if candidate.is_dir():
+            reject_unpatched_uflow_base(candidate)
             return candidate
         raise FileNotFoundError(f"Qwen3-14B kernel directory not found under PYPTO_LIB_ROOT={pypto_lib_root!r}")
 
@@ -83,6 +85,7 @@ def _find_pypto_lib_qwen14b_dir(pypto_lib_root: str | None = None) -> Path:
     for directory in (start_dir, *start_dir.parents):
         candidate = directory / "pypto-lib" / "models" / "qwen3_14b"
         if candidate.is_dir():
+            reject_unpatched_uflow_base(candidate)
             return candidate
     raise FileNotFoundError(
         "Cannot locate Qwen3-14B kernels. Run from a checkout with pypto-lib available "

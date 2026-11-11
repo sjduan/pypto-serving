@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      run_npu:
+        description: "Explicitly run physical NPU jobs on this fork"
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -27,6 +32,7 @@ jobs:
           extra_args: --all-files
 
   unit-tests:
+    if: github.repository == 'hw-native-sys/pypto-serving' || (github.event_name == 'workflow_dispatch' && inputs.run_npu)
     runs-on: [self-hosted, linux, arm64, npu]
     # The DeepSeek matrix client waits up to 2400 seconds while the daemon caps
     # the task at 3600 seconds. The venv no longer inherits a base env's torch,
@@ -156,6 +162,7 @@ jobs:
           checkout-path: dist-checkout
 
   v41-a5-smoke:
+    if: github.repository == 'hw-native-sys/pypto-serving' || (github.event_name == 'workflow_dispatch' && inputs.run_npu)
     # The A5 runner must provide PYPTO_DSV41_MODEL_DIR.
     runs-on: [self-hosted, linux, npu-a5]
     timeout-minutes: 180

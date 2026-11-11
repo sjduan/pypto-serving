@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '17 18 * * *'  # 02:17 Asia/Shanghai (next day UTC), away from pypto-lib's morning run.
   workflow_dispatch:
+    inputs:
+      run_npu:
+        description: "Explicitly run physical NPU performance jobs on this fork"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -14,6 +19,7 @@ concurrency:
 
 jobs:
   dspark-performance:
+    if: github.repository == 'hw-native-sys/pypto-serving' || (github.event_name == 'workflow_dispatch' && inputs.run_npu)
     runs-on: [self-hosted, linux, arm64, npu]
     timeout-minutes: 720
     env:

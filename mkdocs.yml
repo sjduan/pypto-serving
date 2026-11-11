@@ -116,6 +116,7 @@ nav:
       - Router CLI: cli-reference/pypto-serving-router.md
   - Developer Guide:
       - Architecture: developer-guide/architecture.md
+      - UFlow Shared DDR Baseline: development/uflow-baseline.md
       - Profiling: developer-guide/profile.md
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
