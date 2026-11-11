@@ -49,10 +49,20 @@ jobs:
             tests/unit/serving/test_shared_prefix_record.py \
             tests/unit/serving/test_cooperative_close.py \
             tests/unit/serving/test_terminal_unmap.py \
-            tests/unit/test_task_supervisor.py tests/unit/test_task_lifecycle.py \
+            tests/unit/test_task_supervisor.py \
             tests/unit/test_locked_lib.py
+      - name: Validate private SHM closure with complete process visibility
+        # The runtime retains SHM when another UID's FD/VMA cannot be inspected.
+        # Keep that fail-closed rule; test full closure and real UID-denial cases
+        # as root only on this disposable hosted VM, with no device present.
+        run: |
+          sudo --preserve-env=PYTHONPATH,TORCH_DEVICE_BACKEND_AUTOLOAD,PYTHONDONTWRITEBYTECODE,LD_LIBRARY_PATH \
+            "$(command -v python)" -B -m pytest -q --junitxml="$RUNNER_TEMP/uflow-lifecycle.xml" \
+            tests/unit/test_task_lifecycle.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: uflow-host-contracts
-          path: ${{ runner.temp }}/uflow-host.xml
+          path: |
+            ${{ runner.temp }}/uflow-host.xml
+            ${{ runner.temp }}/uflow-lifecycle.xml
