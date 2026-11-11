@@ -32,7 +32,6 @@ from pypto_serving.model.qwen.npu_runner import (
     _L3Callable,
     Qwen314BModelRunner,
 )
-from pypto_serving.model.qwen.source_guard import reject_unpatched_uflow_base
 
 
 _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
@@ -77,7 +76,6 @@ def _find_pypto_lib_qwen14b_dir(pypto_lib_root: str | None = None) -> Path:
     if pypto_lib_root:
         candidate = Path(pypto_lib_root) / "models" / "qwen3_14b"
         if candidate.is_dir():
-            reject_unpatched_uflow_base(candidate)
             return candidate
         raise FileNotFoundError(f"Qwen3-14B kernel directory not found under PYPTO_LIB_ROOT={pypto_lib_root!r}")
 
@@ -85,7 +83,6 @@ def _find_pypto_lib_qwen14b_dir(pypto_lib_root: str | None = None) -> Path:
     for directory in (start_dir, *start_dir.parents):
         candidate = directory / "pypto-lib" / "models" / "qwen3_14b"
         if candidate.is_dir():
-            reject_unpatched_uflow_base(candidate)
             return candidate
     raise FileNotFoundError(
         "Cannot locate Qwen3-14B kernels. Run from a checkout with pypto-lib available "
@@ -131,17 +128,11 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         platform: str = "a2a3sim",
         device_ids: Sequence[int] = (0,),
         pypto_build_dir: str | None = None,
-        native_ddr_config=None,
-        native_ddr_pool_access=None,
     ) -> None:
         # ``pypto_build_dir`` is an explicit diagnostic/output request (set by
         # the serving worker only when the user asks for build output); it
         # bypasses PyPTO's JIT cache. The persistent cache policy reaches pypto
         # through the run config instead.
-        self._native_ddr_config = native_ddr_config
-        self._native_ddr_pool_access = native_ddr_pool_access
-        if native_ddr_config is not None and native_ddr_config.enabled and native_ddr_pool_access is None:
-            raise ValueError('enabled DDR requires a registered UFlow access view before model startup')
         super().__init__(
             kv_cache_manager,
             platform=platform,
@@ -160,18 +151,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
     def supports_device_sampling(self) -> bool:
         """Qwen3 NPU runner can return greedy sampled token ids."""
         return True
-
-    def close_native_ddr_owner(self, model_id):
-        """Strict owner shutdown: a caller may publish stop proof only after this returns."""
-        runner = self._runners.get(model_id)
-        if runner is not None:
-            runner.close()
-            del self._runners[model_id]
-
-    def close_native_ddr_domain_preserving_pool(self, model_id):
-        """Partial shutdown only: no pool-unmapped or overall stop proof."""
-        runner = self._runners[model_id]
-        runner.close_native_domain_preserving_pool()
 
     @property
     def device_topk_sampling_k(self) -> int:
@@ -328,21 +307,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             sampled_ids_width=sampled_ids_width,
             topk_width=topk_width,
         )
-        native_programs = native_slots = None
-        slot_count = 0
-        native_config = getattr(self, "_native_ddr_config", None)
-        if native_config is not None and native_config.enabled:
-            slot_count = native_config.capacity_bytes // 20971520
-        if slot_count:
-            from pypto_serving.model.qwen.native_ddr_kv import compile_programs
-            from pypto_serving.model.qwen.native_ddr_transfer import ManagedDdrSlots
-
-            native_programs = compile_programs(self._compiler)
-            bindings = None
-            if native_config.shared_slots_path:
-                from pypto_serving.serving.native_ddr.shared_pool import load_bindings
-                bindings = load_bindings(native_config.shared_slots_path, self._native_ddr_pool_access)
-            native_slots = ManagedDdrSlots(slot_count, self._native_ddr_pool_access, bindings=bindings)
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
@@ -355,8 +319,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             padded_embed_weight=padded_embed_weight,
             decode_weights=decode_weights,
             layout=layout,
-            native_ddr_programs=native_programs,
-            native_ddr_slots=native_slots,
         )
 
     def _compile_jit_fwd_callable(

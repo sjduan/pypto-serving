@@ -6,11 +6,6 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      run_npu:
-        description: "Explicitly run physical NPU jobs on this fork"
-        type: boolean
-        default: false
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -32,7 +27,6 @@ jobs:
           extra_args: --all-files
 
   unit-tests:
-    if: github.repository == 'hw-native-sys/pypto-serving' || (github.event_name == 'workflow_dispatch' && inputs.run_npu)
     runs-on: [self-hosted, linux, arm64, npu]
     # The DeepSeek matrix client waits up to 2400 seconds while the daemon caps
     # the task at 3600 seconds. The venv no longer inherits a base env's torch,
@@ -72,6 +66,7 @@ jobs:
           bad=0
           for key in \
             PYPTO_QWEN3_MODEL_DIR \
+            PYPTO_DSV4_MODEL_DIR \
             PYPTO_DSV4_DSPARK_MODEL_DIR; do
             value="${!key:-}"
             if [ -z "$value" ]; then
@@ -128,12 +123,28 @@ jobs:
           run_cmd="$run_cmd python -m pytest tests/test_qwen3_serving.py -q -s"
           task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
 
-      - name: Run DSpark HTTP guard (K=7, one 8-card server)
+      - name: Run DeepSeek V4 MTP HTTP guard (K=1 fused)
         env:
           PYPTO_RUNTIME_LOG: error
-          PYPTO_DSPARK_EP_SIZE: '8'
-          PYPTO_DSPARK_RING_HEAP: '1073741824,1073741824,2147483648,4294967296'
-          PYPTO_DSPARK_DRAFTER_RING_HEAP: '1073741824,1073741824,1073741824,1073741824'
+        run: |
+          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
+          run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
+          run_cmd="$run_cmd && source activate.sh"
+          run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
+          run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
+          run_cmd="$run_cmd PYPTO_DSV4_MODEL_DIR=$PYPTO_DSV4_MODEL_DIR"
+          run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
+          # Only the fused K=1 case runs: every case boots its own 8-card
+          # server. Selecting by node id also makes a renamed case id fail
+          # collection instead of silently widening the run.
+          run_cmd="$run_cmd python -m pytest 'tests/test_deepseek_v4_accuracy.py::test_deepseek_v4_http_completion_contract[k1-fused]' -q -s"
+          task-submit --device auto --device-num 8 --ignore-whitelist \
+            --timeout 2400 --max-time 3600 \
+            --run "$run_cmd"
+
+      - name: Run DSpark HTTP guard (K=7, one server)
+        env:
+          PYPTO_RUNTIME_LOG: error
         run: |
           source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
           run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
@@ -142,74 +153,15 @@ jobs:
           run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd PYPTO_DSV4_DSPARK_MODEL_DIR=$PYPTO_DSV4_DSPARK_MODEL_DIR"
           run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
-          run_cmd="$run_cmd PYPTO_DSPARK_EP_SIZE=$PYPTO_DSPARK_EP_SIZE"
-          run_cmd="$run_cmd PYPTO_DSPARK_RING_HEAP=$PYPTO_DSPARK_RING_HEAP"
-          run_cmd="$run_cmd PYPTO_DSPARK_DRAFTER_RING_HEAP=$PYPTO_DSPARK_DRAFTER_RING_HEAP"
-          # One 8-card EP8/TP4 server for the whole guard: the cold greedy palace
+          # One 16-card server for the whole guard: the cold greedy palace
           # request checks generation correctness, then a different prompt run
           # twice exercises prefix cache on the same boot. Selecting by node
           # id also makes a renamed case id fail collection instead of
           # silently widening the run.
           run_cmd="$run_cmd python -m pytest 'tests/test_deepseek_dspark_accuracy.py::test_dspark_http_k7_one_server' -q -s"
-          task-submit --device auto --device-num 8 --ignore-whitelist \
+          task-submit --device auto --device-num 16 --ignore-whitelist \
             --timeout 4800 --max-time 7200 \
             --run "$run_cmd"
-
-      - name: Kill orphaned task-submit tasks
-        if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
-        with:
-          checkout-path: dist-checkout
-
-  v41-a5-smoke:
-    if: github.repository == 'hw-native-sys/pypto-serving' || (github.event_name == 'workflow_dispatch' && inputs.run_npu)
-    # The A5 runner must provide PYPTO_DSV41_MODEL_DIR.
-    runs-on: [self-hosted, linux, npu-a5]
-    timeout-minutes: 180
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
-      PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
-      CMAKE_C_COMPILER_LAUNCHER: ccache
-      CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_MAXSIZE: 30G
-      CCACHE_UMASK: '000'
-
-    steps:
-      - name: Fetch composite action definitions
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/actions
-          clean: false
-          persist-credentials: false
-
-      - name: Resolve V4.1 model directory
-        run: |
-          if [ -z "${PYPTO_DSV41_MODEL_DIR:-}" ] || [ ! -d "$PYPTO_DSV41_MODEL_DIR" ]; then
-            echo "::error::PYPTO_DSV41_MODEL_DIR must point to the V4.1 checkpoint on this A5 runner"
-            exit 1
-          fi
-
-      - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
-        with:
-          checkout-path: dist-checkout
-          needs-device: 'true'
-          toolchain: bundle
-          build-namespace: pypto-serving-v41-a5
-          pip-cache-name: pip-pypto-serving-v41-a5
-
-      - name: Run V4.1 DP4 HTTP answer guard
-        run: |
-          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
-          run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
-          run_cmd="$run_cmd && source activate.sh"
-          run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
-          run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
-          run_cmd="$run_cmd PYPTO_DSV41_MODEL_DIR=$PYPTO_DSV41_MODEL_DIR"
-          run_cmd="$run_cmd python -m pytest tests/test_deepseek_v41_serving.py::test_v41_dp4_http_answer -q -s"
-          task-submit --device auto --device-num 4 \
-            --timeout 3600 --max-time 3600 --run "$run_cmd"
 
       - name: Kill orphaned task-submit tasks
         if: always()

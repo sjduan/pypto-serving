@@ -83,8 +83,6 @@ class _CompiledKernels:
     padded_embed_weight: torch.Tensor
     decode_weights: dict[str, torch.Tensor]
     layout: QwenLayout
-    native_ddr_programs: tuple | None = None
-    native_ddr_slots: Any | None = None
 
 
 @dataclass
@@ -820,52 +818,13 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         if worker is None:
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
-            programs = [
+            worker = DistributedWorker([
                 self._compiled.prefill.compiled,
                 self._compiled.decode.compiled,
                 self._compiled.topk_select.compiled,
-            ]
-            extra = getattr(self._compiled, "native_ddr_programs", None)
-            if extra is None:
-                worker = DistributedWorker(programs)
-            else:
-                programs.extend(program.compiled for program in extra)
-                from pypto_serving.serving.native_ddr.managed_process import descendants, attach_new_children
-                slots = self._compiled.native_ddr_slots
-                slots.child_baseline = descendants()
-                try:
-                    worker = DistributedWorker(
-                        programs, inherited_host_tensors=slots.inherited_host_tensors,
-                        startup_timeout_s=60,
-                    )
-                except BaseException:
-                    slots.access.report_unknown(None, 'native owner construction has no whole-tree exit proof')
-                    raise
-                # Retain the actual owner even if UFlow child registration
-                # fails. A construction/registration error is not an exit proof.
-                self._l3_worker = worker
-                recovery = getattr(slots.access, 'cooperative_close', None)
-                if recovery is not None:
-                    recovery.worker = worker
-                slots.child_registrations = attach_new_children(slots.access, slots.child_baseline,
-                    helpers=slots.child_helpers, control_resources=slots.control_resources)
+            ])
             self._l3_worker = worker
         return worker
-
-    def create_native_ddr_backend(self, model, worker_epoch, *, observer=None):
-        """Explicit M3 seam; production enabled still requires the separate startup assembly."""
-        if self._compiled.native_ddr_programs is None:
-            raise RuntimeError("native transfer programs were not registered at owner startup")
-        from pypto_serving.model.qwen.native_ddr_kv import layout_from_model
-        from pypto_serving.model.qwen.native_ddr_transfer import QwenNativeTransferBackend
-
-        pool = self._kv_caches[model.config.model_id]
-        pages = pool.key_pages.shape[0] // (40 * 1024)
-        return QwenNativeTransferBackend(
-            self._shared_l3_worker(), self._compiled.native_ddr_programs, self._compiled.native_ddr_slots,
-            layout_from_model(model.config, model.runtime, pages), pool.key_pages, pool.value_pages,
-            worker_epoch, run_config=self._l3_run_config, observer=observer,
-        )
 
     def _decode_logits_device_arg(self) -> DeviceTensor:
         """Device-resident decode logits scratch for device sampling.
@@ -923,11 +882,6 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
 
     def close(self) -> None:
         """Release shared L3 worker resources and clear static tensor caches."""
-        slots = getattr(getattr(self, '_compiled', None), 'native_ddr_slots', None)
-        if slots is not None:
-            self.close_native_domain_preserving_pool()
-            slots.close_after_owner()
-            return
         try:
             self.close_kv_cache()
         finally:
@@ -937,20 +891,6 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
                     worker.close()
             finally:
                 self._reset_l3_dispatch()
-
-    def close_native_domain_preserving_pool(self):
-        """Close this real owner; leave UF views/unknown obligations retained."""
-        from pypto_serving.serving.native_ddr.managed_process import detach_closed_children
-        slots = self._compiled.native_ddr_slots
-        if slots is None:
-            raise RuntimeError('managed native owner required')
-        self.close_kv_cache()
-        if self._l3_worker is not None:
-            self._l3_worker.close()
-            detach_closed_children(slots.access, slots.child_registrations, slots.child_baseline,
-                                   helpers=slots.child_helpers)
-            self._l3_worker = None
-        self._reset_l3_dispatch()
 
     def _prepare_prefill_inputs(
         self,
