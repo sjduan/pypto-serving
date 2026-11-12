@@ -304,7 +304,7 @@ def run(args, engine_config, generate):
             or not all(hasattr(DistributedWorker, name)
                        for name in ("export_buffer", "release_export"))):
         raise ValueError("PyPTO lacks the required VMM buffer export interfaces")
-    from simpler.buffer_export import BufferMapping  # noqa: F401
+    from simpler.buffer_export import BufferExportError, BufferImportError, BufferMapping  # noqa: F401
     provider_class(config.provider).check_available()
     logging.basicConfig(level=logging.INFO)
     configure_runtime_logging()

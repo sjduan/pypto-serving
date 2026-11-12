@@ -258,7 +258,12 @@ class TransferWorker:
         return pid
 
     def register(self, runtime, tensor, name):
-        exported = runtime.export_buffer(tensor, worker_id=self.rank)
+        from simpler.buffer_export import BufferExportError
+        try:
+            exported = runtime.export_buffer(tensor, worker_id=self.rank)
+        except BufferExportError as error:
+            self.retained.append((runtime, error.exported))
+            raise
         self.retained.append((runtime, exported))
         return decode(self.call("register", exported=asdict(exported),
                                 name=name, extent=tensor.nbytes), Region)
@@ -343,7 +348,7 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
     # Each TE is another HCCL process on the compute owner's device. Let the
     # OS reserve unused ports atomically instead of reusing HCCL's fixed 16666.
     configure_ports()
-    from simpler.buffer_export import BufferExport, BufferMapping
+    from simpler.buffer_export import BufferExport, BufferImportError, BufferMapping
 
     mappings = []
     sequence = 0
@@ -395,7 +400,11 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
                 elif op == "release":
                     provider.release()
                     while mappings:
-                        mappings[0].close()
+                        try:
+                            mappings[0].close()
+                        except Exception as exc:
+                            # DMA has drained and the provider disconnected; retry only the mapping cleanup.
+                            raise TransferError(f"buffer unmap incomplete: {exc}") from exc
                         mappings.pop(0)
                 elif op == "profile":
                     profiler = get_profiler(initially_active=False)
@@ -411,7 +420,9 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
                 else:
                     raise ValueError("unknown transfer operation")
             except Exception as exc:
-                reply.update(error=str(exc), uncertain=not isinstance(exc, ValueError)
+                if isinstance(exc, BufferImportError):
+                    mappings.append(exc.mapping)
+                reply.update(error=str(exc), uncertain=not isinstance(exc, (ValueError, BufferImportError))
                              and (not isinstance(exc, TransferError) or exc.uncertain))
             _send(channel, reply)
             if stopped:

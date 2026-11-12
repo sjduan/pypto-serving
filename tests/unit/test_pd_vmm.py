@@ -29,7 +29,23 @@ class Export:
     mapping_bytes: int = 4096
 
 
-def test_imported_address_and_retirement_order(monkeypatch):
+@pytest.fixture(autouse=True)
+def buffer_sdk(monkeypatch):
+    class ExportError(RuntimeError):
+        def __init__(self, exported):
+            self.exported = exported
+    class ImportError(RuntimeError):
+        def __init__(self, mapping):
+            self.mapping = mapping
+    sdk = ModuleType("simpler.buffer_export")
+    sdk.BufferExport = Export
+    sdk.BufferExportError, sdk.BufferImportError = ExportError, ImportError
+    monkeypatch.setitem(sys.modules, "simpler.buffer_export", sdk)
+    return sdk
+
+
+@pytest.mark.parametrize("failure", [None, "import", "unmap"])
+def test_imported_address_and_retirement_order(monkeypatch, buffer_sdk, failure):
     events = []
     monkeypatch.setenv("HCCL_NPU_SOCKET_PORT_RANGE", "16666")
     monkeypatch.setenv("HCCL_HOST_SOCKET_PORT_RANGE", "16666")
@@ -46,7 +62,15 @@ def test_imported_address_and_retirement_order(monkeypatch):
         def __init__(self, exported):
             assert exported.shareable_handle == 42
             events.append("import")
-        def close(self): events.append("unmap")
+            self.close_failed = False
+            if failure == "import":
+                raise buffer_sdk.BufferImportError(self)
+        def close(self):
+            if failure == "unmap" and not self.close_failed:
+                self.close_failed = True
+                events.append("unmap-failed")
+                raise RuntimeError("unmap failed")
+            events.append("unmap")
     class Provider:
         def register(self, boot, rank, name, address, extent):
             assert address == 8192 and extent == 1024
@@ -55,9 +79,7 @@ def test_imported_address_and_retirement_order(monkeypatch):
         def release(self): events.append("unregister-disconnect")
     monkeypatch.setattr(transfer, "DeviceContext", Context)
     monkeypatch.setattr(transfer, "configure_profiler", lambda *a, **kw: None)
-    sdk = ModuleType("simpler.buffer_export")
-    sdk.BufferExport, sdk.BufferMapping = Export, Mapping
-    monkeypatch.setitem(sys.modules, "simpler.buffer_export", sdk)
+    buffer_sdk.BufferMapping = Mapping
     worker = transfer.TransferWorker("boot", 0, "host")
     thread = threading.Thread(target=transfer._serve, args=(worker.child, "boot", 0, 4, "host",
                               "fake", lambda *a: Provider(), worker.profile_config), daemon=True)
@@ -66,16 +88,59 @@ def test_imported_address_and_retirement_order(monkeypatch):
     runtime = SimpleNamespace(export_buffer=lambda tensor, **kw: Export(),
                               release_export=lambda exported: events.append("source-release"))
     try:
-        region = worker.register(runtime, SimpleNamespace(nbytes=1024), "cache")
-        assert region.handle["address"] == 8192
+        if failure == "import":
+            with pytest.raises(transfer.TransferError) as error:
+                worker.register(runtime, SimpleNamespace(nbytes=1024), "cache")
+            assert not error.value.uncertain and not worker.uncertain
+            assert events == ["import"]
+        else:
+            region = worker.register(runtime, SimpleNamespace(nbytes=1024), "cache")
+            assert region.handle["address"] == 8192
         with pytest.raises(RuntimeError, match="registered"):
             worker.close()
+        if failure == "unmap":
+            with pytest.raises(transfer.TransferError) as error:
+                worker.release()
+            assert not error.value.uncertain and not worker.uncertain
+            assert worker.retained and "source-release" not in events
         worker.release()
-        assert events == ["import", "register", "unregister-disconnect", "unmap", "source-release"]
+        expected = ["import"] + ([] if failure == "import" else ["register"])
+        if failure == "unmap":
+            expected += ["unregister-disconnect", "unmap-failed"]
+        assert events == expected + ["unregister-disconnect", "unmap", "source-release"]
         worker.close()
         assert events[-2:] == ["unregister-disconnect", "context-close"]
         assert not thread.is_alive()
     finally:
+        worker.parent.close()
+
+
+def test_unconfirmed_export_remains_reachable_until_release(buffer_sdk):
+    exported = Export()
+    worker = transfer.TransferWorker("boot", 0, "host")
+    commands, releases = [], []
+    def export(tensor, **kwargs):
+        raise buffer_sdk.BufferExportError(exported)
+    def release(value):
+        releases.append(value)
+        if len(releases) == 1:
+            raise TimeoutError("retain confirmation lost")
+    worker.call = lambda operation, **kwargs: commands.append(operation)
+    runtime = SimpleNamespace(export_buffer=export, release_export=release)
+    try:
+        with pytest.raises(buffer_sdk.BufferExportError):
+            worker.register(runtime, SimpleNamespace(nbytes=1024), "cache")
+        assert not commands and worker.retained == [(runtime, exported)]
+        with pytest.raises(RuntimeError, match="registered"):
+            worker.close()
+        with pytest.raises(TimeoutError):
+            worker.release()
+        assert worker.retained == [(runtime, exported)]
+        worker.release()
+        assert not worker.retained and releases == [exported, exported]
+        worker.close()
+    finally:
+        worker.child.close()
         worker.parent.close()
 
 
