@@ -12,7 +12,7 @@ Control protocol version 4 separates the common replicated-page data contract fr
 
 Follow the SDK's normal source-build instructions with its matching runtime pin and required PTOAS version (0.72 for the paired PR revisions). Keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
 
-Keep the Serving-pinned Lib revision with this SDK pair: the model's remainder scratch must satisfy the updated compiler contract.
+Keep the Serving-pinned Lib revision with this SDK pair: remainder scratch must satisfy the updated compiler contract, and the persistent drafter lease pool must remain independent of the per-step decode batch.
 
 Model nodes require Linux Python with `os.pidfd_open` and a working Mooncake Ascend installation. Startup checks these dependencies before loading weights. Serving starts one independent transfer process per rank, imports the owner's VMM backing into its own ACL context and registers its local device address before the first transfer. Adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
 
@@ -58,7 +58,8 @@ For example, keep P at `--dp 4 --tp 4 --ep 16` and set D to
 `--dp 16 --tp 1 --ep 16 --lm-head-tp 4`; no PD JSON mode changes are needed.
 Without PD, Prefill and Decode share the same local topology.
 Smaller attention TP does not multiply batch capacity: every rank still owns
-16 decode request slots, distinct from the padded 64-request group ABI.
+16 decode request slots. Group metadata covers `16 * TP` request slots;
+the persistent drafter state pool retains 64 leases per group.
 
 Real-weight K7 validation covers ordinary DP4TP4, homogeneous PD DP4TP4,
 and asymmetric P DP4TP4 to D DP16TP1 with head TP4 and prefix caching enabled.
