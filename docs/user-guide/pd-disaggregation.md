@@ -8,7 +8,7 @@ The initial adapter supports DeepSeek V4 Flash DSpark K7, greedy sampling, ident
 
 Use matching PyPTO/Simpler source builds with the leased VMM buffer APIs from [PyPTO PR #3397](https://github.com/hw-native-sys/pypto/pull/3397) and [Simpler PR #3017](https://github.com/hw-native-sys/simpler/pull/3017). PyPTO must expose `alloc_tensor(exportable=True)`, `export_buffer()` and `release_export()`; Simpler supplies `BufferMapping`. Keep the runtime submodule at PyPTO's exact pin. The previous owner-service patch is no longer required or supported.
 
-Control protocol version 3 separates the common replicated-page data contract from each node's local rank groups. All participants must use the same protocol version; older schemas are rejected. Every destination cache replica selects a complete source replica from the request's Prefill partition. Page/ring formats must remain compatible: this is replica mapping, not a general sharded-layout conversion.
+Control protocol version 4 separates the common replicated-page data contract from each node's local rank groups. All participants must use the same protocol version; older schemas are rejected. Every destination cache replica selects a complete source replica from the request's Prefill partition. Page/ring formats must remain compatible: this is replica mapping, not a general sharded-layout conversion.
 
 Follow the SDK's normal source-build instructions with its matching runtime pin and required PTOAS version (0.72 for the paired PR revisions). Keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
 
@@ -82,7 +82,15 @@ need not agree; the Router does not query or manage physical cache.
 
 The common Serving Router uses `role: "prefill"` and `role: "decode"` in its `replicas` table. Entries without a role remain ordinary complete replicas. PD requires both roles and uses statically launched nodes; mixing complete replicas, PD nodes or launchable `hosts` is rejected. The Router never starts or stops these external P/D processes.
 
-Start the external Router, then wait for `/health` to report `ok`:
+Start the external Router, then wait for `/health` to report `ok`.
+P/D descriptors expose local initialization so the Router can discover peers;
+node `/health` and Router admission remain unavailable until data-plane preflight
+succeeds. Each compatible boot pair checks every legal rank edge with real D2D
+writes to dedicated canary buffers and validates payload/guards on D. Probe storage
+never overlaps model caches. A new boot requires another check; a failure keeps
+that pair unroutable. PD compute and TE processes use `HCCL_NPU_SOCKET_PORT_RANGE=auto` and
+`HCCL_HOST_SOCKET_PORT_RANGE=auto` so the OS reserves unused ports alongside
+compute communication. Non-PD startup is unchanged.
 
 ```bash
 pypto-serving-router --replicas examples/pd.json --host 0.0.0.0 --port 8110

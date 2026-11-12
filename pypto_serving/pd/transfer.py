@@ -30,6 +30,13 @@ from .config import PROVIDERS
 from .protocol import Copy, MAX_FRAME, decode
 
 logger = logging.getLogger(__name__)
+PROBE_COMPONENT = "__pd_preflight"
+PROBE_BYTES = bytes(range(64))
+
+
+def configure_ports():
+    os.environ["HCCL_NPU_SOCKET_PORT_RANGE"] = "auto"
+    os.environ["HCCL_HOST_SOCKET_PORT_RANGE"] = "auto"
 
 
 class TransferError(RuntimeError):
@@ -295,6 +302,7 @@ class DeviceContext:
             self.check(initialized)
         self.check(self.acl.aclrtSetDevice(device_id))
         self.context = ctypes.c_void_p()
+        self.probe = ctypes.c_void_p()
         self.check(self.acl.aclrtCreateContext(ctypes.byref(self.context), device_id))
         self.bind()
 
@@ -306,16 +314,40 @@ class DeviceContext:
     def bind(self):
         self.check(self.acl.aclrtSetCurrentContext(self.context))
 
+    def probe_address(self):
+        if not self.probe.value:
+            self.acl.aclrtMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_int]
+            self.acl.aclrtMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                                            ctypes.c_size_t, ctypes.c_int]
+            self.check(self.acl.aclrtMalloc(ctypes.byref(self.probe), 192, 0))
+            initial = ctypes.create_string_buffer(PROBE_BYTES + bytes(64) + bytes([90]) * 64)
+            self.check(self.acl.aclrtMemcpy(self.probe, 192, initial, 192, 1))
+        return self.probe.value
+
+    def check_probe(self):
+        observed = ctypes.create_string_buffer(192)
+        self.check(self.acl.aclrtMemcpy(observed, 192, self.probe, 192, 2))
+        if observed.raw != PROBE_BYTES * 2 + bytes([90]) * 64:
+            raise RuntimeError("PD data-plane preflight payload/guard mismatch")
+
     def close(self):
         self.bind()
+        if self.probe.value:
+            self.acl.aclrtFree.argtypes = [ctypes.c_void_p]
+            self.check(self.acl.aclrtFree(self.probe))
+            self.probe.value = None
         self.check(self.acl.aclrtDestroyContext(self.context))
 
 
 def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, profile_config):
+    # Each TE is another HCCL process on the compute owner's device. Let the
+    # OS reserve unused ports atomically instead of reusing HCCL's fixed 16666.
+    configure_ports()
     from simpler.buffer_export import BufferExport, BufferMapping
 
     mappings = []
     sequence = 0
+    probe_region = None
     try:
         context = DeviceContext(device_id)
         configure_profiler(profile_config, process_name=f"pd-transfer-{rank}", initially_active=False)
@@ -333,6 +365,13 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
                 op = request["operation"]
                 if op == "probe":
                     reply["result"] = os.getpid()
+                elif op == "preflight_region":
+                    if probe_region is None:
+                        probe_region = provider.register(boot, rank, PROBE_COMPONENT,
+                                                         context.probe_address(), 192)
+                    reply["result"] = probe_region
+                elif op == "preflight_check":
+                    context.check_probe()
                 elif op == "register":
                     exported = BufferExport(**request["exported"])
                     if exported.device_id != device_id:

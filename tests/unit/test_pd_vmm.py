@@ -9,6 +9,8 @@
 """Independent transfer-process mappings must retire before source leases."""
 
 from dataclasses import dataclass
+import ctypes
+import os
 import sys
 import threading
 from types import ModuleType, SimpleNamespace
@@ -29,8 +31,13 @@ class Export:
 
 def test_imported_address_and_retirement_order(monkeypatch):
     events = []
+    monkeypatch.setenv("HCCL_NPU_SOCKET_PORT_RANGE", "16666")
+    monkeypatch.setenv("HCCL_HOST_SOCKET_PORT_RANGE", "16666")
     class Context:
-        def __init__(self, device): assert device == 4
+        def __init__(self, device):
+            assert device == 4
+            assert os.environ["HCCL_NPU_SOCKET_PORT_RANGE"] == "auto"
+            assert os.environ["HCCL_HOST_SOCKET_PORT_RANGE"] == "auto"
         def bind(self): pass
         def close(self): events.append("context-close")
     class Mapping:
@@ -126,3 +133,57 @@ def test_transfer_channels_start_after_compute_owners(monkeypatch):
     assert events == ["channel", 4]
     runtime.close()
     assert events[-1] == "close"
+
+
+def test_probe_checks_payload_and_guards_without_cache_storage():
+    backing = ctypes.create_string_buffer(192)
+    def malloc(pointer, size, policy):
+        assert size == 192
+        pointer._obj.value = ctypes.addressof(backing)
+        return 0
+    def copy(destination, capacity, source, size, direction):
+        ctypes.memmove(destination, source, size)
+        return 0
+    context = transfer.DeviceContext.__new__(transfer.DeviceContext)
+    context.probe = ctypes.c_void_p()
+    context.acl = SimpleNamespace(aclrtMalloc=malloc, aclrtMemcpy=copy)
+    address = context.probe_address()
+    with pytest.raises(RuntimeError, match="payload/guard"):
+        context.check_probe()
+    ctypes.memmove(address + 64, transfer.PROBE_BYTES, 64)
+    context.check_probe()
+    ctypes.memset(address + 128, 0, 1)
+    with pytest.raises(RuntimeError, match="payload/guard"):
+        context.check_probe()
+
+
+def test_preflight_writes_all_edges_and_retains_unknown_failure():
+    from concurrent.futures import Future
+    from pypto_serving.pd.worker import WorkerRuntime
+    calls = []
+    def write(operation, **payload):
+        calls.append(payload["copies"][0])
+    class Pool:
+        def submit(self, action, *args, **kwargs):
+            future = Future()
+            try:
+                future.set_result(action(*args, **kwargs))
+            except Exception as error:
+                future.set_exception(error)
+            return future
+    runtime = WorkerRuntime(SimpleNamespace(), SimpleNamespace(ranks=2))
+    runtime.pool.shutdown()
+    runtime.pool = Pool()
+    runtime.owners = (SimpleNamespace(call=write), SimpleNamespace(call=write))
+    runtime.peers["peer"] = ()
+    edges = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    runtime.preflight(dict(peer="peer", mapping=edges))
+    assert [(c.source_rank, c.destination_rank) for c in calls] == edges
+    assert all((c.component, c.source_offset, c.destination_offset, c.length) ==
+               (transfer.PROBE_COMPONENT, 0, 64, 64) for c in calls)
+    def fail(*args, **kwargs):
+        raise transfer.TransferError("native channel failed", uncertain=True)
+    runtime.owners[0].call = fail
+    with pytest.raises(transfer.TransferError):
+        runtime.preflight(dict(peer="peer", mapping=edges))
+    assert runtime.uncertain and not runtime.checking

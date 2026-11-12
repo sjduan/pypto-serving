@@ -28,7 +28,7 @@ def router(pd, *, body=None, error=None):
     if peers is not None:
         peers.d_stream = body
     async def transport(req):
-        if req.method == "GET" or req.url.path.endswith("abort"):
+        if req.method == "GET" or req.url.path.endswith(("abort", "preflight")):
             return await peers.handle(req) if pd else httpx.Response(200, json={})
         if error is not None:
             raise error("transport failed", request=req)

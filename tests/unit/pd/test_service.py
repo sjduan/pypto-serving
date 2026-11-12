@@ -79,6 +79,7 @@ def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True
     config = SimpleNamespace(prefill=(0,), decode=(0,), capacity=4)
     destination = Service(config, SimpleNamespace(node_id="d"), "decode", adapter, core, None)
     destination.node, destination.geometry = nodes[1], dg
+    destination.transport_ready = True
     entry = destination.register_http(binding, {})
     entry.continuation = Continuation(tokens, {"max_new_tokens": 512}, None, None)
     entry.normalized_digest = digest(entry.continuation)
@@ -194,8 +195,23 @@ def service():
     core = SimpleNamespace(kv_cache_manager=cache, scheduler=SimpleNamespace(requests={}), is_ready=lambda: True)
     result = Service(config, config.endpoint("decode"), "decode", None, core, None)
     result.node = d
+    result.transport_ready = True
     return result, p, d
 
+
+
+def test_local_initialization_does_not_admit_before_data_plane_probe():
+    s, p, d = service()
+    s.transport_ready = False
+    assert s.is_initialized() and not s.is_ready()
+    with pytest.raises(RuntimeError, match="unavailable"):
+        s.register_http(Binding.create(p, d, {}), {})
+    async def worker(operation):
+        assert operation == "preflight_check"
+        return {}
+    s.worker = worker
+    asyncio.run(s.control(p, (), "preflight_check", {}))
+    assert s.is_ready()
 
 def test_status_reads_current_lease_without_changing_cache():
     s, p, d = service()

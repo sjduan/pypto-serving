@@ -92,10 +92,16 @@ class Server(ServingServer):
         super()._register_routes()
         self.app.add_api_route("/internal/pd/descriptor", self.descriptor, methods=["GET"])
         self.app.add_api_route("/internal/pd/abort", self.abort, methods=["POST"])
+        self.app.add_api_route("/internal/pd/preflight", self.transport_preflight, methods=["POST"])
         self.app.add_api_route("/internal/pd/requests/{request_id}", self.status, methods=["GET"])
 
     async def status(self, request_id: str):
         return JSONResponse(self.service.status(request_id))
+
+    async def transport_preflight(self, request: HTTPRequest):
+        peer = decode(await request.json(), Node)
+        result = await self.service.check_transport(peer)
+        return JSONResponse(msgspec.to_builtins(result))
 
     async def _health(self):
         healthy = self.service.is_ready()
@@ -106,7 +112,7 @@ class Server(ServingServer):
         if node is None:
             return JSONResponse(dict(error="node initializing"), status_code=503)
         return JSONResponse(msgspec.to_builtins(msgspec.structs.replace(
-            node, healthy=self.service.is_ready())))
+            node, healthy=self.service.is_initialized())))
 
     async def abort(self, request: HTTPRequest):
         binding = decode(await request.json(), Binding)
@@ -285,13 +291,14 @@ def run(args, engine_config, generate):
     from pypto_serving.tools.profile import configure_profiler
     from pypto_serving.serving.utils.env import configure_runtime_logging
     from inspect import signature
-    from .transfer import provider_class
+    from .transfer import configure_ports, provider_class
     from pypto_serving.model.tokenizer import load_tokenizer
     if args.prompt or not args.pd_config:
         raise ValueError("PD requires --pd-config and online serving")
     config = Config.load(args.pd_config)
     if not hasattr(os, "pidfd_open"):
         raise ValueError("PD model nodes require Linux Python with os.pidfd_open")
+    configure_ports()
     from pypto.runtime.distributed_runner import DistributedWorker
     if ("exportable" not in signature(DistributedWorker.alloc_tensor).parameters
             or not all(hasattr(DistributedWorker, name)

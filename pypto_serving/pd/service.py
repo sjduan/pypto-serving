@@ -86,21 +86,48 @@ class Service:
         self.listener = None
         self.connections = set()
         self.preflight = None
+        self.transport_checks = {}
+        self.transport_ready = False
 
     async def worker(self, operation, value=None):
         with span(logger, "pd.worker.encode", log=False, thread_cpu=True, operation=operation) as timing:
             payload = msgspec.msgpack.encode(value) if value is not None else b""
         with span(logger, "pd.worker." + operation, encode_ms=timing["duration_ms"],
                   encode_thread_cpu_ms=timing["thread_cpu_ms"]):
-            response = (await self.progress.call(operation, payload) if operation in ("submit", "source_state")
+            response = (await self.progress.call(operation, payload)
+                        if operation in ("submit", "source_state", "preflight")
                         else await self.core.call_worker(operation, payload))
             result = msgspec.msgpack.decode(response)
-        if operation in ("submit", "source_state"):
+        if operation in ("submit", "source_state", "preflight"):
             if "error" in result:
                 raise TransferError(result["error"], uncertain=result["uncertain"])
         if operation == "submit":
             return result["job"]
         return result
+
+    async def check_transport(self, peer):
+        if self.role != "prefill" or not self.is_initialized() or not self.node.compatible(peer):
+            raise NodeUnavailable("PD source is not ready for transport preflight")
+        self.config.endpoint("decode", peer.node_id)
+        identity = self.node.key, peer.key
+        previous = self.transport_checks.get(peer.node_id)
+        if previous is None or previous[0] != identity:
+            async def check():
+                try:
+                    async with self.peers.use(peer.key, lambda: self.connect(peer)) as session:
+                        mapping = sorted({edge for p in range(len(self.node.topology.groups))
+                            for d in range(len(peer.topology.groups))
+                            for edge in self.adapter.mapping(self.node.topology, peer.topology, p, d)})
+                        await self.worker("preflight", dict(peer=peer.boot, mapping=mapping))
+                        await asyncio.wait_for(session.call("preflight_check", {}), self.config.handoff_timeout)
+                    record(logger, "transport.ready", prefill=self.node.key, decode=peer.key, rank_edges=len(mapping))
+                    self.transport_ready = True
+                    return dict(prefill=self.node.key, decode=peer.key)
+                except BaseException:
+                    self.gated = True
+                    raise
+            previous = self.transport_checks[peer.node_id] = (identity, asyncio.create_task(check()))
+        return await asyncio.shield(previous[1])
 
     def observe(self, name, entry, **fields):
         record(logger, name, request=entry.binding.request, node_id=self.node.node_id,
@@ -115,12 +142,15 @@ class Service:
                          topology, self.config.provider, self.cache.enable_prefix_cache)
         if self.role == "decode":
             self.listener = await asyncio.start_server(self._accept, "0.0.0.0", self.endpoint.control_port)
-        logger.info("ready node=%s role=%s boot=%s prefix=%s", self.node.node_id, self.role,
+        logger.info("initialized node=%s role=%s boot=%s prefix=%s", self.node.node_id, self.role,
                     boot, self.node.prefix)
 
-    def is_ready(self):
+    def is_initialized(self):
         return (self.node is not None and not self.gated and not self.closing
                 and self.core.is_ready())
+
+    def is_ready(self):
+        return self.is_initialized() and self.transport_ready
 
     def status(self, request):
         """Copy current facts without advancing execution or querying a native owner."""
@@ -287,6 +317,16 @@ class Service:
             self.connections.discard(writer)
 
     async def control(self, peer, geometry, operation, payload):
+        if operation == "preflight_check":
+            if not self.is_initialized():
+                raise NodeUnavailable("PD receiver is not ready for transport preflight")
+            try:
+                await self.worker("preflight_check")
+            except BaseException:
+                self.gated = True
+                raise
+            self.transport_ready = True
+            return {}
         binding = decode(payload["binding"], Binding)
         if binding.prefill != peer.key:
             raise ValueError("control sender differs from binding")
@@ -759,6 +799,7 @@ class Service:
 
     async def close(self):
         self.closing = True
+        await asyncio.gather(*(task for _, task in self.transport_checks.values()), return_exceptions=True)
         if self.requests or self.pins.active or self.gated:
             raise RuntimeError("node has active/uncertain handoffs; retire it through external orchestration")
         if self.role == "prefill":

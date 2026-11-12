@@ -44,12 +44,19 @@ class Peers:
                                   Topology.for_tp(4, 1)) for r in cfg.replicas}
         self.calls, self.requests, self.errors = [], [], {}
         self.p_hold = self.d_stream = self.stream_body = None
+        self.preflight_error = False
 
     async def handle(self, req):
         name, path = req.url.host, req.url.path
         self.calls.append((name, path))
         if path.endswith("descriptor"):
             return httpx.Response(200, json=msgspec.to_builtins(self.nodes[name]))
+        if path.endswith("preflight"):
+            if self.preflight_error:
+                return httpx.Response(503, json={"error": "native channel unavailable"})
+            peer = msgspec.convert(json.loads(req.content), Node)
+            return httpx.Response(200, json=msgspec.to_builtins(
+                dict(prefill=self.nodes[name].key, decode=peer.key)))
         if path.endswith("abort"):
             if self.p_hold is not None:
                 self.p_hold.set()
@@ -128,6 +135,29 @@ def test_pool_rotation_health_and_new_boot():
             await router.health.probe_once()
             assert all(d.node_id == "d1" for _, d in router.proxy.pairs())
             assert_idle(router)
+    asyncio.run(run())
+
+
+def test_data_plane_failure_blocks_ready_and_dispatch_until_new_boot():
+    async def run():
+        cfg = config()
+        peers = Peers(cfg)
+        peers.preflight_error = True
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            assert (await router._health()).status_code == 503
+            assert (await router.proxy.forward(request({}), "/v1/completions")).status_code == 503
+            assert not peers.requests
+            peers.preflight_error = False
+            await router.health.probe_once()
+            assert (await router._health()).status_code == 200
+            count = sum(path.endswith("preflight") for _, path in peers.calls)
+            await router.health.probe_once()
+            assert sum(path.endswith("preflight") for _, path in peers.calls) == count
+            peers.nodes["d0"] = msgspec.structs.replace(peers.nodes["d0"], boot="new-decode")
+            peers.preflight_error = True
+            await router.health.probe_once()
+            assert (await router._health()).status_code == 503
     asyncio.run(run())
 
 

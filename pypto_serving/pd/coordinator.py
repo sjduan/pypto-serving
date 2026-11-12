@@ -43,6 +43,8 @@ class PDCoordinator:
                               for offset in range(len(config.decode)) for i, p in enumerate(config.prefill))
         self.active = {}
         self.closing = False
+        self.checked = {}
+        self.check_lock = asyncio.Lock()
 
     def _timeout(self, read, *, control=False):
         values = self.client.timeout.as_dict()
@@ -67,6 +69,21 @@ class PDCoordinator:
                 self.registry.set_ready(spec.name, False)
                 return False
             self.nodes[spec.name] = node
+            async with self.check_lock:
+                for p_id, d_id in self.pair_ids:
+                    p, d = self.nodes.get(p_id), self.nodes.get(d_id)
+                    if p is None or d is None or not p.compatible(d):
+                        continue
+                    identity = p.key, d.key
+                    if self.checked.get((p_id, d_id)) == identity:
+                        continue
+                    endpoint = self.registry.state(p_id).spec.base_url
+                    response = await self.probe_client.post(endpoint + "/internal/pd/preflight",
+                        json=msgspec.to_builtins(d), timeout=self._timeout(self.config.handoff_timeout))
+                    response.raise_for_status()
+                    if response.json() != dict(prefill=list(p.key), decode=list(d.key)):
+                        raise ValueError("data-plane preflight identity mismatch")
+                    self.checked[p_id, d_id] = identity
             return True
         except httpx.PoolTimeout:
             raise  # The shared HealthMonitor classifies local pool pressure.
@@ -80,6 +97,7 @@ class PDCoordinator:
         for p_id, d_id in self.pair_ids:
             p, d = self.nodes.get(p_id), self.nodes.get(d_id)
             valid = (p is not None and d is not None and p.compatible(d)
+                     and self.checked.get((p_id, d_id)) == (p.key, d.key)
                      and p.role == "prefill" and d.role == "decode"
                      and all(self.registry.state(n).routable for n in (p_id, d_id))
                      and (model is None or p.contract.model == model))

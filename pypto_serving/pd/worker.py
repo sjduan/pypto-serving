@@ -21,8 +21,8 @@ import time
 import msgspec
 
 from pypto_serving.tools.observe import record, span
-from .protocol import Completion, MAX_FRAME, Plan, Topology, decode, digest
-from .transfer import Region, TransferError, TransferWorker
+from .protocol import Completion, Copy, MAX_FRAME, Plan, Topology, decode, digest
+from .transfer import PROBE_COMPONENT, Region, TransferError, TransferWorker
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,7 @@ class WorkerRuntime:
         self.local_regions, self.peer_regions = {}, {}
         self.uncertain = False
         self.accepting = True
+        self.checking = False
         self.pool = ThreadPoolExecutor(max_workers=model.ranks, thread_name_prefix="pd-write")
         self.lock = threading.Lock()
         self.progress_channel, self.progress = progress_channel, None
@@ -99,6 +100,8 @@ class WorkerRuntime:
                             for rank, owner in enumerate(self.owners)
                             for name, tensor in self.model.regions().items())
             self.registry = dict(geometry=geometry, regions=regions,
+                                 probes=tuple(decode(owner.call("preflight_region"), Region)
+                                              for owner in self.owners),
                                  topology=Topology.for_tp(self.model.ranks, self.model.tp))
             self.registry_digest = digest(self.registry)
             # Region geometry is fixed for this boot; request page IDs are not cached here.
@@ -128,8 +131,12 @@ class WorkerRuntime:
         if ({(r.rank, r.name) for r in regions} != {(i, n) for i in range(topology.ranks) for n in names}
                 or len(regions) != len(names) * topology.ranks):
             raise ValueError("peer registry has missing or duplicate rank/region")
+        probes = tuple(decode(r, Region) for r in value["probes"])
+        if (len(probes) != topology.ranks or {r.rank for r in probes} != set(range(topology.ranks))
+                or any(r.boot != peer or r.name != PROBE_COMPONENT or r.extent != 192 for r in probes)):
+            raise ValueError("peer preflight registry has missing or invalid ranks")
         for owner in self.owners:
-            owner.call("install", regions=regions)
+            owner.call("install", regions=regions + probes)
         self.peers[peer] = regions
         self.peer_fingerprints[peer] = fingerprint
         self.peer_regions[peer] = {(r.rank, r.name): r for r in regions}
@@ -194,6 +201,33 @@ class WorkerRuntime:
         if self.uncertain or not self.accepting:
             raise TransferError("transfer worker is gated or closing", uncertain=self.uncertain)
 
+    def preflight(self, value):
+        futures = []
+        with self.lock:
+            self._check_accepting()
+            if self.checking or value["peer"] not in self.peers:
+                raise ValueError("preflight is active or peer is not installed")
+            self.checking = True
+        try:
+            for source, destination in value["mapping"]:
+                futures.append(self.pool.submit(self.owners[source].call, "write", peer=value["peer"],
+                    copies=(Copy(PROBE_COMPONENT, source, destination, 0, 64, 64),), observation={}))
+            for future in futures:
+                future.result()
+        except BaseException:
+            self.uncertain = True
+            raise
+        finally:
+            # Even an error must join every enqueued write before retirement.
+            for future in futures:
+                try:
+                    future.result()
+                except BaseException:
+                    pass
+            with self.lock:
+                self.checking = False
+        return {}
+
     def poll(self, jobs):
         """Take terminal results once; source pins outlive this bookkeeping.
 
@@ -224,10 +258,14 @@ class WorkerRuntime:
             result = self.prepare()
         elif operation == "install":
             result = self.install(value)
+        elif operation == "preflight_check":
+            for owner in self.owners:
+                owner.call("preflight_check")
+            result = {}
         elif operation == "release":
             with self.lock:
                 self.accepting = False
-                if self.uncertain or self.jobs:
+                if self.uncertain or self.jobs or self.checking:
                     raise TransferError("cannot unregister an unsafe or active owner", uncertain=True)
                 for owner in self.owners:
                     owner.release()
@@ -251,11 +289,14 @@ class WorkerRuntime:
                 with self.lock:
                     self._check_accepting()
                     result = self.model.source_state(value)
+            elif operation == "preflight":
+                result = self.preflight(value)
             else:
                 raise ValueError("unknown independent transfer operation")
         except Exception as exc:
             uncertain = (exc.uncertain if isinstance(exc, TransferError) else operation == "poll"
-                         or (operation == "submit" and not isinstance(exc, (ValueError, KeyError, msgspec.DecodeError))))
+                         or (operation in ("submit", "preflight")
+                             and not isinstance(exc, (ValueError, KeyError, msgspec.DecodeError))))
             if uncertain:
                 with self.lock:
                     self.uncertain = True
@@ -265,7 +306,7 @@ class WorkerRuntime:
     def close(self):
         with self.lock:
             self.accepting = False
-            if self.uncertain or self.jobs or any(o.retained for o in self.owners):
+            if self.uncertain or self.jobs or self.checking or any(o.retained for o in self.owners):
                 raise RuntimeError("transfer must be safely drained before model shutdown")
         self.pool.shutdown(wait=True)
         if self.progress is not None:
