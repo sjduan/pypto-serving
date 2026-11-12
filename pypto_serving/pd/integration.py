@@ -293,10 +293,11 @@ def run(args, engine_config, generate):
     if not hasattr(os, "pidfd_open"):
         raise ValueError("PD model nodes require Linux Python with os.pidfd_open")
     from pypto.runtime.distributed_runner import DistributedWorker
-    if ("chip_service_factories" not in signature(DistributedWorker).parameters
+    if ("exportable" not in signature(DistributedWorker.alloc_tensor).parameters
             or not all(hasattr(DistributedWorker, name)
-                       for name in ("retain_service_tensor", "release_service_tensor"))):
-        raise ValueError("PyPTO lacks the required owner-service and tensor-retain interfaces")
+                       for name in ("export_buffer", "release_export"))):
+        raise ValueError("PyPTO lacks the required VMM buffer export interfaces")
+    from simpler.buffer_export import BufferMapping  # noqa: F401
     provider_class(config.provider).check_available()
     logging.basicConfig(level=logging.INFO)
     configure_runtime_logging()
