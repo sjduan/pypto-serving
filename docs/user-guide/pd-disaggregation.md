@@ -12,6 +12,8 @@ Control protocol version 4 separates the common replicated-page data contract fr
 
 Follow the SDK's normal source-build instructions with its matching runtime pin and required PTOAS version (0.72 for the paired PR revisions). Keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
 
+Keep the Serving-pinned Lib revision with this SDK pair: the model's remainder scratch must satisfy the updated compiler contract.
+
 Model nodes require Linux Python with `os.pidfd_open` and a working Mooncake Ascend installation. Startup checks these dependencies before loading weights. Serving starts one independent transfer process per rank, imports the owner's VMM backing into its own ACL context and registers its local device address before the first transfer. Adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
 
 Install `python -m pip install -e '.[pd]'` in each environment. The Router only needs this extra, not PyPTO, model weights, or NPUs. Optional constrained tools use the ordinary [XGrammar deployment requirements](../models/deepseek-v4/tool-constraints.md).
