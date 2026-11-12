@@ -35,6 +35,35 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
 )
 
 
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_kernel_import_keeps_the_per_owner_decode_slab(tmp_path, tp):
+    import importlib
+    import sys
+
+    kernel_dir = tmp_path / "models" / "deepseek_v4_flash_dspark"
+    kernel_dir.mkdir(parents=True)
+    (kernel_dir / "config.py").write_text(
+        "DECODE_SEQ = 8\nDECODE_BATCH = 64\nHCA_STATE_BLOCKS_PER_REQUEST = 17\n"
+        "CSA_STATE_BLOCKS_PER_REQUEST = 8\nCSA_INNER_STATE_BLOCKS_PER_REQUEST = 8\n"
+    )
+    original_argv, original_config = list(sys.argv), sys.modules.get("config")
+    with executor_module._dspark_import_context(
+        kernel_dir, pypto_lib_root=tmp_path, tp=tp, ep=16, dp=16 // tp, weight_bank_size=43,
+    ):
+        config = importlib.import_module("config")
+        # The TP1 standalone default would produce 512 rows instead of the
+        # runner's fixed 128-row scratch; do not relax the runtime ABI check.
+        assert config.DECODE_BATCH == 16 * tp
+        assert config.DECODE_TOKENS // config.TP == config.MOE_TOKENS == 128
+        assert config.RECV_MAX == config.DECODE_RECV_MAX == 2048
+        assert config.DP == 16 // tp and config.EP == 16
+        for group in ("HCA", "CSA", "CSA_INNER"):
+            assert getattr(config, f"{group}_STATE_PHYSICAL_BLOCKS") == (
+                config.DECODE_BATCH * getattr(config, f"{group}_STATE_BLOCKS_PER_REQUEST")
+            )
+    assert sys.argv == original_argv and sys.modules.get("config") is original_config
+
+
 @pytest.mark.parametrize("tp_size", [1, 4])
 @pytest.mark.parametrize("prefill_tokens", [128, 8192])
 @pytest.mark.parametrize("max_seq_len,budget", [(310000, 8530341888), (262144, 8457752576)],
@@ -477,7 +506,8 @@ def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_si
     assert compiled.layout.tp_size == tp_size and compiled.layout.lm_head_tp_size == 4
     assert compiled.layout.partitions == 16 // tp_size
     assert compiled.layout.decode_capacity == 16 * tp_size
-    assert compiled.layout.decode_batch == 64  # Frozen ABI, not usable capacity.
+    assert compiled.layout.decode_batch == 16 * tp_size
+    assert compiled.layout.decode_tokens == 16 * tp_size * compiled.layout.decode_seq
     assert compiled.layout.prefill_batch == max_batch_size
     assert executor.max_prefill_requests_per_partition == per_group
     assert executor.max_prefill_batch_size == max_batch_size

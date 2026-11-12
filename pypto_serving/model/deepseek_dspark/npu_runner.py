@@ -697,6 +697,8 @@ class DSparkCacheLayout:
             tp_size=tp_size,
             lm_head_tp_size=lm_head_tp_size,
             partitions=partitions,
+            decode_batch=group_batch,
+            decode_tokens=group_batch * DSPARK_DECODE_SEQ,
             prefill_local_tokens=DSPARK_PREFILL_DISPATCH_TOKENS // tp_size,
             prefill_batch=partitions * group_batch,
             prefill_requests=group_batch,
@@ -3717,7 +3719,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             name="dspark_default_grammar_mask",
         )
         mask.fill_(-1)
-        counts = shared_empty((ranks, DSPARK_DECODE_BATCH), torch.int32, name="dspark_default_draft_counts")
+        counts = shared_empty((ranks, self._compiled.layout.decode_batch), torch.int32,
+                              name="dspark_default_draft_counts")
         counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
         self._default_grammar_args = {
             "grammar_mask": StaticDeviceTensor(mask),
@@ -4805,7 +4808,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     owner = self._decode_task_args[slot].tensors[owner_fields[name]] if name in owner_fields else None
                     tables[group, name] = DecodeTableRows(
                         target[begin], ring=name not in ("cmp_c128", "cmp_c4", "idx"),
-                        fillers=scratch[name], replicas=tuple(target[rank] for rank in range(begin + 1, end)),
+                        fillers=scratch[name][:layout.decode_batch],
+                        replicas=tuple(target[rank] for rank in range(begin + 1, end)),
                         owner=owner[begin:end].view(-1, target.shape[-1]) if owner is not None else None,
                     )
             self._decode_table_rows.append(tables)

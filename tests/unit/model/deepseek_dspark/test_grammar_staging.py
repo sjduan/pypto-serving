@@ -139,12 +139,13 @@ def test_k7_mask_rows_and_draft_caps_are_isolated() -> None:
     assert int(masks[6, 48, 0, -1]) == 0
 
 
-def test_ordinary_dispatch_reuses_immutable_device_defaults() -> None:
+@pytest.mark.parametrize("tp", [1, 4])
+def test_ordinary_dispatch_reuses_immutable_device_defaults(tp) -> None:
     from pypto_serving.model.common.runner.buffer_set import StaticDeviceTensor, resolve_l3_arg
 
     runner = DSparkModelRunner.__new__(DSparkModelRunner)
     runner._default_grammar_args = {}
-    runner._compiled = SimpleNamespace(layout=SimpleNamespace(ranks=1))
+    runner._compiled = SimpleNamespace(layout=SimpleNamespace(ranks=1, decode_batch=16 * tp))
     runner._ensure_shared_host_allocation_before_worker = lambda _name: None
     runner._prepare_default_grammar_args()
     defaults = runner._default_grammar_args
@@ -158,6 +159,7 @@ def test_ordinary_dispatch_reuses_immutable_device_defaults() -> None:
     assert isinstance(ordinary[1], StaticDeviceTensor)
     assert ordinary[1].tensor.is_shared()
     assert torch.all(ordinary[1].tensor == -1)
+    assert ordinary[2].tensor.shape == (1, 16 * tp)
     assert torch.all(ordinary[2].tensor == DSPARK_DRAFTER_QUERY_WIDTH)
     assert runner._grammar_dispatch_args(args, names, constrained=True) is args
     assert runner._grammar_dispatch_args(args, names, constrained=False)[1] is ordinary[1]

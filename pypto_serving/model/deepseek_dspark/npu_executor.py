@@ -36,6 +36,7 @@ from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor as 
 from pypto_serving.model.common.executor.utils import build_pypto_run_config
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek_dspark.npu_runner import (
+    DSPARK_DECODE_LOCAL_BATCH,
     DSPARK_FWD_NUM_LAYERS,
     DSPARK_NOISE_TOKEN_ID,
     DSPARK_RANKS,
@@ -182,6 +183,17 @@ def _dspark_import_context(
         config = importlib.import_module("config")
         config.EP = int(ep)
         config.TP = int(tp)
+        config.DP = int(dp)
+        # Lib derives its fixed scratch from the group batch. Keep the same
+        # per-owner slab when attention TP changes, before importing any kernel.
+        config.DECODE_BATCH = DSPARK_DECODE_LOCAL_BATCH * config.TP
+        config.DECODE_TOKENS = config.DECODE_BATCH * config.DECODE_SEQ
+        for group in ("HCA", "CSA", "CSA_INNER"):
+            setattr(config, f"{group}_STATE_PHYSICAL_BLOCKS",
+                    config.DECODE_BATCH * getattr(config, f"{group}_STATE_BLOCKS_PER_REQUEST"))
+        config.MOE_TOKENS = config.DECODE_TOKENS // config.TP
+        config.DECODE_RECV_MAX = config.DP * config.DECODE_TOKENS
+        config.RECV_MAX = config.DECODE_RECV_MAX
         yield
     finally:
         sys.argv = old_argv
