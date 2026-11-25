@@ -33,7 +33,8 @@ processes use the same configuration.
   "replicas": [
     {"host": "192.0.2.10", "port": 8000, "role": "prefill"},
     {"host": "192.0.2.20", "port": 8000, "role": "decode"}
-  ]
+  ],
+  "pd": {"capacity": 256}
 }
 ```
 
@@ -44,8 +45,10 @@ on a trusted network. The Router accepts client traffic on port `8110`.
 The published image tag `20261125-ca0ed96-lib9b2cc05-arm64` bundles the matching
 PyPTO, Simpler, PTOAS and Mooncake runtime. Run the Bash setup below on both model hosts. Set the model and
 configuration paths on each host and adjust the host-side Ascend mount paths
-for its driver installation. The example uses a 32,768-token prompt-plus-output
-limit and a 50 GB DDR prefix-cache pool per model node.
+for its driver installation. This AgentX deployment configuration uses a
+1,048,576-token limit for prompt plus output and an 800 GB DDR prefix-cache
+pool per model node. Check available host RAM and `/dev/shm` space for the
+pool and runtime overhead on each host.
 
 ```bash
 PD_IMAGE=ghcr.io/sjduan/pypto-serving-pd@sha256:d0d7f49fb37a0bb2fd763f0728e52920f220fe4d85ccbac1b551a3541c00ca20
@@ -74,9 +77,9 @@ start_pd_model() {
     "$PD_IMAGE" pypto-serving \
     --model /models/dsv4-flash-0731-dspark-w8a8 --served-model-name dsv4 \
     --backend npu --platform a2a3 --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
-    --ep 16 --lm-head-tp 4 --block-size 32 --max-model-len 32768 \
+    --ep 16 --lm-head-tp 4 --block-size 32 --max-model-len 1048576 \
     --long-prefill-token-threshold 8192 --npu-memory-utilization 0.95 \
-    --enable-prefix-caching --prefix-cache-retention-interval 8192 --kv-offload-bytes 50000000000 \
+    --enable-prefix-caching --prefix-cache-retention-interval 8192 --kv-offload-bytes 800000000000 \
     --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
     --generate-config '{"max_new_tokens":131072,"temperature":0,"seed":1024}' \
     --async-scheduling --show-startup-logs --pd-config /config/pd.json \
@@ -91,7 +94,8 @@ start_pd_model prefill --dp 4 --tp 4 --max-num-seqs 16 --max-num-batched-tokens 
   --ring-heap 1073741824,1073741824,1073741824,4294967296
 ```
 
-Start Decode and the Router on host B.
+Start Decode and the Router on host B. The Decode command uses the AgentX
+C32/C64 request limit. For C128, set Decode `--max-num-seqs 256`.
 
 ```bash
 start_pd_model decode --dp 16 --tp 1 --max-num-seqs 128 --max-num-batched-tokens 768 \
